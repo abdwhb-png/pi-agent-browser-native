@@ -23,7 +23,7 @@ Define the product requirements and constraints for `pi-agent-browser-native`.
 
 ### Version policy
 
-- Baseline documentation and verification on the current recommended `agent-browser` release.
+- Keep the exact capability baseline at `agent-browser 0.37.0` while recommending the complete stable `0.37.x` series.
 - Accept stable `agent-browser` versions at or above the configured minimum; the floor remains 0.35.0 until the owner explicitly changes it.
 - Do **not** add version-specific backward-compatibility shims.
 - Keep the wrapper close to current upstream behavior as `agent-browser` evolves.

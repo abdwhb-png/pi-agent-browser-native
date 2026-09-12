@@ -1,6 +1,8 @@
 export const TARGET_AGENT_BROWSER_SOURCE = "scripts/agent-browser-target.mjs";
 export const TARGET_AGENT_BROWSER_VERSION = "0.37.0";
 export const TARGET_AGENT_BROWSER_VERSION_LABEL = `agent-browser ${TARGET_AGENT_BROWSER_VERSION}`;
+export const CAPABILITY_BASELINE_AGENT_BROWSER_VERSION = TARGET_AGENT_BROWSER_VERSION;
+export const RECOMMENDED_AGENT_BROWSER_VERSION_SERIES = "0.37.x";
 export const MINIMUM_AGENT_BROWSER_VERSION = "0.35.0";
 export const MINIMUM_AGENT_BROWSER_VERSION_LABEL = `agent-browser ${MINIMUM_AGENT_BROWSER_VERSION}`;
 export const SUPPORTED_AGENT_BROWSER_VERSION_LABEL = `${MINIMUM_AGENT_BROWSER_VERSION_LABEL} or newer`;
@@ -18,4 +20,9 @@ export function isSupportedAgentBrowserVersion(version) {
 		if (actual[index] !== minimum[index]) return actual[index] > minimum[index];
 	}
 	return true;
+}
+
+export function isRecommendedAgentBrowserVersion(version) {
+	const actual = stableVersionParts(version);
+	return actual?.[0] === 0 && actual[1] === 37;
 }

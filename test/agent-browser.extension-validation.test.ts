@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { chmod, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -1536,12 +1536,11 @@ process.stdout.write(JSON.stringify(command === "batch"
 test("agentBrowserExtension warns after record start when ffmpeg is missing", { concurrency: false }, async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-recording-ffmpeg-"));
 	const noRecordingMarker = join(tempDir, "no-recording");
-	const nodeBinDir = dirname(process.execPath);
-	const missingFfmpegPath = process.platform === "android" ? join(tempDir, "node-only") : nodeBinDir;
-	if (process.platform === "android") {
-		await mkdir(missingFfmpegPath);
-		await symlink(process.execPath, join(missingFfmpegPath, "node"), "file");
-	}
+	const missingFfmpegPath = join(tempDir, "node-only");
+	await mkdir(missingFfmpegPath);
+	const isolatedNodePath = join(missingFfmpegPath, process.platform === "win32" ? "node.exe" : "node");
+	await copyFile(process.execPath, isolatedNodePath);
+	if (process.platform !== "win32") await chmod(isolatedNodePath, 0o755);
 	await writeFakeAgentBrowserBinary(
 		tempDir,
 		`const fs = require("node:fs");

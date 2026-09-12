@@ -267,6 +267,8 @@ The extension does not ship `agent-browser`, but it does ship maintainer-owned d
 
 3. **Live help verification** is `scripts/verify-command-reference.mjs`, invoked via `npm run verify -- command-reference` (and included in the default `npm run verify` gate). It runs the baseline’s help commands against `agent-browser` on `PATH` and fails when the installed upstream surface does not match the declared target version or expected tokens.
 
+The verifier may sample any stable 0.37.x patch against the exact 0.37.0 capability baseline. Runtime acceptance remains broader at stable 0.35.0 or newer; the package doctor warns when that compatible binary is outside the recommended series.
+
 This mirrors the playbook contract pattern described in [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md): canonical TypeScript source and Markdown fragments stay paired through `npm run docs` / `npm run verify`, with deeper step-by-step notes in [`AGENTS.md`](https://github.com/fitchmultz/pi-agent-browser-native/blob/main/AGENTS.md), release checklist items in [`RELEASE.md`](RELEASE.md), and the baseline inventory-to-gates matrix in [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md).
 
 ## Not the right design

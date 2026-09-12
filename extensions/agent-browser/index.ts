@@ -44,6 +44,8 @@ import { getAgentBrowserProcessEnvironment, withIsolatedAgentBrowserEnvironment 
 import { withNativeSessionDefaults } from "./lib/orchestration/native-session-defaults.js";
 import {
 	MINIMUM_AGENT_BROWSER_VERSION,
+	CAPABILITY_BASELINE_AGENT_BROWSER_VERSION,
+	RECOMMENDED_AGENT_BROWSER_VERSION_SERIES,
 	SUPPORTED_AGENT_BROWSER_VERSION_LABEL,
 	TARGET_AGENT_BROWSER_VERSION,
 	getAgentBrowserVersionValidationError,
@@ -1139,12 +1141,14 @@ export default function agentBrowserExtension(
 		}
 		return {
 			content: [{ type: "text", text: error }],
-			details: {
-				expectedVersion: TARGET_AGENT_BROWSER_VERSION,
+				details: {
+					capabilityBaselineVersion: CAPABILITY_BASELINE_AGENT_BROWSER_VERSION,
+					expectedVersion: TARGET_AGENT_BROWSER_VERSION,
 				failureCategory: "validation-error",
 				observedVersion,
 				resultCategory: "failure",
-				minimumSupportedVersion: MINIMUM_AGENT_BROWSER_VERSION,
+					minimumSupportedVersion: MINIMUM_AGENT_BROWSER_VERSION,
+					recommendedVersionSeries: RECOMMENDED_AGENT_BROWSER_VERSION_SERIES,
 				versionValidation: { expected: SUPPORTED_AGENT_BROWSER_VERSION_LABEL, observed: observedVersion },
 			},
 			isError: true,

@@ -18,6 +18,7 @@ import {
   CAPABILITY_BASELINE_SOURCE,
   COMMAND_REFERENCE_DOC_PATH,
 } from "./agent-browser-capability-baseline.mjs";
+import { RECOMMENDED_AGENT_BROWSER_VERSION_SERIES, isRecommendedAgentBrowserVersion } from "./agent-browser-target.mjs";
 
 const execFile = promisify(execFileCallback);
 const GENERATED_BLOCK_PATTERN = new RegExp(
@@ -46,8 +47,8 @@ Usage:
 
 Checks:
   1. agent-browser is installed on PATH.
-  2. agent-browser --version is ${EXPECTED_VERSION}.
-  3. Expected ${EXPECTED_VERSION} help tokens from ${CAPABILITY_BASELINE_SOURCE} are present upstream.
+  2. agent-browser --version is in ${RECOMMENDED_AGENT_BROWSER_VERSION_SERIES}.
+  3. Expected ${EXPECTED_VERSION} baseline help tokens from ${CAPABILITY_BASELINE_SOURCE} are present upstream.
   4. ${COMMAND_REFERENCE_DOC_PATH} includes the maintained human-authored local reference tokens.
 
 Related runtime contract check:
@@ -84,9 +85,9 @@ export async function verifyCommandReference({
 
   const versionOutput = await run(["--version"]);
   const version = versionOutput.trim().replace(/^agent-browser\s+/, "");
-  if (version !== EXPECTED_VERSION) {
-    failures.push(
-      `agent-browser version drift: expected ${EXPECTED_VERSION}, found ${version || "<empty>"}. Update ${CAPABILITY_BASELINE_SOURCE}, run \`npm run docs -- command-reference write\`, and refresh ${COMMAND_REFERENCE_DOC_PATH}.`,
+  if (!isRecommendedAgentBrowserVersion(version)) {
+		failures.push(
+			`agent-browser version drift: expected ${RECOMMENDED_AGENT_BROWSER_VERSION_SERIES} against capability baseline ${EXPECTED_VERSION}, found ${version || "<empty>"}. Update ${CAPABILITY_BASELINE_SOURCE}, run \`npm run docs -- command-reference write\`, and refresh ${COMMAND_REFERENCE_DOC_PATH}.`,
     );
   }
 

@@ -30,7 +30,7 @@ The lightweight drift check is `npm run verify -- command-reference`. Run it whe
 
 ### Upstream 0.37.0 rebaseline
 
-The recommended release keeps the stable 0.35.0 floor and no upper version cap.
+The exact capability baseline is 0.37.0 and the recommended runtime series is stable 0.37.x. Stable versions at or above the 0.35.0 floor retain execution support with no upper cap; the package doctor warns outside 0.37.x.
 
 - `record start` / `record restart` accept command-local `--fps <n>` before, between or after path/URL operands (1–60, default 30). WebM uses VP8/libvpx; MP4 uses H.264/libx264. Other extensions are handed to ffmpeg; extensionless paths are rejected. Native startup validates the path, rate and ffmpeg availability.
 - Recording uses the current active page without replacing its DOM/JavaScript state unless a URL is supplied. The wrapper still conservatively requires a fresh snapshot after dispatched starts and URL-bearing restarts to protect older supported natives; this is not evidence that a page changed. FPS alone neither chooses another tab nor makes a restart invalidate refs.

@@ -4,6 +4,7 @@
 
 ### Added
 
+- Keep 0.37.0 as the exact capability baseline while recommending and accepting the 0.37.x patch series in doctor and command-reference checks. Other stable versions from 0.35.0 remain executable with a doctor warning; missing, non-executable, unreadable, and too-old binaries receive distinct diagnostics.
 - Normalize two common structured-input mistakes across `semanticAction` and `job`: role plus label placed in `value`, and click/check targets placed in `text`. Successful repairs are visible in `details.inputNormalizations`; contradictory inputs retain concise structured validation errors, and the redundant schema `anyOf` was removed.
 - Validate direct, batch, generated, and script-inner argv against bounded help from the installed external `agent-browser`, cached by cwd, `PATH`, and observed version. Proven unsupported flags now fail before dispatch; unavailable help remains fail-open with a visible warning, and `console --level` includes a copyable retry without the unsupported filter.
 - Set `PI_AGENT_BROWSER_SESSION_ARTIFACT_MAX_BYTES=0` to disable automatic persistent-session spill eviction. The default remains 32 MiB; positive limits and temporary spill cleanup are unchanged.

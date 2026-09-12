@@ -7,7 +7,7 @@
  * Related: `docs/SUPPORT_MATRIX.md` maps `CAPABILITY_BASELINE.inventorySections` to human docs, runtime behavior, tests, and verification gates; refresh that matrix whenever this baseline changes.
  */
 
-import { TARGET_AGENT_BROWSER_VERSION } from "./agent-browser-target.mjs";
+import { RECOMMENDED_AGENT_BROWSER_VERSION_SERIES, TARGET_AGENT_BROWSER_VERSION } from "./agent-browser-target.mjs";
 
 export const CAPABILITY_BASELINE_SOURCE = "scripts/agent-browser-capability-baseline.mjs";
 export const COMMAND_REFERENCE_DOC_PATH = "docs/COMMAND_REFERENCE.md";
@@ -937,6 +937,8 @@ const inventorySections = Object.freeze([
 ]);
 
 export const CAPABILITY_BASELINE = Object.freeze({
+	capabilityBaselineVersion: TARGET_AGENT_BROWSER_VERSION,
+	recommendedVersionSeries: RECOMMENDED_AGENT_BROWSER_VERSION_SERIES,
   targetVersion: TARGET_AGENT_BROWSER_VERSION,
   sourceEvidence,
   helpCommands,

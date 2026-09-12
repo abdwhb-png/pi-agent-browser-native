@@ -32,6 +32,8 @@ The tool also needs an operating playbook, not just a capability list. The model
 
 The native command reference in `docs/COMMAND_REFERENCE.md` is driven by the same pattern: `scripts/agent-browser-target.mjs` owns the runtime version and `scripts/agent-browser-capability-baseline.mjs` imports it alongside help/doc inventory; selected regions are generated into the Markdown by `npm run docs -- command-reference write`, and `npm run docs` plus `npm run verify -- command-reference` catch drift (the latter also samples the installed `agent-browser` on `PATH`). Maintainer workflow details live in `AGENTS.md` under upstream capability baseline.
 
+Version policy keeps `0.37.0` as the exact capability baseline and recommends stable `0.37.x`. Stable releases from `0.35.0` upward remain executable. The package doctor passes 0.37.x, warns for another supported series, and distinguishes a missing binary, a non-executable binary, unreadable version output, and a version below the floor.
+
 ## Host execution hook
 
 An SDK host can import the package's compiled `dist/extensions/agent-browser/index.js` default export and register it once through a Pi extension factory:

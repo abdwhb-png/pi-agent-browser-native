@@ -48,6 +48,8 @@ test("structured inputs normalize common role/value and click/text mistakes", ()
 		params: { job: { steps: [{ action: "click", text: "SYNTHETIC HAIR TOPPER WIG" }] } },
 	});
 	assert.equal(job.status, "valid");
+	assert.equal(job.kind, "job");
+	if (job.kind !== "job") throw new Error("expected normalized job input");
 	assert.deepEqual(job.compiledJob?.steps[0]?.args, ["find", "text", "SYNTHETIC HAIR TOPPER WIG", "click"]);
 	assert.deepEqual(job.inputNormalizations, [{ code: "text-as-target", path: "job.steps[0]" }]);
 });

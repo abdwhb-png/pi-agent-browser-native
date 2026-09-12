@@ -71,8 +71,8 @@ test("doctor reports missing agent-browser with actionable install guidance", as
 	assert.match(text, /https:\/\/github\.com\/vercel-labs\/agent-browser/);
 });
 
-test("doctor accepts the supported floor and newer stable versions", async () => {
-	for (const version of ["0.35.0", "0.35.2", "1.0.0"]) {
+test("doctor passes the recommended 0.37 series and warns for other supported stable versions", async () => {
+	for (const version of ["0.37.0", "0.37.1"]) {
 		const report = await evaluateDoctorWithPi({
 			runAgentBrowser: async () => `agent-browser ${version}\n`,
 			skipSourceCheck: true,
@@ -80,9 +80,22 @@ test("doctor accepts the supported floor and newer stable versions", async () =>
 		const text = formatDoctorReport(report);
 
 		assert.equal(report.failures.length, 0);
-		assert.match(text, new RegExp(`version meets supported floor: ${version.replaceAll(".", "\\.")}`));
-		assert.match(text, new RegExp(`recommended ${CAPABILITY_BASELINE.targetVersion}`));
+		assert.match(text, new RegExp(`recommended series: ${version.replaceAll(".", "\\.")}`));
 	}
+	for (const version of ["0.35.0", "0.35.2", "1.0.0"]) {
+		const report = await evaluateDoctorWithPi({ runAgentBrowser: async () => `agent-browser ${version}\n`, skipSourceCheck: true });
+		const text = formatDoctorReport(report);
+		assert.equal(report.failures.length, 0);
+		assert.match(text, /supported but outside recommended 0\.37\.x/);
+	}
+});
+
+test("doctor distinguishes non-executable and unreadable agent-browser versions", async () => {
+	const denied = Object.assign(new Error("spawn agent-browser EACCES"), { code: "EACCES" });
+	const nonExecutable = await evaluateDoctorWithPi({ runAgentBrowser: async () => { throw denied; }, skipSourceCheck: true });
+	assert.match(formatDoctorReport(nonExecutable), /not executable.*EACCES/i);
+	const unreadable = await evaluateDoctorWithPi({ runAgentBrowser: async () => "unexpected output\n", skipSourceCheck: true });
+	assert.match(formatDoctorReport(unreadable), /version output is unreadable/i);
 });
 
 test("doctor reports versions below the supported floor", async () => {

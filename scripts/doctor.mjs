@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { CAPABILITY_BASELINE_SOURCE } from "./agent-browser-capability-baseline.mjs";
-import { MINIMUM_AGENT_BROWSER_VERSION, TARGET_AGENT_BROWSER_SOURCE, TARGET_AGENT_BROWSER_VERSION, isSupportedAgentBrowserVersion } from "./agent-browser-target.mjs";
+import { MINIMUM_AGENT_BROWSER_VERSION, RECOMMENDED_AGENT_BROWSER_VERSION_SERIES, TARGET_AGENT_BROWSER_SOURCE, isRecommendedAgentBrowserVersion, isSupportedAgentBrowserVersion } from "./agent-browser-target.mjs";
 
 const execFile = promisify(execFileCallback);
 const PACKAGE_NAME = "pi-agent-browser-native";
@@ -25,7 +25,7 @@ const EXTENSION_ENTRYPOINTS = Object.freeze([
 	"extensions/agent-browser/index.ts",
 	"dist/extensions/agent-browser/index.js",
 ]);
-const RECOMMENDED_VERSION = TARGET_AGENT_BROWSER_VERSION;
+const RECOMMENDED_VERSION = RECOMMENDED_AGENT_BROWSER_VERSION_SERIES;
 const MINIMUM_PI_VERSION = "0.84.0";
 const DEFAULT_AGENT_DIR = resolve(homedir(), ".pi/agent");
 const THIS_PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -341,6 +341,13 @@ async function checkAgentBrowserVersion({ runAgentBrowser }) {
 	try {
 		const rawOutput = await runAgentBrowser(["--version"]);
 		const version = normalizeAgentBrowserVersion(rawOutput);
+		if (!/^\d+\.\d+\.\d+$/u.test(version)) {
+			return {
+				status: "fail",
+				title: `agent-browser version output is unreadable: ${version || "<empty>"}.`,
+				lines: ["Run `agent-browser --version` in the same shell that launches Pi and repair the executable before retrying."],
+			};
+		}
 		if (!isSupportedAgentBrowserVersion(version)) {
 			return {
 				status: "fail",
@@ -352,17 +359,18 @@ async function checkAgentBrowserVersion({ runAgentBrowser }) {
 			};
 		}
 		return {
-			status: "pass",
-			title: version === RECOMMENDED_VERSION
-				? `agent-browser version matches recommended baseline: ${version}`
-				: `agent-browser version meets supported floor: ${version} (recommended ${RECOMMENDED_VERSION})`,
+			status: isRecommendedAgentBrowserVersion(version) ? "pass" : "warn",
+			title: isRecommendedAgentBrowserVersion(version)
+				? `agent-browser version is in the recommended series: ${version}`
+				: `agent-browser ${version} is supported but outside recommended ${RECOMMENDED_VERSION}`,
 			lines: [],
 		};
 	} catch (error) {
 		const code = error && typeof error === "object" ? error.code : undefined;
+		const nonExecutable = code === "EACCES" || code === "EPERM";
 		return {
 			status: "fail",
-			title: "agent-browser is required but was not found on PATH.",
+			title: nonExecutable ? `agent-browser was found but is not executable (${String(code)}).` : "agent-browser is required but was not found on PATH.",
 			lines: [
 				"This package does not bundle agent-browser.",
 				"Install upstream agent-browser, then make sure `agent-browser --version` works in the same shell that launches pi.",

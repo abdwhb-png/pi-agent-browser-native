@@ -54,6 +54,12 @@ import {
 	writeFakeMacElectronApp,
 } from "./helpers/extension-validation-fixtures.js";
 
+async function withHermeticAgentBrowserProbe<T>(tempDir: string, run: () => Promise<T>): Promise<T> {
+	const basePath = process.env.PATH ?? "";
+	await writeFakeAgentBrowserBinary(tempDir, `process.stderr.write("unexpected upstream dispatch during Electron startup fixture"); process.exit(90);`);
+	return withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, run);
+}
+
 test("agentBrowserExtension supports Electron launch handoff modes", { concurrency: false }, async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-electron-handoff-"));
 	const applicationsDir = join(tempDir, "Applications");
@@ -142,33 +148,35 @@ test("agentBrowserExtension aborts Electron launch before and during app startup
 	try {
 		await mkdir(applicationsDir, { recursive: true });
 		const app = await writeFakeLaunchableElectronApp({ applicationsDir, bundleId: "com.example.AbortElectron", launchLogPath, mode: "no-port-file", name: "Abort Electron" });
-		const harness = createExtensionHarness({ cwd: tempDir });
-		await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		await withHermeticAgentBrowserProbe(tempDir, async () => {
+			const harness = createExtensionHarness({ cwd: tempDir });
+			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-		const alreadyAborted = new AbortController();
-		alreadyAborted.abort();
-		const preLaunchResult = await executeRegisteredTool(harness.tool, harness.ctx, { electron: { action: "launch", appPath: app.appPath } }, alreadyAborted.signal);
-		assert.equal(preLaunchResult.isError, true);
-		assert.equal(preLaunchResult.details?.failureCategory, "aborted");
-		assert.deepEqual(await readOptionalFakeElectronLaunchLog(launchLogPath), []);
+			const alreadyAborted = new AbortController();
+			alreadyAborted.abort();
+			const preLaunchResult = await executeRegisteredTool(harness.tool, harness.ctx, { electron: { action: "launch", appPath: app.appPath } }, alreadyAborted.signal);
+			assert.equal(preLaunchResult.isError, true);
+			assert.equal(preLaunchResult.details?.failureCategory, "aborted");
+			assert.deepEqual(await readOptionalFakeElectronLaunchLog(launchLogPath), []);
 
-		const midLaunch = new AbortController();
-		const pendingResult = executeRegisteredTool(harness.tool, harness.ctx, {
-			electron: { action: "launch", appPath: app.appPath, timeoutMs: 10_000 },
-		}, midLaunch.signal);
-		let [launch] = await readOptionalFakeElectronLaunchLog(launchLogPath);
-		for (let attempt = 0; !launch && attempt < 100; attempt += 1) {
-			await delay(20);
-			[launch] = await readOptionalFakeElectronLaunchLog(launchLogPath);
-		}
-		assert.ok(launch, "fake Electron app should start before mid-launch abort");
-		midLaunch.abort();
-		const midLaunchResult = await pendingResult;
-		assert.equal(midLaunchResult.isError, true);
-		assert.equal(midLaunchResult.details?.failureCategory, "aborted");
-		assert.doesNotMatch(midLaunchResult.content[0]?.text ?? "", /increase electron\.timeoutMs/);
-		await assert.rejects(stat(launch.userDataDir));
-		assert.equal(isTestPidAlive(launch.pid), false);
+			const midLaunch = new AbortController();
+			const pendingResult = executeRegisteredTool(harness.tool, harness.ctx, {
+				electron: { action: "launch", appPath: app.appPath, timeoutMs: 10_000 },
+			}, midLaunch.signal);
+			let [launch] = await readOptionalFakeElectronLaunchLog(launchLogPath);
+			for (let attempt = 0; !launch && attempt < 100; attempt += 1) {
+				await delay(20);
+				[launch] = await readOptionalFakeElectronLaunchLog(launchLogPath);
+			}
+			assert.ok(launch, "fake Electron app should start before mid-launch abort");
+			midLaunch.abort();
+			const midLaunchResult = await pendingResult;
+			assert.equal(midLaunchResult.isError, true);
+			assert.equal(midLaunchResult.details?.failureCategory, "aborted");
+			assert.doesNotMatch(midLaunchResult.content[0]?.text ?? "", /increase electron\.timeoutMs/);
+			await assert.rejects(stat(launch.userDataDir));
+			assert.equal(isTestPidAlive(launch.pid), false);
+		});
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -212,7 +220,7 @@ test("agentBrowserExtension cleans Electron resources when launch fails before u
 		try {
 			await mkdir(applicationsDir, { recursive: true });
 			const app = await writeFakeLaunchableElectronApp({ applicationsDir, bundleId: `com.example.${mode}`, launchLogPath, mode, name: `Failed ${mode}`, writeLaunchLog });
-			await withPatchedEnv({ PATH: dirname(process.execPath) }, async () => {
+			await withHermeticAgentBrowserProbe(tempDir, async () => {
 				const harness = createExtensionHarness({ cwd: tempDir });
 				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
@@ -271,8 +279,9 @@ if (!process.argv.includes("--quiet")) {
 }
 process.exit(42);
 `);
-		const harness = createExtensionHarness({ cwd: tempDir });
-		for (const quiet of [false, true]) {
+		await withHermeticAgentBrowserProbe(tempDir, async () => {
+			const harness = createExtensionHarness({ cwd: tempDir });
+			for (const quiet of [false, true]) {
 			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
 				electron: { action: "launch", appPath: app.appPath, appArgs: quiet ? ["--quiet"] : [], timeoutMs: 5_000 },
 			});
@@ -296,7 +305,8 @@ process.exit(42);
 			assert.ok(failure.userDataDir);
 			await assert.rejects(stat(failure.userDataDir), { code: "ENOENT" });
 			assert.equal(isTestPidAlive(failure.diagnostics?.pid), false);
-		}
+			}
+		});
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -400,7 +410,8 @@ test("Electron capture closes real file handles and retains startup errors when 
 	});
 	syncBuiltinESMExports();
 	try {
-		for (fault of ["open-stderr", "spawn-sync", "spawn-async", "read-stdout"] as const) {
+		await withHermeticAgentBrowserProbe(tempDir, async () => {
+			for (fault of ["open-stderr", "spawn-sync", "spawn-async", "read-stdout"] as const) {
 			handles.length = 0;
 			await writeFile(app.executablePath, fault === "spawn-async" ? "#!/does-not-exist/piab-node\n" : "#!/usr/bin/env node\nprocess.exit(42);\n");
 			const harness = createExtensionHarness({ cwd: tempDir });
@@ -425,7 +436,8 @@ test("Electron capture closes real file handles and retains startup errors when 
 			}
 			assert.ok(failure.userDataDir);
 			await assert.rejects(stat(failure.userDataDir), { code: "ENOENT" });
-		}
+			}
+		});
 	} finally {
 		t.mock.restoreAll();
 		syncBuiltinESMExports();

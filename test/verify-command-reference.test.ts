@@ -98,6 +98,11 @@ test("verifyCommandReference passes for matching fake upstream and doc content",
   assert.deepEqual(failures, []);
 });
 
+test("verifyCommandReference samples a newer patch in the recommended series", async () => {
+  const failures = await verifyCommandReference({ cwd: "/repo", run: fakeRunWithVersion("0.37.1"), readDoc: async () => completeDoc() });
+  assert.deepEqual(failures, []);
+});
+
 test("verifyCommandReference reports version drift", async () => {
   const failures = await verifyCommandReference({
     cwd: "/repo",

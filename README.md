@@ -108,7 +108,7 @@ Optional external tools unlock the full command surface:
 | `agent-browser` | All browser automation through this extension | See upstream install docs |
 | `ffmpeg` | Recording WebM (libvpx) or MP4 (libx264); install before `record start` / `record restart` | `brew install ffmpeg` or `brew install ffmpeg-full` |
 
-Keep both binaries on `PATH`. This package recommends `agent-browser 0.37.0` and accepts stable versions at or above the 0.35.0 floor; browser-backed calls fail fast below that floor while local inspection/setup commands remain available for diagnosis. Native 0.37 validates `ffmpeg`, the output extension and FPS before recording; older supported natives may defer failures until stop. Use `record start <path.webm|path.mp4> [url] [--fps <n>]` (1–60 fps, default 30), then verify the completed file after `record stop`. Native `doctor` checks the recording dependency and encoders.
+Keep both binaries on `PATH`. The exact capability baseline is `agent-browser 0.37.0`; the strongly recommended runtime series is `0.37.x`. Stable versions at or above the 0.35.0 floor remain executable, with doctor warnings outside 0.37.x; browser-backed calls fail fast below that floor while local inspection/setup commands remain available for diagnosis. Native 0.37 validates `ffmpeg`, the output extension and FPS before recording; older supported natives may defer failures until stop. Use `record start <path.webm|path.mp4> [url] [--fps <n>]` (1–60 fps, default 30), then verify the completed file after `record stop`. Native `doctor` checks the recording dependency and encoders.
 
 ### Android / Termux
 

@@ -6,6 +6,7 @@ import test from "node:test";
 
 import {
 	MINIMUM_AGENT_BROWSER_VERSION,
+	RECOMMENDED_AGENT_BROWSER_VERSION_SERIES,
 	TARGET_AGENT_BROWSER_VERSION,
 	getAgentBrowserVersionValidationError,
 	parseAgentBrowserVersionOutput,
@@ -51,6 +52,8 @@ process.stdout.write(JSON.stringify({ success: true, data: { url: "https://examp
 			assert.equal(blocked.details?.observedVersion, "0.33.20");
 			assert.equal(blocked.details?.minimumSupportedVersion, MINIMUM_AGENT_BROWSER_VERSION);
 			assert.equal(blocked.details?.expectedVersion, TARGET_AGENT_BROWSER_VERSION);
+			assert.equal(blocked.details?.capabilityBaselineVersion, TARGET_AGENT_BROWSER_VERSION);
+			assert.equal(blocked.details?.recommendedVersionSeries, RECOMMENDED_AGENT_BROWSER_VERSION_SERIES);
 			assert.ok((blocked.content[0]?.text ?? "").includes(`Install agent-browser ${TARGET_AGENT_BROWSER_VERSION}`));
 			await assert.rejects(readFile(logPath, "utf8"));
 
