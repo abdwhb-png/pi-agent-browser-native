@@ -257,6 +257,9 @@ Illustrative shapes (each real call uses exactly one of `script`, `args`, `seman
 - type: `string[]`
 - required unless `script`, `semanticAction`, `job`, `qa`, `sourceLookup`, `networkSourceLookup`, or `electron` is provided
 - exact CLI args passed after `agent-browser`; this is the 1:1 upstream CLI coverage path for the targeted `agent-browser` version
+- before dispatch, the wrapper samples the installed binary's root and command-family help without a shell, with a five-second timeout and a 256 KiB output limit. Unsupported flags fail with `failureCategory: "validation-error"`; the same check covers effective batch rows, generated structured-mode rows, and calls inside `script`
+- help grammar is cached by working directory, `PATH`, and observed upstream version. If help is missing or unusable, the wrapper preserves native pass-through and adds a visible warning only when a flag could not be verified
+- positional values and flag values that begin with `-` stay literal. The free-form tail of `plugin run` is not interpreted as wrapper flags
 - no shell operators
 - do not include the binary name
 - do not include `--json`; the wrapper injects it (see [Wrapper `--json`](#wrapper-json))
@@ -272,6 +275,8 @@ Examples:
 { "args": ["network", "unroute"] }
 { "args": ["quit"] }
 ```
+
+`console` has no upstream level filter. A call such as `{ "args": ["console", "--level", "error"] }` is rejected before dispatch with `details.nextActions[].id: "retry-console-without-level"`. Retry without `--level`, then inspect the returned message types. Dynamic validation diagnostics contain only flag names and redacted argv values.
 
 ### `script`
 

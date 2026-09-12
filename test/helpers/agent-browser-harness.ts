@@ -597,6 +597,13 @@ if (process.env.PI_AGENT_BROWSER_TEST_CUSTOM_VERSION !== "1" && __piabFakeArgs.i
   process.stdout.write(${JSON.stringify(`${TARGET_AGENT_BROWSER_VERSION_LABEL}\n`)});
   process.exit(0);
 }
+if (process.env.PI_AGENT_BROWSER_ARGV_INSPECTION === "1" && process.env.PI_AGENT_BROWSER_TEST_CUSTOM_HELP !== "1" && __piabFakeArgs.includes("--help")) {
+  const command = __piabFakeArgs.find((arg) => !arg.startsWith("-"));
+  process.stdout.write(command
+    ? "agent-browser " + command + "\\n\\nUsage: agent-browser " + command + " [args...]\\n"
+    : "agent-browser\\n\\nUsage: agent-browser <command> [args...] [options]\\n");
+  process.exit(0);
+}
 if (process.env.PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO !== "1" && __piabFakeArgs.includes("session") && __piabFakeArgs.includes("info")) {
   process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
   process.exit(0);
@@ -703,4 +710,3 @@ export async function stopChildProcess(child: ReturnType<typeof spawn>): Promise
 		clearTimeout(timeout);
 	}
 }
-

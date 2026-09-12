@@ -1181,7 +1181,12 @@ if (args.includes("get") && args.includes("url")) {
 			assert.equal(jsonFunctionResult.isError, false);
 			const jsonFunctionText = (jsonFunctionResult.content[0] as { text: string }).text;
 			assert.doesNotMatch(jsonFunctionText, /Eval stdin hint:/);
-			assert.deepEqual(JSON.parse(jsonFunctionText), {
+			const jsonFunctionPayload = JSON.parse(jsonFunctionText) as { warnings?: string[] };
+			assert.deepEqual(jsonFunctionPayload.warnings, [
+				"Argv validation warning: installed agent-browser help could not be inspected, so one or more flags were not verified before dispatch.",
+			]);
+			delete jsonFunctionPayload.warnings;
+			assert.deepEqual(jsonFunctionPayload, {
 				data: { origin: "https://example.com/", result: {} },
 				success: true,
 			});

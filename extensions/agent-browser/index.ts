@@ -76,6 +76,7 @@ import {
 	type ElectronLaunchRecord,
 } from "./lib/orchestration/electron-host/index.js";
 import { buildValidationFailureResult, resolveAgentBrowserInput, type AgentBrowserExecuteParams } from "./lib/orchestration/input-plan.js";
+import { applyDynamicArgvValidationWarning, DynamicArgvValidator, type DynamicArgvValidationResult } from "./lib/orchestration/dynamic-argv-validation.js";
 import { applyAgentBrowserOutputPath, normalizeRequestedOutputPath } from "./lib/orchestration/output-file.js";
 import { appendScriptSessionLease, buildScriptBrowserEnvelope, buildScriptToolResult, getScriptSessionLeasesFromBranch } from "./lib/orchestration/script-mode.js";
 import type { FileArtifactMetadata, NetworkRouteRecord, SessionArtifactManifest } from "./lib/results/contracts.js";
@@ -979,6 +980,7 @@ export default function agentBrowserExtension(
 	let branchRestoreGeneration = 0;
 	let branchStateGeneration = 0;
 	const validatedUpstreamPathKeys = new Set<string>();
+	const dynamicArgvValidator = new DynamicArgvValidator(async (args, cwd, timeoutMs, signal) => runAgentBrowserProcess({ args, cwd, env: { PI_AGENT_BROWSER_ARGV_INSPECTION: "1" }, signal, timeoutMs }));
 
 	const recordingPersistenceWarning = "Recording persistence warning: recording protection could not be saved to the Pi journal. Restart protection is not yet durable; keep recording destinations untouched until exact stop or close. The next browser operation retries journal persistence; cleanup remains available.";
 
@@ -1762,6 +1764,20 @@ export default function agentBrowserExtension(
 				: undefined;
 			const runBrowserCommand = async () => {
 				flushRecordingReservations();
+				let dynamicArgvValidation: DynamicArgvValidationResult | undefined;
+				if (!electronHostOnlyAction && toolArgs.length > 0 && !isPlainTextInspectionArgs(toolArgs) && signal?.aborted !== true) {
+					const processEnvironment = getAgentBrowserProcessEnvironment();
+					dynamicArgvValidation = await dynamicArgvValidator.validate({
+						args: toolArgs,
+						cwd: ctx.cwd,
+						path: processEnvironment.PATH ?? processEnvironment.Path ?? "",
+						signal,
+						stdin: resolvedInput.toolStdin,
+					});
+					if (dynamicArgvValidation.rejection) {
+						return applyAgentBrowserOutputPath({ cwd: ctx.cwd, outputPath, result: dynamicArgvValidation.rejection });
+					}
+				}
 				const branchRestoreGenerationAtStart = branchRestoreGeneration;
 				const generationAtStart = branchStateGeneration;
 				const sessionPageStateUpdate = sessionPageState.beginUpdate();
@@ -1912,7 +1928,9 @@ export default function agentBrowserExtension(
 					});
 					if (serializeBrowserCommand) branchStateGeneration += 1;
 				}
-				return applyAgentBrowserOutputPath({ cwd: ctx.cwd, outputPath, preserveTextContent: Array.isArray(params.args) && params.args.includes("--json"), result: warnRecordingPersistence(result) });
+				const userRequestedJson = Array.isArray(params.args) && params.args.includes("--json");
+				const validatedResult = dynamicArgvValidation ? applyDynamicArgvValidationWarning(result, dynamicArgvValidation, userRequestedJson) : result;
+				return applyAgentBrowserOutputPath({ cwd: ctx.cwd, outputPath, preserveTextContent: userRequestedJson, result: warnRecordingPersistence(validatedResult) });
 			};
 
 			const closesAllSessions = commandClosesAllSessions(toolArgs, resolvedInput.toolStdin);
