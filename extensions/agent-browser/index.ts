@@ -75,7 +75,7 @@ import {
 	restoreElectronLaunchRecordsFromBranch,
 	type ElectronLaunchRecord,
 } from "./lib/orchestration/electron-host/index.js";
-import { buildValidationFailureResult, resolveAgentBrowserInput, type AgentBrowserExecuteParams } from "./lib/orchestration/input-plan.js";
+import { applyInputNormalizationsToResult, buildValidationFailureResult, resolveAgentBrowserInput, type AgentBrowserExecuteParams } from "./lib/orchestration/input-plan.js";
 import { applyDynamicArgvValidationWarning, DynamicArgvValidator, type DynamicArgvValidationResult } from "./lib/orchestration/dynamic-argv-validation.js";
 import { applyAgentBrowserOutputPath, normalizeRequestedOutputPath } from "./lib/orchestration/output-file.js";
 import { appendScriptSessionLease, buildScriptBrowserEnvelope, buildScriptToolResult, getScriptSessionLeasesFromBranch } from "./lib/orchestration/script-mode.js";
@@ -1520,10 +1520,10 @@ export default function agentBrowserExtension(
 				params,
 			});
 			if (resolvedInput.status === "invalid") {
-				return buildValidationFailureResult(resolvedInput);
+				return applyInputNormalizationsToResult(buildValidationFailureResult(resolvedInput), resolvedInput.inputNormalizations);
 			}
 			if (resolvedInput.kind !== "script") await beforeExecute?.(nativeToolCallId, { ...ctx, signal });
-			return withNativeSessionDefaults(resolvedInput, ctx.cwd, signal, async (resolvedInput) => {
+			const executedResult = await withNativeSessionDefaults(resolvedInput, ctx.cwd, signal, async (resolvedInput) => {
 			if (resolvedInput.kind === "qa" && resolvedInput.compiledQaPreset.checks.attached && !managedSessionActive && !extractExplicitSessionName(resolvedInput.toolArgs)) {
 				return buildValidationFailureResult({ ...resolvedInput, attemptedKind: "qa", kind: "invalid", status: "invalid", validationError: "qa.attached requires an active attached session. Run electron.launch or connect to an Electron debug port first, or configure a native shared session." });
 			}
@@ -1759,7 +1759,7 @@ export default function agentBrowserExtension(
 				ownedElectronLaunchRecords,
 				ownedManagedSessions,
 			});
-			const callerOwnedSessionQueueKey = !serializeBrowserCommand && explicitSessionName
+				const callerOwnedSessionQueueKey = !serializeBrowserCommand && explicitSessionName
 				? getSessionContextKey(explicitSessionName, callerOwnedSessionNamespace) ?? explicitSessionName
 				: undefined;
 			const runBrowserCommand = async () => {
@@ -1976,8 +1976,9 @@ export default function agentBrowserExtension(
 					})),
 				});
 			});
-			});
-		},
+				});
+				return applyInputNormalizationsToResult(executedResult, resolvedInput.inputNormalizations);
+			},
 	} satisfies ToolDefinition<typeof AGENT_BROWSER_PARAMS>;
 	pi.registerTool(beforeExecute ? { ...agentBrowserTool, executionMode: "sequential" } : agentBrowserTool);
 

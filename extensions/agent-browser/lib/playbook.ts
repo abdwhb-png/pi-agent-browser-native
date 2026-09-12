@@ -95,8 +95,8 @@ export const RUNTIME_PROMPT_GUIDELINES = [
 	"For agent_browser, use open → snapshot -i → @refs; re-snapshot after changes. In authenticated unattended/auto-approved employee flows, ordinary requested non-destructive submissions may proceed. Honor explicit stops; require explicit authorization for purchases, production-control, destructive/irreversible, or account/security/privacy changes.",
 	"agent_browser honors native shared-session defaults on bare calls; do not relaunch/close a shared browser. Without a selected native session, use sessionMode=fresh for launch flags. Use requested/configured profiles only; verify auth. Profile content is model-visible; script is always disposable.",
 	"agent_browser: exact user paths; verify artifactVerification/artifacts before success claims. Save promptGuard-required files before close; ffmpeg before recording; close keeps files; waited:timeout proves nothing.",
-	"When agent_browser details.nextActions exists, use them. Check Omitted high-value controls in dense snapshots. Dashboards: verify scroll via screenshot/snapshot.",
-	"agent_browser: read <url> for docs/text or active DOM; get title/url; get text/html/value/count <selector>; get attr <selector> <name>. Batch 3+ getters; heed visibility warnings.",
+	"When agent_browser details.nextActions exists, use them. Check omitted controls in dense snapshots. Dashboards: verify scroll via screenshot/snapshot.",
+	"agent_browser: read <url> for docs/text; get title/url; get text/html/value/count <selector>; get attr <selector> <name>. role=button, name=Submit; locator=text, value=Submit. Batch 3+ getters.",
 ] as const;
 
 export function buildBrowserExecutablePathGuideline(executablePath: string | undefined): string | undefined {

@@ -48,16 +48,6 @@ export function createAgentBrowserParamsSchema(
 			session: Type.Optional(Type.String({ description: "Upstream session name." })),
 		}, {
 			additionalProperties: false,
-			// Pi normalizes optional nulls through properties, not union branches.
-			anyOf: [
-				Type.Object({
-					action: StringEnum(["select"] as const),
-					locator: Type.Optional(StringEnum(["role", "label"] as const)),
-				}, { not: { required: ["text"] } }),
-				Type.Object({
-					action: StringEnum(["check", "click", "fill"] as const),
-				}, { not: { required: ["values"] } }),
-			],
 			description: "Stable locator or direct-selector action. values only with action=select.",
 		}),
 	),

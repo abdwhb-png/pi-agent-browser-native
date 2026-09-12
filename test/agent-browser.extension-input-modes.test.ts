@@ -16,6 +16,7 @@ import { Check } from "typebox/value";
 
 import { analyzeQaPresetResults, analyzeQaPresetTimeout, compileAgentBrowserJob, compileAgentBrowserQaPreset } from "../extensions/agent-browser/lib/input-modes/job.js";
 import { compileAgentBrowserSemanticAction } from "../extensions/agent-browser/lib/input-modes/semantic-action.js";
+import { resolveAgentBrowserInput } from "../extensions/agent-browser/lib/orchestration/input-plan.js";
 import {
 	createExtensionHarness,
 	executeRegisteredTool,
@@ -31,6 +32,33 @@ test("semanticAction treats an empty generated role name as omitted", () => {
 		compileAgentBrowserSemanticAction({ action: "fill", locator: "role", role: "textbox", name: "", text: "query" }).compiled?.args,
 		["find", "role", "textbox", "fill", "query"],
 	);
+});
+
+test("structured inputs normalize common role/value and click/text mistakes", () => {
+	const semantic = resolveAgentBrowserInput({
+		getBatchPreflightValidationError: () => undefined,
+		params: { semanticAction: { action: "click", locator: "role", role: "button", value: "SEND MESSAGE" } },
+	});
+	assert.equal(semantic.status, "valid");
+	assert.deepEqual(semantic.toolArgs, ["find", "role", "button", "click", "--name", "SEND MESSAGE"]);
+	assert.deepEqual(semantic.inputNormalizations, [{ code: "role-value-as-name", path: "semanticAction" }]);
+
+	const job = resolveAgentBrowserInput({
+		getBatchPreflightValidationError: () => undefined,
+		params: { job: { steps: [{ action: "click", text: "SYNTHETIC HAIR TOPPER WIG" }] } },
+	});
+	assert.equal(job.status, "valid");
+	assert.deepEqual(job.compiledJob?.steps[0]?.args, ["find", "text", "SYNTHETIC HAIR TOPPER WIG", "click"]);
+	assert.deepEqual(job.inputNormalizations, [{ code: "text-as-target", path: "job.steps[0]" }]);
+});
+
+test("structured normalization keeps contradictory targets invalid with bounded guidance", () => {
+	const result = resolveAgentBrowserInput({
+		getBatchPreflightValidationError: () => undefined,
+		params: { semanticAction: { action: "click", locator: "role", role: "button", name: "Submit", text: "Different" } },
+	});
+	assert.equal(result.status, "invalid");
+	assert.match(result.validationError, /must match value|text is only supported for fill/i);
 });
 
 test("analyzeQaPresetTimeout reports unverified expected-text timeouts as QA failures", () => {
@@ -410,6 +438,18 @@ process.stdout.write(JSON.stringify({ success: true, data: { args, title: "Click
 				args: ["--session", "named", "find", "text", "Close", "click"],
 			});
 			assert.equal(sessionClickResult.details?.sessionName, "named");
+
+			const normalizedRoleClick = await executeRegisteredTool(harness.tool, harness.ctx, {
+				semanticAction: { action: "click", locator: "role", role: "button", value: "SEND MESSAGE" },
+			});
+			assert.equal(normalizedRoleClick.isError, false);
+			assert.deepEqual(normalizedRoleClick.details?.inputNormalizations, [{ code: "role-value-as-name", path: "semanticAction" }]);
+			assert.match(normalizedRoleClick.content[0]?.text ?? "", /^Input normalized: semanticAction \(role-value-as-name\)\./);
+			assert.deepEqual(normalizedRoleClick.details?.compiledSemanticAction, {
+				action: "click",
+				locator: "role",
+				args: ["find", "role", "button", "click", "--name", "SEND MESSAGE"],
+			});
 
 			const selectResult = await executeRegisteredTool(harness.tool, harness.ctx, {
 				semanticAction: { action: "select", selector: "#flavor-select", value: "chocolate", session: "named" },

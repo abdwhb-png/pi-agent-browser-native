@@ -239,7 +239,7 @@ Upstream restore-state persistence remains upstream-owned. The wrapper passes an
 
 ### `pi-agent-browser-native` owns
 
-- tool registration and schema (including the optional `semanticAction` compilation path to upstream `find` or `select`)
+- tool registration and a compact single-object structured schema (including the optional `semanticAction` compilation path to upstream `find` or `select`). A pre-validation normalization seam repairs two deterministic small-model mistakes for `semanticAction` and `job` while preserving public fields; it records only normalization codes/paths, and leaves ambiguous or contradictory targets to bounded structured validation errors
 - bounded, fail-open argv capability inspection against the external binary: root and command-family help run without a shell, are cached by cwd/`PATH`/observed version, and reject only flags that usable installed help proves unsupported. The same boundary receives direct args, effective batch rows, generated structured-mode argv, and recursive script calls; `plugin run` payloads and dash-prefixed operand/value positions remain opaque
 - subprocess execution and JSON parsing through `buildAgentBrowserProcessEnv` in `extensions/agent-browser/lib/process.ts`: copies the parent process environment so user-approved provider credentials and other runtime variables reach upstream, then applies wrapper overrides such as the managed socket directory and clamped default operation timeout
 - clear missing-binary errors

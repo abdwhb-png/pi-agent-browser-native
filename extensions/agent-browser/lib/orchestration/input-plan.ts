@@ -5,6 +5,7 @@ import { compileAgentBrowserElectron } from "../input-modes/electron.js";
 import { compileAgentBrowserJob, compileAgentBrowserQaPreset } from "../input-modes/job.js";
 import { compileAgentBrowserNetworkSourceLookup, compileAgentBrowserSourceLookup, redactNetworkSourceLookupArgs, redactNetworkSourceLookupUrl } from "../input-modes/lookups.js";
 import { compileAgentBrowserSemanticAction } from "../input-modes/semantic-action.js";
+import { normalizeAgentBrowserStructuredInputs, type AgentBrowserInputNormalization } from "../input-modes/normalization.js";
 import { AGENT_BROWSER_SCRIPT_MAX_TIMEOUT_MS, compileAgentBrowserScript, type CompiledAgentBrowserScript } from "../input-modes/script.js";
 import { type CompiledAgentBrowserElectron, type CompiledAgentBrowserJob, type CompiledAgentBrowserNetworkSourceLookup, type CompiledAgentBrowserQaPreset, type CompiledAgentBrowserSemanticAction, type CompiledAgentBrowserSourceLookup } from "../input-modes/types.js";
 export interface AgentBrowserExecuteParams {
@@ -41,6 +42,7 @@ type ResolvedAgentBrowserInputModeFields = {
 };
 
 interface ResolvedAgentBrowserInputBase {
+	inputNormalizations?: AgentBrowserInputNormalization[];
 	redactedArgs: string[];
 	toolArgs: string[];
 	toolStdin?: string;
@@ -175,8 +177,9 @@ export function resolveAgentBrowserInput(options: {
 	params: AgentBrowserExecuteParams;
 }): ResolvedAgentBrowserInput {
 	const { getBatchPreflightValidationError, params } = options;
-	const semanticActionResult = params.semanticAction === undefined ? {} : compileAgentBrowserSemanticAction(params.semanticAction);
-	const jobResult = params.job === undefined ? {} : compileAgentBrowserJob(params.job);
+	const normalizedInputs = normalizeAgentBrowserStructuredInputs(params);
+	const semanticActionResult = params.semanticAction === undefined ? {} : compileAgentBrowserSemanticAction(normalizedInputs.semanticAction);
+	const jobResult = params.job === undefined ? {} : compileAgentBrowserJob(normalizedInputs.job);
 	const qaResult = params.qa === undefined ? {} : compileAgentBrowserQaPreset(params.qa);
 	const sourceLookupResult = params.sourceLookup === undefined ? {} : compileAgentBrowserSourceLookup(params.sourceLookup);
 	const networkSourceLookupResult = params.networkSourceLookup === undefined ? {} : compileAgentBrowserNetworkSourceLookup(params.networkSourceLookup);
@@ -279,7 +282,7 @@ export function resolveAgentBrowserInput(options: {
 	const redactedCompiledNetworkSourceLookup = redactCompiledNetworkSourceLookup(compiledNetworkSourceLookup);
 	const redactedCompiledQaPreset = compiledQaPreset && redactedCompiledJob ? { ...redactedCompiledJob, checks: compiledQaPreset.checks } : undefined;
 	const redactedCompiledSourceLookup = redactCompiledSourceLookup(compiledSourceLookup);
-	const resolvedBase: ResolvedAgentBrowserInputBase = { redactedArgs, toolArgs, toolStdin };
+	const resolvedBase: ResolvedAgentBrowserInputBase = { inputNormalizations: normalizedInputs.normalizations.length > 0 ? normalizedInputs.normalizations : undefined, redactedArgs, toolArgs, toolStdin };
 	if (validationError) {
 		return {
 			...resolvedBase,
@@ -362,9 +365,11 @@ export function buildValidationFailureResult(input: ResolvedAgentBrowserInvalidI
 	isError: true;
 } {
 	const validationError = input.validationError ?? "Invalid agent_browser input.";
+	const jobStepPath = validationError.match(/job\.steps\[(\d+)\]/u)?.[0];
+	const inputValidationPath = jobStepPath ?? input.attemptedKind;
 	return {
 		content: [{ type: "text", text: validationError }],
-		details: {
+			details: {
 			args: input.redactedArgs,
 			compiledElectron: input.redactedCompiledElectron,
 			compiledJob: input.redactedCompiledJob,
@@ -372,6 +377,14 @@ export function buildValidationFailureResult(input: ResolvedAgentBrowserInvalidI
 			compiledSourceLookup: input.redactedCompiledSourceLookup,
 			compiledNetworkSourceLookup: input.redactedCompiledNetworkSourceLookup,
 			compiledSemanticAction: input.redactedCompiledSemanticAction,
+			inputNormalizations: input.inputNormalizations,
+			inputValidation: input.attemptedKind === "semanticAction" || input.attemptedKind === "job" ? {
+				code: "invalid-structured-input",
+				path: inputValidationPath,
+				canonicalShape: input.attemptedKind === "semanticAction"
+					? { action: "click", locator: "role", role: "button", name: "Submit" }
+					: { steps: [{ action: "click", locator: "text", value: "Submit" }] },
+			} : undefined,
 			...buildAgentBrowserResultCategoryDetails({
 				args: input.redactedArgs,
 				errorText: validationError,
@@ -382,4 +395,17 @@ export function buildValidationFailureResult(input: ResolvedAgentBrowserInvalidI
 		},
 		isError: true,
 	};
+}
+
+export function applyInputNormalizationsToResult<T extends { content: Array<{ type: string; text?: string }>; details?: unknown }>(
+	result: T,
+	normalizations: AgentBrowserInputNormalization[] | undefined,
+): T {
+	if (!normalizations?.length) return result;
+	const lines = normalizations.map((entry) => `Input normalized: ${entry.path} (${entry.code}).`);
+	const content = [...result.content];
+	const first = content[0];
+	if (first?.type === "text") content[0] = { ...first, text: `${lines.join("\n")}\n\n${first.text ?? ""}` };
+	else content.unshift({ type: "text", text: lines.join("\n") });
+	return { ...result, content, details: { ...(typeof result.details === "object" && result.details !== null ? result.details : {}), inputNormalizations: normalizations } };
 }

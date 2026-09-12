@@ -50,11 +50,19 @@ test("semantic schema rejects non-select values and select text like the compile
 	for (const action of ["check", "click", "fill"]) {
 		const semanticAction = { action, selector: "#target", values: ["nope"], ...(action === "fill" ? { text: "query" } : {}) };
 		assert.match(compileAgentBrowserSemanticAction(semanticAction).error ?? "", /values is only supported for select/);
-		assert.equal(Check(schema, { semanticAction }), false, JSON.stringify(semanticAction));
+		assert.equal(Check(schema, { semanticAction }), true, "runtime validation owns cross-field values rules without anyOf");
 	}
 	const semanticAction = { action: "select", selector: "#flavor", value: "chocolate", text: "ignored" };
 	assert.match(compileAgentBrowserSemanticAction(semanticAction).error ?? "", /text is not supported for select/);
-	assert.equal(Check(schema, { semanticAction }), false);
+	assert.equal(Check(schema, { semanticAction }), true, "runtime validation owns cross-field select/text rules without anyOf");
+});
+
+test("semantic schema uses one compact object without redundant anyOf", () => {
+	const schema = createAgentBrowserParamsSchema() as { properties: { semanticAction: { additionalProperties?: boolean; anyOf?: unknown } } };
+	assert.equal(schema.properties.semanticAction.anyOf, undefined);
+	assert.equal(schema.properties.semanticAction.additionalProperties, false);
+	assert.ok(Buffer.byteLength(JSON.stringify(schema)) <= 10 * 1024);
+	assert.equal(Check(schema, { semanticAction: { action: '{"action":"click"}', locator: "text", value: "Submit" } }), false);
 });
 
 test("semantic schema keeps supported locators, role aliases, selectors and select options", () => {
