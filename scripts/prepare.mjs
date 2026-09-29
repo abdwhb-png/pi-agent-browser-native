@@ -8,7 +8,7 @@
 
 import { execFile as execFileCallback } from "node:child_process";
 import { createRequire } from "node:module";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
 
@@ -33,17 +33,19 @@ function canResolveBuildDependencies() {
 }
 
 async function runNpmInstallDevDependencies() {
-	const npmExecPath = process.env.npm_execpath;
+	const packageManager = /^bun(?:\.exe)?$/iu.test(basename(process.env.npm_execpath ?? "")) ? "bun" : "npm";
+	const args = packageManager === "bun"
+		? ["install", "--ignore-scripts"]
+		: ["install", "--include=dev", "--ignore-scripts"];
 	const options = process.platform === "win32" ? { shell: true } : {};
-	if (npmExecPath) {
-		await execFile(process.execPath, [npmExecPath, "install", "--include=dev", "--ignore-scripts"], {
-			...options,
-			cwd: process.cwd(),
-			maxBuffer: 20 * 1024 * 1024,
-		});
-		return;
+	let socketFirewallAvailable = false;
+	try {
+		await execFile("sfw", ["--version"], options);
+		socketFirewallAvailable = true;
+	} catch (error) {
+		if (error.code !== "ENOENT") throw error;
 	}
-	await execFile("npm", ["install", "--include=dev", "--ignore-scripts"], {
+	await execFile(socketFirewallAvailable ? "sfw" : packageManager, socketFirewallAvailable ? ["--", packageManager, ...args] : args, {
 		...options,
 		cwd: process.cwd(),
 		maxBuffer: 20 * 1024 * 1024,
