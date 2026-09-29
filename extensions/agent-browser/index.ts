@@ -78,7 +78,7 @@ import {
 	type ElectronLaunchRecord,
 } from "./lib/orchestration/electron-host/index.js";
 import { applyInputNormalizationsToResult, buildValidationFailureResult, resolveAgentBrowserInput, type AgentBrowserExecuteParams } from "./lib/orchestration/input-plan.js";
-import { applyDynamicArgvValidationWarning, DynamicArgvValidator, type DynamicArgvValidationResult } from "./lib/orchestration/dynamic-argv-validation.js";
+import type { DynamicArgvValidationResult, DynamicArgvValidator } from "./lib/orchestration/dynamic-argv-validation.js";
 import { applyAgentBrowserOutputPath, normalizeRequestedOutputPath } from "./lib/orchestration/output-file.js";
 import { appendScriptSessionLease, buildScriptBrowserEnvelope, buildScriptToolResult, getScriptSessionLeasesFromBranch } from "./lib/orchestration/script-mode.js";
 import type { FileArtifactMetadata, NetworkRouteRecord, SessionArtifactManifest } from "./lib/results/contracts.js";
@@ -982,7 +982,9 @@ export default function agentBrowserExtension(
 	let branchRestoreGeneration = 0;
 	let branchStateGeneration = 0;
 	const validatedUpstreamPathKeys = new Set<string>();
-	const dynamicArgvValidator = new DynamicArgvValidator(async (args, cwd, timeoutMs, signal) => runAgentBrowserProcess({ args, cwd, env: { PI_AGENT_BROWSER_ARGV_INSPECTION: "1" }, signal, timeoutMs }));
+	let dynamicArgvValidator: DynamicArgvValidator | undefined;
+	let dynamicArgvModulePromise: Promise<typeof import("./lib/orchestration/dynamic-argv-validation.js")> | undefined;
+	const loadDynamicArgvModule = () => dynamicArgvModulePromise ??= import("./lib/orchestration/dynamic-argv-validation.js");
 
 	const recordingPersistenceWarning = "Recording persistence warning: recording protection could not be saved to the Pi journal. Restart protection is not yet durable; keep recording destinations untouched until exact stop or close. The next browser operation retries journal persistence; cleanup remains available.";
 
@@ -1770,6 +1772,8 @@ export default function agentBrowserExtension(
 				flushRecordingReservations();
 				let dynamicArgvValidation: DynamicArgvValidationResult | undefined;
 				if (!electronHostOnlyAction && toolArgs.length > 0 && !isPlainTextInspectionArgs(toolArgs) && signal?.aborted !== true) {
+					const { DynamicArgvValidator } = await loadDynamicArgvModule();
+					dynamicArgvValidator ??= new DynamicArgvValidator(async (args, cwd, timeoutMs, signal) => runAgentBrowserProcess({ args, cwd, env: { PI_AGENT_BROWSER_ARGV_INSPECTION: "1" }, signal, timeoutMs }));
 					const processEnvironment = getAgentBrowserProcessEnvironment();
 					dynamicArgvValidation = await dynamicArgvValidator.validate({
 						args: toolArgs,
@@ -1933,7 +1937,9 @@ export default function agentBrowserExtension(
 					if (serializeBrowserCommand) branchStateGeneration += 1;
 				}
 				const userRequestedJson = Array.isArray(params.args) && params.args.includes("--json");
-				const validatedResult = dynamicArgvValidation ? applyDynamicArgvValidationWarning(result, dynamicArgvValidation, userRequestedJson) : result;
+				const validatedResult = dynamicArgvValidation
+					? (await loadDynamicArgvModule()).applyDynamicArgvValidationWarning(result, dynamicArgvValidation, userRequestedJson)
+					: result;
 				return applyAgentBrowserOutputPath({ cwd: ctx.cwd, outputPath, preserveTextContent: userRequestedJson, result: warnRecordingPersistence(validatedResult) });
 			};
 
