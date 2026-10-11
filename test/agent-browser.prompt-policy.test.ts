@@ -1,24 +1,49 @@
 /**
  * Purpose: Verify prompt-derived policy helpers for the pi-agent-browser extension.
- * Responsibilities: Assert direct agent-browser bash allowance, browser-prompt detection, stop boundaries, and requested artifact extraction.
+ * Responsibilities: Assert direct agent-browser bash allowance, stop boundaries, and requested artifact extraction.
  * Scope: Unit-style Node test-runner coverage for pure prompt-policy helpers.
  */
 
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 
-import { WEB_SEARCH_PROMPT_GUIDELINE } from "../extensions/agent-browser/lib/playbook.js";
-import { buildPromptPolicy, getLatestUserPrompt, shouldAppendBrowserSystemPrompt } from "../extensions/agent-browser/lib/prompt-policy.js";
+import {
+	buildPromptPolicy,
+	getLatestUserMessage,
+	getMessageText,
+} from "../extensions/agent-browser/lib/prompt-policy.js";
 
-test("buildPromptPolicy and getLatestUserPrompt derive direct agent-browser bash policy from prompt text without globals", () => {
-	const prompt = getLatestUserPrompt([
-		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "Not relevant" }] } },
-		{ type: "message", message: { role: "user", content: [{ type: "text", text: "Please debug the browser integration via bash." }] } },
-	]);
+test("prompt policy restores the latest raw user intent without projecting or copying historical context", () => {
+	const manager = SessionManager.inMemory();
+	for (let index = 0; index < 1_000; index++) {
+		manager.appendCustomEntry("history", { index });
+	}
+	const userId = manager.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "Please debug the browser integration via bash." }],
+		timestamp: 0,
+	});
+	manager.appendContextEdit(userId, null);
+	manager.appendCompaction("User text omitted from model context", null, 0);
+	let reads = 0;
+	const message = getLatestUserMessage({
+		getLeafId: () => manager.getLeafId(),
+		getEntry(id) {
+			reads += 1;
+			return manager.getEntry(id);
+		},
+	});
+	const prompt = getMessageText(message?.content);
 	const policy = buildPromptPolicy(prompt);
 
 	assert.equal(prompt, "Please debug the browser integration via bash.");
 	assert.equal(policy.allowLegacyAgentBrowserBash, true);
+	assert.equal(
+		reads,
+		3,
+		"restoration stops at the latest raw user instead of reading the older history",
+	);
 });
 
 test("buildPromptPolicy does not allow direct agent-browser bash for generic docs prompts unrelated to agent-browser", () => {
@@ -28,7 +53,9 @@ test("buildPromptPolicy does not allow direct agent-browser bash for generic doc
 });
 
 test("buildPromptPolicy allows explicit tool-specific direct agent-browser bash inspection requests", () => {
-	const policy = buildPromptPolicy("Show me the agent-browser docs and explain agent-browser --help output.");
+	const policy = buildPromptPolicy(
+		"Show me the agent-browser docs and explain agent-browser --help output.",
+	);
 
 	assert.equal(policy.allowLegacyAgentBrowserBash, true);
 });
@@ -38,7 +65,11 @@ test("buildPromptPolicy detects requested artifact paths without deriving semant
 Save a screenshot here: /tmp/pi-smoke/page.png
 Save a short screen recording here if recording is available: /tmp/pi-smoke/run.webm`);
 
-	assert.equal("stopBoundary" in policy, false);
+	assert.deepEqual(
+		Object.keys(policy).sort(),
+		["allowLegacyAgentBrowserBash", "requestedArtifacts"],
+		"prompt policy must not grow semantic action-gate fields under any name",
+	);
 	assert.deepEqual(policy.requestedArtifacts, [
 		{ kind: "screenshot", path: "/tmp/pi-smoke/page.png", required: true },
 		{ kind: "recording", path: "/tmp/pi-smoke/run.webm", required: false },
@@ -60,7 +91,9 @@ Save a short screen recording here if recording is available: recordings/run.web
 });
 
 test("buildPromptPolicy keeps recording paths distinct when prompts are collapsed to one line", () => {
-	const policy = buildPromptPolicy("Save a screenshot here: /tmp/page.png Save a short screen recording here if recording is available: /tmp/run.webm");
+	const policy = buildPromptPolicy(
+		"Save a screenshot here: /tmp/page.png Save a short screen recording here if recording is available: /tmp/run.webm",
+	);
 
 	assert.deepEqual(policy.requestedArtifacts, [
 		{ kind: "screenshot", path: "/tmp/page.png", required: true },
@@ -84,30 +117,58 @@ test("buildPromptPolicy does not treat inbound media descriptions as requested o
 		"No need to save a screenshot at /tmp/input.png",
 		"Take this screenshot: /tmp/input.png",
 	]) {
+		// The nonempty prompt fixture matrix exhaustively verifies each case; any failed assertion fails the test.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(buildPromptPolicy(prompt).requestedArtifacts, []);
 	}
 });
 
 test("buildPromptPolicy scans large path lists linearly", () => {
 	const inbound = Array.from({ length: 10_000 }, (_, index) => `/tmp/input-${index}.png`).join(" ");
-	const output = Array.from({ length: 10_000 }, (_, index) => `/tmp/output-${index}.png`).join(", ");
+	const output = Array.from({ length: 10_000 }, (_, index) => `/tmp/output-${index}.png`).join(
+		", ",
+	);
 
-	assert.deepEqual(buildPromptPolicy(`Review these screenshots: ${inbound}`).requestedArtifacts, []);
-	assert.equal(buildPromptPolicy(`Capture screenshots at ${output}`).requestedArtifacts.length, 10_000);
+	assert.deepEqual(
+		buildPromptPolicy(`Review these screenshots: ${inbound}`).requestedArtifacts,
+		[],
+	);
+	assert.equal(
+		buildPromptPolicy(`Capture screenshots at ${output}`).requestedArtifacts.length,
+		10_000,
+	);
 	const multilineStartedAt = performance.now();
-	const multiline = Array.from({ length: 32_000 }, (_, index) => `- /tmp/multiline-${index}.png`).join("\n");
-	assert.equal(buildPromptPolicy(`${"Context ".repeat(2_000)}. Capture screenshots at:\n${multiline}`).requestedArtifacts.length, 32_000);
+	const multiline = Array.from(
+		{ length: 32_000 },
+		(_, index) => `- /tmp/multiline-${index}.png`,
+	).join("\n");
+	assert.equal(
+		buildPromptPolicy(`${"Context ".repeat(2_000)}. Capture screenshots at:\n${multiline}`)
+			.requestedArtifacts.length,
+		32_000,
+	);
 	const multilineElapsedMs = performance.now() - multilineStartedAt;
-	assert.ok(multilineElapsedMs < 500, `multiline path lists should remain linear; took ${multilineElapsedMs.toFixed(1)}ms`);
-	const repeatedIntents = Array.from({ length: 4_000 }, (_, index) => `save a screenshot to /tmp/repeated-${index}.png`).join(". ");
+	assert.ok(
+		multilineElapsedMs < 500,
+		`multiline path lists should remain linear; took ${multilineElapsedMs.toFixed(1)}ms`,
+	);
+	const repeatedIntents = Array.from(
+		{ length: 4_000 },
+		(_, index) => `save a screenshot to /tmp/repeated-${index}.png`,
+	).join(". ");
 	assert.equal(buildPromptPolicy(repeatedIntents).requestedArtifacts.length, 4_000);
 	const slashHeavyStartedAt = performance.now();
 	assert.deepEqual(buildPromptPolicy(`see a${"/a".repeat(26)}!`).requestedArtifacts, []);
-	assert.ok(performance.now() - slashHeavyStartedAt < 500, "slash-heavy non-path token should not trigger pathological backtracking");
+	assert.ok(
+		performance.now() - slashHeavyStartedAt < 500,
+		"slash-heavy non-path token should not trigger pathological backtracking",
+	);
 });
 
 test("buildPromptPolicy detects requested artifact paths on the following line", () => {
-	const policy = buildPromptPolicy("Take a screenshot and save it to:\n/tmp/final.png\nStart a recording at:\n/tmp/run.webm");
+	const policy = buildPromptPolicy(
+		"Take a screenshot and save it to:\n/tmp/final.png\nStart a recording at:\n/tmp/run.webm",
+	);
 
 	assert.deepEqual(policy.requestedArtifacts, [
 		{ kind: "screenshot", path: "/tmp/final.png", required: true },
@@ -183,61 +244,138 @@ Save a recording to /tmp/required.webm`);
 
 test("buildPromptPolicy scopes per-path availability and keeps duplicate requirements", () => {
 	assert.deepEqual(
-		buildPromptPolicy("Save a recording to /tmp/optional-clause.webm if recording is available. Save a recording to /tmp/required-clause.webm").requestedArtifacts,
+		buildPromptPolicy(
+			"Save a recording to /tmp/optional-clause.webm if recording is available. Save a recording to /tmp/required-clause.webm",
+		).requestedArtifacts,
 		[
 			{ kind: "recording", path: "/tmp/optional-clause.webm", required: false },
 			{ kind: "recording", path: "/tmp/required-clause.webm", required: true },
 		],
 	);
 	assert.deepEqual(
-		buildPromptPolicy("Save a recording to /tmp/run.webm if recording is available\nSave a recording to /tmp/run.webm").requestedArtifacts,
+		buildPromptPolicy(
+			"Save a recording to /tmp/run.webm if recording is available\nSave a recording to /tmp/run.webm",
+		).requestedArtifacts,
 		[{ kind: "recording", path: "/tmp/run.webm", required: true }],
 	);
 });
 
 test("buildPromptPolicy associates output intent with its path and rejects negated intent", () => {
 	assert.deepEqual(
-		buildPromptPolicy("Review /tmp/input.png and save a screenshot to /tmp/output.png").requestedArtifacts,
-		[{ kind: "screenshot", path: "/tmp/output.png", required: true }],
-	);
-	assert.deepEqual(buildPromptPolicy("Do not save this screenshot: /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Do not screenshot the page at /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Do not try to save a screenshot at /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Do not accidentally save a screenshot at /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("I can't save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("I cannot save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You may not save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You may save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You might save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You are allowed to save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("If you want, save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("The docs say, save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Reference example:\n```text\nSave a screenshot to /tmp/input.png\n```").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Reference example:\n~~~text\nSave a screenshot to /tmp/input.png\n~~~").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("If the page errors, save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("If needed, save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Rather than save a screenshot to /tmp/input.png, continue").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Save a screenshot to /tmp/input.png if desired").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You should not save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("You should not accidentally save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(buildPromptPolicy("Don’t save a screenshot to /tmp/input.png").requestedArtifacts, []);
-	assert.deepEqual(
-		buildPromptPolicy("Do not close the browser until you save a screenshot to /tmp/output.png").requestedArtifacts,
+		buildPromptPolicy("Review /tmp/input.png and save a screenshot to /tmp/output.png")
+			.requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/output.png", required: true }],
 	);
 	assert.deepEqual(
-		buildPromptPolicy("Don't finish until you save a screenshot to /tmp/finish.png").requestedArtifacts,
+		buildPromptPolicy("Do not save this screenshot: /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Do not screenshot the page at /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Do not try to save a screenshot at /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Do not accidentally save a screenshot at /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("I can't save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("I cannot save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You may not save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You may save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You might save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You are allowed to save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("If you want, save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("The docs say, save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Reference example:\n```text\nSave a screenshot to /tmp/input.png\n```")
+			.requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Reference example:\n~~~text\nSave a screenshot to /tmp/input.png\n~~~")
+			.requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("If the page errors, save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("If needed, save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Rather than save a screenshot to /tmp/input.png, continue")
+			.requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Save a screenshot to /tmp/input.png if desired").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You should not save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("You should not accidentally save a screenshot to /tmp/input.png")
+			.requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Don’t save a screenshot to /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Do not close the browser until you save a screenshot to /tmp/output.png")
+			.requestedArtifacts,
+		[{ kind: "screenshot", path: "/tmp/output.png", required: true }],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Don't finish until you save a screenshot to /tmp/finish.png")
+			.requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/finish.png", required: true }],
 	);
-	assert.deepEqual(buildPromptPolicy("Take a look at this screenshot: /tmp/input.png").requestedArtifacts, []);
 	assert.deepEqual(
-		buildPromptPolicy("Take a screenshot of the checkout page. Save it at /tmp/checkout.png").requestedArtifacts,
+		buildPromptPolicy("Take a look at this screenshot: /tmp/input.png").requestedArtifacts,
+		[],
+	);
+	assert.deepEqual(
+		buildPromptPolicy("Take a screenshot of the checkout page. Save it at /tmp/checkout.png")
+			.requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/checkout.png", required: true }],
 	);
-	assert.deepEqual(
-		buildPromptPolicy("Take a screenshot: /tmp/colon.png").requestedArtifacts,
-		[{ kind: "screenshot", path: "/tmp/colon.png", required: true }],
-	);
+	assert.deepEqual(buildPromptPolicy("Take a screenshot: /tmp/colon.png").requestedArtifacts, [
+		{ kind: "screenshot", path: "/tmp/colon.png", required: true },
+	]);
 	assert.deepEqual(
 		buildPromptPolicy("Capture a screenshot directly to /tmp/direct.png").requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/direct.png", required: true }],
@@ -247,15 +385,18 @@ test("buildPromptPolicy associates output intent with its path and rejects negat
 		[{ kind: "screenshot", path: "/tmp/checkout.png", required: true }],
 	);
 	assert.deepEqual(
-		buildPromptPolicy("Take a screenshot of react.dev, save to .dogfood/react.png").requestedArtifacts,
+		buildPromptPolicy("Take a screenshot of react.dev, save to .dogfood/react.png")
+			.requestedArtifacts,
 		[{ kind: "screenshot", path: ".dogfood/react.png", required: true }],
 	);
 	assert.deepEqual(
-		buildPromptPolicy("Do not save the input; instead save a screenshot to /tmp/output.png").requestedArtifacts,
+		buildPromptPolicy("Do not save the input; instead save a screenshot to /tmp/output.png")
+			.requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/output.png", required: true }],
 	);
 	assert.deepEqual(
-		buildPromptPolicy("Capture screenshots at /tmp/first.png and /tmp/second.png").requestedArtifacts,
+		buildPromptPolicy("Capture screenshots at /tmp/first.png and /tmp/second.png")
+			.requestedArtifacts,
 		[
 			{ kind: "screenshot", path: "/tmp/first.png", required: true },
 			{ kind: "screenshot", path: "/tmp/second.png", required: true },
@@ -301,33 +442,14 @@ test("buildPromptPolicy associates output intent with its path and rejects negat
 		"Take the screenshot at /tmp/baseline.png — tell me what is broken",
 		"Take the screenshot at /tmp/baseline.png (reference)",
 	]) {
+		// The nonempty prompt fixture matrix exhaustively verifies each case; any failed assertion fails the test.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(buildPromptPolicy(prompt).requestedArtifacts, []);
 	}
 	assert.deepEqual(
-		buildPromptPolicy("Save a screenshot here:\n/tmp/output.png\n/var/folders/xx/T/pi-clipboard-input.png").requestedArtifacts,
+		buildPromptPolicy(
+			"Save a screenshot here:\n/tmp/output.png\n/var/folders/xx/T/pi-clipboard-input.png",
+		).requestedArtifacts,
 		[{ kind: "screenshot", path: "/tmp/output.png", required: true }],
 	);
-});
-
-test("shouldAppendBrowserSystemPrompt only targets clearly browser-oriented prompts", () => {
-	assert.equal(shouldAppendBrowserSystemPrompt("Open https://example.com and take a snapshot."), true);
-	assert.equal(shouldAppendBrowserSystemPrompt("Do web research and read the live docs for this API."), true);
-	assert.equal(shouldAppendBrowserSystemPrompt("Search online for the current browser automation docs."), true);
-	assert.equal(shouldAppendBrowserSystemPrompt("Please review browser compatibility docs."), false);
-	assert.equal(shouldAppendBrowserSystemPrompt("Summarize the article at https://example.com/blog/post for the changelog."), false);
-	assert.equal(shouldAppendBrowserSystemPrompt("Please review the repository architecture."), false);
-});
-
-test("web-search prompt guidance warns about anti-bot search form automation", () => {
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /Prefer agent_browser_web_search for current or external web facts/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /public search-engine forms/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /anti-bot\/CAPTCHA-gated/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /searchType: deep-lite/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /omit it for everyday lookups/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /Provider rank is not proof of authority/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /primary current docs/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /Exa includeDomains; Brave site:/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /URL aliases/);
-	assert.match(WEB_SEARCH_PROMPT_GUIDELINE, /after you have a target URL/);
-	assert.doesNotMatch(WEB_SEARCH_PROMPT_GUIDELINE, /one query, one follow-up max/);
 });

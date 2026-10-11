@@ -1,77 +1,97 @@
-export interface AgentBrowserNextAction {
-	artifactPath?: string;
-	id: string;
-	params?: {
-		args?: string[];
-		electron?: {
-			action: "cleanup" | "list" | "launch" | "probe" | "status";
-			all?: boolean;
-			handoff?: "connect" | "snapshot" | "tabs";
-			launchId?: string;
-		};
-		networkSourceLookup?: {
-			filter?: string;
-			namespace?: string;
-			requestId?: string;
-			session?: string;
-			url?: string;
-		};
-		sessionMode?: "auto" | "fresh";
-		stdin?: string;
-	};
-	reason: string;
-	safety?: string;
-	tool: "agent_browser";
+import type { AgentBrowserNextAction } from "./action-contracts.js";
+
+export type { AgentBrowserNextAction } from "./action-contracts.js";
+
+export function withOptionalNamespaceArgs(
+	namespace: string | undefined,
+	args: readonly string[],
+): readonly string[] {
+	return namespace !== undefined && args[0] !== "--namespace"
+		? ["--namespace", namespace, ...args]
+		: args;
 }
 
-export function withOptionalNamespaceArgs(namespace: string | undefined, args: string[]): string[] {
-	return namespace !== undefined && args[0] !== "--namespace" ? ["--namespace", namespace, ...args] : args;
-}
-
-export function withOptionalSessionArgs(sessionName: string | undefined, args: string[]): string[] {
-	if (!sessionName || args[0] === "--session" || (args[0] === "--namespace" && args[2] === "--session")) return args;
-	if (args[0] === "--namespace" && args.length >= 2) return [args[0], args[1], "--session", sessionName, ...args.slice(2)];
+export function withOptionalSessionArgs(
+	sessionName: string | undefined,
+	args: readonly string[],
+): readonly string[] {
+	if (
+		sessionName === undefined ||
+		sessionName.length === 0 ||
+		args[0] === "--session" ||
+		(args[0] === "--namespace" && args[2] === "--session")
+	) {
+		return args;
+	}
+	if (args[0] === "--namespace" && args.length >= 2) {
+		return [args[0], args[1], "--session", sessionName, ...args.slice(2)];
+	}
 	return ["--session", sessionName, ...args];
 }
 
-export function applyNamespaceToNextActions(actions: AgentBrowserNextAction[] | undefined, namespace: string | undefined): AgentBrowserNextAction[] | undefined {
-	if (namespace === undefined || !actions) return actions;
+export function applyNamespaceToNextActions(
+	actions: readonly AgentBrowserNextAction[] | undefined,
+	namespace: string | undefined,
+): readonly AgentBrowserNextAction[] | undefined {
+	if (namespace === undefined || !actions) {
+		return actions;
+	}
 	return actions.map((action) => {
 		const args = action.params?.args;
-		if (args) return { ...action, params: { ...action.params, args: withOptionalNamespaceArgs(namespace, args) } };
-		const networkSourceLookup = action.params?.networkSourceLookup;
-		return networkSourceLookup ? { ...action, params: { ...action.params, networkSourceLookup: { ...networkSourceLookup, namespace } } } : action;
+		if (args) {
+			return {
+				...action,
+				params: { ...action.params, args: withOptionalNamespaceArgs(namespace, args) },
+			};
+		}
+		return action.tool === "agent_browser_network_source"
+			? { ...action, params: { ...action.params, namespace } }
+			: action;
 	});
 }
 
-export function applySessionToNextActions(actions: AgentBrowserNextAction[] | undefined, sessionName: string | undefined): AgentBrowserNextAction[] | undefined {
-	if (!sessionName || !actions) return actions;
+export function applySessionToNextActions(
+	actions: readonly AgentBrowserNextAction[] | undefined,
+	sessionName: string | undefined,
+): readonly AgentBrowserNextAction[] | undefined {
+	if (sessionName === undefined || sessionName.length === 0 || !actions) {
+		return actions;
+	}
 	return actions.map((action) => {
 		// Fresh-session actions deliberately target a new session; the planner ignores sessionMode when an
 		// explicit --session is present, so prefixing one here would silently downgrade them to reuse.
-		if (action.params?.sessionMode === "fresh") return action;
+		if (action.params?.sessionMode === "fresh") {
+			return action;
+		}
 		const args = action.params?.args;
-		return args ? { ...action, params: { ...action.params, args: withOptionalSessionArgs(sessionName, args) } } : action;
+		return args
+			? {
+					...action,
+					params: { ...action.params, args: withOptionalSessionArgs(sessionName, args) },
+				}
+			: action;
 	});
 }
 
 export function buildNextToolAction(options: {
-	args: string[];
-	id: string;
-	reason: string;
-	safety?: string;
-	sessionMode?: "auto" | "fresh";
-	stdin?: string;
+	readonly args: readonly string[];
+	readonly id: string;
+	readonly reason: string;
+	readonly safety?: string;
+	readonly sessionMode?: "auto" | "fresh";
+	readonly stdin?: string;
 }): AgentBrowserNextAction {
 	return {
 		id: options.id,
 		params: {
 			args: options.args,
-			...(options.sessionMode ? { sessionMode: options.sessionMode } : {}),
-			...(options.stdin ? { stdin: options.stdin } : {}),
+			...(options.sessionMode !== undefined ? { sessionMode: options.sessionMode } : {}),
+			...(options.stdin !== undefined && options.stdin.length > 0 ? { stdin: options.stdin } : {}),
 		},
 		reason: options.reason,
-		...(options.safety ? { safety: options.safety } : {}),
+		...(options.safety !== undefined && options.safety.length > 0
+			? { safety: options.safety }
+			: {}),
 		tool: "agent_browser",
 	};
 }
@@ -80,19 +100,28 @@ export function buildInspectOverlayStateAction(sessionName?: string): AgentBrows
 	return buildNextToolAction({
 		args: withOptionalSessionArgs(sessionName, ["snapshot", "-i"]),
 		id: "inspect-overlay-state",
-		reason: "Refresh interactive refs and inspect whether an overlay, banner, modal, or dialog is blocking the intended click.",
-		safety: "Read-only inspection; do not blindly retry the blocked click, and use current refs from this snapshot before interacting.",
+		reason:
+			"Refresh interactive refs and inspect whether an overlay, banner, modal, or dialog is blocking the intended click.",
+		safety:
+			"Read-only inspection; do not blindly retry the blocked click, and use current refs from this snapshot before interacting.",
 	});
 }
 
+// This accumulator is caller-owned mutable state; append preserves its identity and side effects.
+export type AgentBrowserNextActionAccumulator = AgentBrowserNextAction[];
+
 export function appendUniqueAgentBrowserNextActions(
-	target: AgentBrowserNextAction[],
-	additions: AgentBrowserNextAction[] | undefined,
+	target: AgentBrowserNextActionAccumulator,
+	additions: readonly AgentBrowserNextAction[] | undefined,
 ): AgentBrowserNextAction[] {
-	if (!additions || additions.length === 0) return target;
+	if (!additions || additions.length === 0) {
+		return target;
+	}
 	const existingIds = new Set(target.map((action) => action.id));
 	for (const action of additions) {
-		if (existingIds.has(action.id)) continue;
+		if (existingIds.has(action.id)) {
+			continue;
+		}
 		target.push(action);
 		existingIds.add(action.id);
 	}
@@ -101,18 +130,28 @@ export function appendUniqueAgentBrowserNextActions(
 
 export function isStandaloneSnapshotNextAction(action: AgentBrowserNextAction): boolean {
 	const args = action.params?.args;
-	if (!args || action.params?.stdin) return false;
+	if (!args || (action.params.stdin !== undefined && action.params.stdin.length > 0)) {
+		return false;
+	}
 	let commandIndex = args[0] === "--namespace" ? 2 : 0;
-	if (args[commandIndex] === "--session") commandIndex += 2;
+	if (args[commandIndex] === "--session") {
+		commandIndex += 2;
+	}
 	return args[commandIndex] === "snapshot";
 }
 
-export function alignPageChangeSummaryNextActionIds<T extends { nextActionIds?: string[] }>(
+export function alignPageChangeSummaryNextActionIds<
+	T extends { readonly nextActionIds?: readonly string[] },
+>(
 	summary: T | undefined,
-	nextActions: AgentBrowserNextAction[] | undefined,
+	nextActions: readonly AgentBrowserNextAction[] | undefined,
 ): T | undefined {
-	if (!summary?.nextActionIds || !nextActions) return summary;
+	if (!summary?.nextActionIds || !nextActions) {
+		return summary;
+	}
 	const nextActionIds = new Set(nextActions.map((action) => action.id));
 	const alignedIds = summary.nextActionIds.filter((id) => nextActionIds.has(id));
-	return alignedIds.length > 0 ? { ...summary, nextActionIds: alignedIds } : { ...summary, nextActionIds: undefined };
+	return alignedIds.length > 0
+		? { ...summary, nextActionIds: alignedIds }
+		: { ...summary, nextActionIds: undefined };
 }

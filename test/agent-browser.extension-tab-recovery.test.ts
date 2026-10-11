@@ -1,3 +1,4 @@
+import { readArray, readRecord, readString } from "./helpers/assertions.js";
 /**
  * Purpose: Verify extension tab recovery and focus-drift behavior.
  * Responsibilities: Assert restored-tab selection, pinned follow-up commands, about:blank recovery, and overlapping explicit-session target ordering.
@@ -7,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -23,29 +24,40 @@ import {
 } from "./helpers/agent-browser-harness.js";
 
 function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
 }
 
 async function waitForInvocation(
 	logPath: string,
-	predicate: (entry: Awaited<ReturnType<typeof readInvocationLog>>[number]) => boolean,
+	predicate: (entry: { readonly args: readonly string[] }) => boolean,
 	timeoutMs = 15_000,
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if ((await readInvocationLog(logPath)).some(predicate)) return;
+		// Read this shared invocation log before issuing the next command or polling retry.
+		// oxlint-disable-next-line no-await-in-loop
+		if ((await readInvocationLog(logPath)).some(predicate)) {
+			return;
+		}
+		// Read this shared invocation log before issuing the next command or polling retry.
+		// oxlint-disable-next-line no-await-in-loop
 		await delay(5);
 	}
 	assert.fail(`Timed out waiting for invocation in ${logPath}`);
 }
 
-test("agentBrowserExtension re-selects the navigated tab after profiled opens when restored tabs steal focus", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension re-selects the navigated tab after profiled opens when restored tabs steal focus",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("tab") && args.includes("list")) {
@@ -58,51 +70,57 @@ if (args.includes("tab") && args.includes("list")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: { title: "Example Domain", url: "https://example.com/" } }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--session", "named", "--profile", "Default", "open", "https://example.com"],
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "--profile", "Default", "open", "https://example.com"],
+				});
+				const resultDetails = readRecord(result.details);
+				assert.equal(result.isError, false);
+				assert.deepEqual(resultDetails.openResultTabCorrection, {
+					selectedTab: "t1",
+					selectionKind: "tabId",
+					targetTitle: "Example Domain",
+					targetUrl: "https://example.com/",
+				});
+
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(invocations.length, 4);
+				assert.deepEqual(invocations[0]?.args, [
+					"--json",
+					"--session",
+					"named",
+					"--profile",
+					"Default",
+					"open",
+					"https://example.com",
+				]);
+				assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "tab", "t1"]);
+				assert.deepEqual(invocations[3]?.args, ["--json", "--session", "named", "tab", "list"]);
 			});
-			assert.equal(result.isError, false);
-			assert.deepEqual(result.details?.openResultTabCorrection, {
-				selectedTab: "t1",
-				selectionKind: "tabId",
-				targetTitle: "Example Domain",
-				targetUrl: "https://example.com/",
-			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.length, 3);
-			assert.deepEqual(invocations[0]?.args, [
-				"--json",
-				"--session",
-				"named",
-				"--profile",
-				"Default",
-				"open",
-				"https://example.com",
-			]);
-			assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "tab", "t1"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension recovers and preserves the prior target when a command returns about:blank", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-"));
-	const logPath = join(tempDir, "invocations.log");
-	const statePath = join(tempDir, "tab-state.json");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension recovers and preserves the prior target when a command returns about:blank",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-"));
+		const logPath = join(tempDir, "invocations.log");
+		const statePath = join(tempDir, "tab-state.json");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -131,79 +149,113 @@ if (args.includes("click")) {
   save();
   process.stdout.write(JSON.stringify({ success: true, data: exampleSite }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const resumedHarness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
-			});
-			await runExtensionEvent(resumedHarness.handlers, "session_start", { reason: "resume" }, resumedHarness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const resumedHarness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					resumedHarness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					resumedHarness.ctx,
+				);
 
-			const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "click", "@e9"],
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.match((result.content[0] as { text: string }).text, /^Warning: agent_browser detected that this session returned about:blank/);
-			assert.match((result.content[0] as { text: string }).text, /https:\/\/example\.com\//);
-			assert.deepEqual(result.details?.aboutBlankSessionMismatch, {
-				activeUrl: "about:blank",
-				recoveryApplied: true,
-				recoveryHint: "agent_browser detected that the active tab became about:blank while this session still had a prior intended tab. Run tab list for this session and re-select the intended tab, or retry with sessionMode=fresh if the tab is gone.",
-				targetTitle: "Example Domain",
-				targetUrl: "https://example.com/",
-			});
-			assert.deepEqual(result.details?.sessionTabCorrection, {
-				selectedTab: "t1",
-				selectionKind: "tabId",
-				targetTitle: "Example Domain",
-				targetUrl: "https://example.com/",
-			});
-			const aboutBlankRecoveryActions = (result.details?.nextActions as Array<{ id: string; params?: { args?: string[] } }> | undefined)
-				?.filter((action) => ["list-tabs-for-about-blank-recovery", "select-intended-tab-after-drift", "snapshot-after-tab-recovery"].includes(action.id));
-			assert.deepEqual(aboutBlankRecoveryActions?.map((action) => action.id), ["list-tabs-for-about-blank-recovery", "select-intended-tab-after-drift", "snapshot-after-tab-recovery"]);
-			assert.deepEqual(aboutBlankRecoveryActions?.map((action) => action.params?.args), [
-				["--session", "named", "tab", "list"],
-				["--session", "named", "tab", "t1"],
-				["--session", "named", "snapshot", "-i"],
-			]);
-			assert.deepEqual(result.details?.sessionTabTarget, {
-				title: "Example Domain",
-				url: "https://example.com/",
-			});
+				const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
+					args: ["--session", "named", "click", "@e9"],
+				});
+				const resultDetails = readRecord(result.details);
+				assert.equal(result.isError, false, JSON.stringify(result));
+				assert.match(
+					readString(readRecord(result.content[0]).text),
+					/^Warning: agent_browser detected that this session returned about:blank/,
+				);
+				assert.match(readString(readRecord(result.content[0]).text), /https:\/\/example\.com\//);
+				assert.deepEqual(resultDetails.aboutBlankSessionMismatch, {
+					activeUrl: "about:blank",
+					recoveryApplied: true,
+					recoveryHint:
+						"agent_browser detected that the active tab became about:blank while this session still had a prior intended tab. Run tab list for this session and re-select the intended tab, or retry with sessionMode=fresh if the tab is gone.",
+					targetTitle: "Example Domain",
+					targetUrl: "https://example.com/",
+				});
+				assert.deepEqual(resultDetails.sessionTabCorrection, {
+					selectedTab: "t1",
+					selectionKind: "tabId",
+					targetTitle: "Example Domain",
+					targetUrl: "https://example.com/",
+				});
+				const aboutBlankRecoveryActions = readArray(resultDetails.nextActions ?? [])
+					.map((value) => readRecord(value))
+					.filter((action) =>
+						[
+							"list-tabs-for-about-blank-recovery",
+							"select-intended-tab-after-drift",
+							"snapshot-after-tab-recovery",
+						].includes(readString(action.id)),
+					);
+				assert.deepEqual(
+					aboutBlankRecoveryActions.map((action) => action.id),
+					[
+						"list-tabs-for-about-blank-recovery",
+						"select-intended-tab-after-drift",
+						"snapshot-after-tab-recovery",
+					],
+				);
+				assert.deepEqual(
+					aboutBlankRecoveryActions.map((action) => readRecord(action.params).args),
+					[
+						["--session", "named", "tab", "list"],
+						["--session", "named", "tab", "t1"],
+						["--session", "named", "snapshot", "-i"],
+					],
+				);
+				assert.deepEqual(resultDetails.sessionTabTarget, {
+					title: "Example Domain",
+					url: "https://example.com/",
+				});
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("batch")), false);
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-			assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "t1"]);
-			assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations.at(-1)?.args, ["--json", "--session", "named", "tab", "t1"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(
+					invocations.some((entry) => entry.args.includes("batch")),
+					false,
+				);
+				assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+				assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "t1"]);
+				assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations.at(-1)?.args, ["--json", "--session", "named", "tab", "t1"]);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension records about:blank and blocks stale refs when about:blank has no recoverable tab", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-missing-"));
-	const logPath = join(tempDir, "invocations.log");
-	const statePath = join(tempDir, "tab-state.json");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension records about:blank and blocks stale refs when about:blank has no recoverable tab",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-missing-"));
+		const logPath = join(tempDir, "invocations.log");
+		const statePath = join(tempDir, "tab-state.json");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -233,96 +285,152 @@ if (args.includes("click")) {
   save();
   process.stdout.write(JSON.stringify({ success: true, data: state.targetGone ? { title: "", url: "about:blank" } : exampleSite }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const resumedHarness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "snapshot", "-i"],
-							command: "snapshot",
-							refSnapshot: {
-								refIds: ["e9"],
-								refs: { e9: { role: "link", name: "Existing" } },
-								target: { title: "Example Domain", url: "https://example.com/" },
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const seed = createExtensionHarness({ cwd: tempDir });
+				const capture = await executeRegisteredTool(seed.tool, seed.ctx, {
+					args: ["--session", "named", "snapshot", "-i"],
+				});
+				const captureDetails = readRecord(capture.details);
+				assert.equal(capture.isError, false, JSON.stringify(capture));
+				await writeFile(statePath, JSON.stringify({ targetGone: false, active: false }));
+				await writeFile(logPath, "");
+				const resumedHarness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
 							},
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
-			});
-			await runExtensionEvent(resumedHarness.handlers, "session_start", { reason: "resume" }, resumedHarness.ctx);
+							isError: false,
+						}),
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "snapshot", "-i"],
+								command: "snapshot",
+								refSnapshot: {
+									...readRecord(captureDetails.refSnapshot),
+									refIds: ["e9"],
+									refs: { e9: { role: "link", name: "Existing" } },
+									target: { title: "Example Domain", url: "https://example.com/" },
+								},
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					resumedHarness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					resumedHarness.ctx,
+				);
 
-			const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "click", "@e9"],
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.match((result.content[0] as { text: string }).text, /No matching tab could be re-selected/);
-			assert.match((result.content[0] as { text: string }).text, /sessionMode=fresh/);
-			assert.equal((result.details?.aboutBlankSessionMismatch as { recoveryApplied?: boolean } | undefined)?.recoveryApplied, false);
-			assert.deepEqual(result.details?.sessionTabCorrection, {
-				selectedTab: "t1",
-				selectionKind: "tabId",
-				targetTitle: "Example Domain",
-				targetUrl: "https://example.com/",
-			});
-			assert.deepEqual(result.details?.sessionTabTarget, {
-				title: undefined,
-				url: "about:blank",
-			});
-			const nextActions = result.details?.nextActions as Array<{ id: string; params?: { args?: string[]; stdin?: string } }> | undefined;
-			const recoveryActions = nextActions
-				?.filter((action) => ["list-tabs-for-about-blank-recovery", "select-intended-tab-after-drift", "snapshot-after-tab-recovery"].includes(action.id));
-			assert.deepEqual(recoveryActions?.map((action) => action.id), ["list-tabs-for-about-blank-recovery"]);
-			assert.deepEqual(recoveryActions?.[0]?.params?.args, ["--session", "named", "tab", "list"]);
-			assert.equal(nextActions?.some((action) => action.id === "inspect-after-mutation" || (action.params?.args?.at(-2) === "snapshot" && action.params?.stdin === undefined)), false);
-			const pageChangeSummary = result.details?.pageChangeSummary as { nextActionIds?: string[] } | undefined;
-			assert.equal(pageChangeSummary?.nextActionIds, undefined);
+				const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
+					args: ["--session", "named", "click", "@e9"],
+				});
+				const resultDetails = readRecord(result.details);
+				assert.equal(result.isError, false, JSON.stringify(result));
+				assert.match(
+					readString(readRecord(result.content[0]).text),
+					/No matching tab could be re-selected/,
+				);
+				assert.match(readString(readRecord(result.content[0]).text), /sessionMode=fresh/);
+				assert.equal(
+					readRecord(resultDetails.aboutBlankSessionMismatch ?? {}).recoveryApplied,
+					false,
+				);
+				assert.deepEqual(resultDetails.sessionTabCorrection, {
+					selectedTab: "t1",
+					selectionKind: "tabId",
+					targetTitle: "Example Domain",
+					targetUrl: "https://example.com/",
+				});
+				assert.deepEqual(resultDetails.sessionTabTarget, {
+					title: undefined,
+					url: "about:blank",
+				});
+				const nextActions = readArray(resultDetails.nextActions ?? []).map((value) =>
+					readRecord(value),
+				);
+				const recoveryActions = nextActions.filter((action) =>
+					[
+						"list-tabs-for-about-blank-recovery",
+						"select-intended-tab-after-drift",
+						"snapshot-after-tab-recovery",
+					].includes(readString(action.id)),
+				);
+				assert.deepEqual(
+					recoveryActions.map((action) => action.id),
+					["list-tabs-for-about-blank-recovery"],
+				);
+				assert.deepEqual(readRecord(recoveryActions[0].params).args, [
+					"--session",
+					"named",
+					"tab",
+					"list",
+				]);
+				assert.equal(
+					nextActions.some(
+						(action) =>
+							action.id === "inspect-after-mutation" ||
+							(readArray(readRecord(action.params).args ?? []).at(-2) === "snapshot" &&
+								readRecord(action.params).stdin === undefined),
+					),
+					false,
+				);
+				const pageChangeSummary = readRecord(resultDetails.pageChangeSummary ?? {});
+				assert.equal(pageChangeSummary.nextActionIds, undefined);
 
-			const staleRefRetry = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "click", "@e9"],
-			});
-			assert.equal(staleRefRetry.isError, true, JSON.stringify(staleRefRetry));
-			assert.equal(staleRefRetry.details?.failureCategory, "stale-ref");
-			assert.match((staleRefRetry.content[0] as { text: string }).text, /current session target is about:blank/);
-			assert.deepEqual((staleRefRetry.details?.refSnapshot as { target?: unknown } | undefined)?.target, {
-				title: "Example Domain",
-				url: "https://example.com/",
-			});
+				const staleRefRetry = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
+					args: ["--session", "named", "click", "@e9"],
+				});
+				const staleRefRetryDetails = readRecord(staleRefRetry.details);
+				assert.equal(staleRefRetry.isError, true, JSON.stringify(staleRefRetry));
+				assert.equal(staleRefRetryDetails.failureCategory, "stale-ref");
+				assert.match(
+					readString(readRecord(staleRefRetry.content[0]).text),
+					/current session target is about:blank/,
+				);
+				assert.equal(staleRefRetryDetails.refSnapshot, undefined);
+				assert.match(
+					readString(readRecord(staleRefRetryDetails.refSnapshotInvalidation).summary),
+					/snapshot for https:\/\/example\.com\/.*target is about:blank/,
+				);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("batch")), false);
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-			assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations.at(-1)?.args, ["--json", "--session", "named", "tab", "list"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(
+					invocations.some((entry) => entry.args.includes("batch")),
+					false,
+				);
+				assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+				assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations.at(-1)?.args, ["--json", "--session", "named", "tab", "list"]);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension accepts about:blank after a batch close reactivates the session", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-after-close-"));
-	const statePath = join(tempDir, "relaunched");
-	const recordingPath = join(tempDir, "recording.webm");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension accepts about:blank after a batch close reactivates the session",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-after-close-"));
+		const statePath = join(tempDir, "relaunched");
+		const recordingPath = join(tempDir, "recording.webm");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 const relaunched = fs.existsSync(${JSON.stringify(statePath)});
@@ -349,45 +457,62 @@ if (args.includes("batch")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: {} }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			const opened = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["open", "https://example.com"],
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				const opened = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["open", "https://example.com"],
+				});
+				const openedDetails = readRecord(opened.details);
+				assert.equal(opened.isError, false, JSON.stringify(opened));
+				assert.deepEqual(openedDetails.sessionTabTarget, {
+					title: "Example Domain",
+					url: "https://example.com/",
+				});
+
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["batch"],
+					stdin: JSON.stringify([["close"], ["record", "stop"]]),
+				});
+				const resultDetails = readRecord(result.details);
+				assert.equal(result.isError, false, JSON.stringify(result));
+				assert.equal(resultDetails.aboutBlankSessionMismatch, undefined);
+				assert.equal(resultDetails.sessionTabCorrection, undefined);
+				assert.equal(resultDetails.sessionTabTarget, undefined);
+				assert.doesNotMatch(readString(readRecord(result.content[0]).text), /^Warning:/);
+
+				const getUrl = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["get", "url"],
+				});
+				const getUrlDetails = readRecord(getUrl.details);
+				assert.equal(getUrl.isError, false, JSON.stringify(getUrl));
+				assert.equal(getUrlDetails.aboutBlankSessionMismatch, undefined);
+				assert.deepEqual(getUrlDetails.sessionTabTarget, {
+					title: undefined,
+					url: "about:blank",
+				});
+				assert.doesNotMatch(readString(readRecord(getUrl.content[0]).text), /^Warning:/);
 			});
-			assert.equal(opened.isError, false, JSON.stringify(opened));
-			assert.deepEqual(opened.details?.sessionTabTarget, { title: "Example Domain", url: "https://example.com/" });
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["batch"],
-				stdin: JSON.stringify([["close"], ["record", "stop"]]),
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(result.details?.aboutBlankSessionMismatch, undefined);
-			assert.equal(result.details?.sessionTabCorrection, undefined);
-			assert.equal(result.details?.sessionTabTarget, undefined);
-			assert.doesNotMatch((result.content[0] as { text: string }).text, /^Warning:/);
-
-			const getUrl = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["get", "url"] });
-			assert.equal(getUrl.isError, false, JSON.stringify(getUrl));
-			assert.equal(getUrl.details?.aboutBlankSessionMismatch, undefined);
-			assert.deepEqual(getUrl.details?.sessionTabTarget, { title: undefined, url: "about:blank" });
-			assert.doesNotMatch((getUrl.content[0] as { text: string }).text, /^Warning:/);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension lets URL QA navigate when the remembered tab is missing but still pins attached QA and raw reads", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-qa-missing-tab-"));
-	const logPath = join(tempDir, "invocations.log");
-	const statePath = join(tempDir, "page.json");
-	const basePath = process.env.PATH ?? "";
-	const targetUrl = "https://example.com/recovered";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
+test(
+	"agentBrowserExtension lets URL QA navigate when the remembered tab is missing but still pins attached QA and raw reads",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-qa-missing-tab-"));
+		const logPath = join(tempDir, "invocations.log");
+		const statePath = join(tempDir, "page.json");
+		const basePath = process.env.PATH ?? "";
+		const targetUrl = "https://example.com/recovered";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -409,55 +534,104 @@ if (args.includes("batch")) data = JSON.parse(stdin).map((step) => ({ command: s
 else if (args.includes("tab") && args.includes("list")) data = { tabs: [{ tabId: "t1", ...page, active: true }] };
 else if (args.includes("open")) data = execute(args.slice(args.indexOf("open")));
 else data = page;
-process.stdout.write(JSON.stringify({ success: true, data }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const first = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(first.handlers, "session_start", { reason: "new" }, first.ctx);
-			const opened = await executeRegisteredTool(first.tool, first.ctx, { args: ["open", "https://example.com/old"] });
-			assert.equal(opened.isError, false, JSON.stringify(opened));
-			await rm(statePath);
-			const resumed = createExtensionHarness({ cwd: tempDir, branch: [createToolBranchEntry({ details: opened.details!, isError: opened.isError })] });
-			await runExtensionEvent(resumed.handlers, "session_start", { reason: "resume" }, resumed.ctx);
-			for (const params of [
-				{ qa: { attached: true } },
-				{ args: ["snapshot", "-i"] },
-				{ args: ["batch"], stdin: JSON.stringify([["get", "title"], ["open", targetUrl]]) },
-			]) {
-				const before = (await readInvocationLog(logPath)).length;
-				const blocked = await executeRegisteredTool(resumed.tool, resumed.ctx, params);
-				assert.equal(blocked.isError, true, JSON.stringify(blocked));
-				assert.equal(blocked.details?.failureCategory, "tab-drift");
-				assert.deepEqual((await readInvocationLog(logPath)).slice(before).map((entry) => entry.args.slice(-2)), [["tab", "list"]]);
-			}
-			const beforeQa = (await readInvocationLog(logPath)).length;
-			const qa = await executeRegisteredTool(resumed.tool, resumed.ctx, { qa: { url: targetUrl } });
-			assert.equal(qa.isError, false, JSON.stringify(qa));
-			assert.equal(qa.details?.resultCategory, "success");
-			assert.equal(qa.details?.sessionName, opened.details?.sessionName);
-			assert.equal(qa.details?.usedImplicitSession, true);
-			assert.deepEqual(qa.details?.sessionTabTarget, { title: "QA page", url: targetUrl });
-			const invocations = (await readInvocationLog(logPath)).slice(beforeQa);
-			assert.deepEqual(invocations[0]?.args.slice(-2), ["batch", "--bail"]);
-			assert.deepEqual(JSON.parse(invocations[0]!.stdin!), [
-				["network", "requests", "--clear"], ["console", "--clear"], ["errors", "--clear"], ["errors"],
-				["open", targetUrl], ["wait", "--load", "domcontentloaded"], ["wait", "150"],
-				["network", "requests"], ["console"], ["errors"],
-			]);
-			assert.equal(invocations.filter((entry) => entry.args.includes("batch")).length, 1);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+process.stdout.write(JSON.stringify({ success: true, data }));`,
+		);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const first = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(first.handlers, "session_start", { reason: "new" }, first.ctx);
+				const opened = await executeRegisteredTool(first.tool, first.ctx, {
+					args: ["open", "https://example.com/old"],
+					sessionMode: "fresh",
+				});
+				const openedDetails = readRecord(opened.details);
+				assert.equal(opened.isError, false, JSON.stringify(opened));
+				await rm(statePath);
+				const resumed = createExtensionHarness({
+					cwd: tempDir,
+					branch: [...first.ctx.sessionManager.getBranch()],
+				});
+				await runExtensionEvent(
+					resumed.handlers,
+					"session_start",
+					{ reason: "resume" },
+					resumed.ctx,
+				);
+				for (const params of [
+					{ qa: { attached: true } },
+					{ args: ["snapshot", "-i"] },
+					{
+						args: ["batch"],
+						stdin: JSON.stringify([
+							["get", "title"],
+							["open", targetUrl],
+						]),
+					},
+				]) {
+					// Read this shared invocation log before issuing the next command or polling retry.
+					// oxlint-disable-next-line no-await-in-loop
+					const before = (await readInvocationLog(logPath)).length;
+					// Read this shared invocation log before issuing the next command or polling retry.
+					// oxlint-disable-next-line no-await-in-loop
+					const blocked = await executeRegisteredTool(resumed.tool, resumed.ctx, params);
+					const blockedDetails = readRecord(blocked.details);
+					// QA, snapshot and batch variants each must fail the same unknown-target recovery guard.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(blocked.isError, true, JSON.stringify(blocked));
+					// QA, snapshot and batch variants each must fail the same unknown-target recovery guard.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(blockedDetails.failureCategory, "tab-drift");
+					// QA, snapshot and batch variants each must fail the same unknown-target recovery guard.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(
+						// Read this shared invocation log before issuing the next command or polling retry.
+						// oxlint-disable-next-line no-await-in-loop
+						(await readInvocationLog(logPath)).slice(before).map((entry) => entry.args.slice(-2)),
+						[["tab", "list"]],
+					);
+				}
+				const beforeQa = (await readInvocationLog(logPath)).length;
+				const qa = await executeRegisteredTool(resumed.tool, resumed.ctx, {
+					qa: { url: targetUrl },
+				});
+				const qaDetails = readRecord(qa.details);
+				assert.equal(qa.isError, false, JSON.stringify(qa));
+				assert.equal(qaDetails.resultCategory, "success");
+				assert.equal(qaDetails.sessionName, openedDetails.sessionName);
+				assert.equal(qaDetails.usedImplicitSession, true);
+				assert.deepEqual(qaDetails.sessionTabTarget, { title: "QA page", url: targetUrl });
+				const invocations = (await readInvocationLog(logPath)).slice(beforeQa);
+				assert.deepEqual(invocations[0]?.args.slice(-2), ["batch", "--bail"]);
+				assert.deepEqual(readArray(JSON.parse(readString(invocations[0].stdin))), [
+					["network", "requests", "--clear"],
+					["console", "--clear"],
+					["errors", "--clear"],
+					["errors"],
+					["open", targetUrl],
+					["wait", "--load", "domcontentloaded"],
+					["wait", "150"],
+					["network", "requests"],
+					["console"],
+					["errors"],
+				]);
+				assert.equal(invocations.filter((entry) => entry.args.includes("batch")).length, 1);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension allows explicit navigation to about:blank", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-explicit-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension allows explicit navigation to about:blank",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-about-blank-explicit-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("tab") && args.includes("list")) {
@@ -469,69 +643,119 @@ if (args.includes("tab") && args.includes("list")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: { title: "", url: "about:blank" } }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const resumedHarness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const resumedHarness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					resumedHarness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					resumedHarness.ctx,
+				);
+
+				const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
+					args: ["--session", "named", "open", "about:blank"],
+				});
+				const resultDetails = readRecord(result.details);
+				assert.equal(result.isError, false, JSON.stringify(result));
+				assert.equal(resultDetails.aboutBlankSessionMismatch, undefined);
+				assert.equal(resultDetails.sessionTabCorrection, undefined);
+				assert.deepEqual(resultDetails.sessionTabTarget, {
+					title: undefined,
+					url: "about:blank",
+				});
+				assert.doesNotMatch(readString(readRecord(result.content[0]).text), /^Warning:/);
+				const explicitAboutBlankActionIds = readArray(resultDetails.nextActions ?? [])
+					.map((value) => readRecord(value))
+					.map((action) => action.id);
+				assert.equal(
+					explicitAboutBlankActionIds.some((id) =>
+						[
+							"list-tabs-for-about-blank-recovery",
+							"select-intended-tab-after-drift",
+							"snapshot-after-tab-recovery",
+						].includes(readString(id)),
+					),
+					false,
+				);
+
+				const snapshot = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
+					args: ["--session", "named", "snapshot", "-i"],
+				});
+				const snapshotDetails = readRecord(snapshot.details);
+				assert.equal(snapshot.isError, false, JSON.stringify(snapshot));
+				assert.equal(snapshotDetails.aboutBlankSessionMismatch, undefined);
+				assert.equal(snapshotDetails.sessionTabCorrection, undefined);
+				assert.deepEqual(snapshotDetails.sessionTabTarget, {
+					title: undefined,
+					url: "about:blank",
+				});
+				assert.doesNotMatch(readString(readRecord(snapshot.content[0]).text), /^Warning:/);
+				const snapshotActionIds = readArray(snapshotDetails.nextActions ?? [])
+					.map((value) => readRecord(value))
+					.map((action) => action.id);
+				assert.equal(
+					snapshotActionIds.some((id) =>
+						[
+							"list-tabs-for-about-blank-recovery",
+							"select-intended-tab-after-drift",
+							"snapshot-after-tab-recovery",
+						].includes(readString(id)),
+					),
+					false,
+				);
+
+				const invocations = await readInvocationLog(logPath);
+				assert.deepEqual(invocations[0]?.args, [
+					"--json",
+					"--session",
+					"named",
+					"open",
+					"about:blank",
+				]);
+				assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "get", "url"]);
+				assert.deepEqual(invocations[3]?.args, ["--json", "--session", "named", "snapshot", "-i"]);
+				assert.equal(
+					invocations.some(
+						(invocation) =>
+							JSON.stringify(invocation.args) ===
+							JSON.stringify(["--json", "--session", "named", "tab", "blank"]),
+					),
+					false,
+				);
 			});
-			await runExtensionEvent(resumedHarness.handlers, "session_start", { reason: "resume" }, resumedHarness.ctx);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const result = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "open", "about:blank"],
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(result.details?.aboutBlankSessionMismatch, undefined);
-			assert.equal(result.details?.sessionTabCorrection, undefined);
-			assert.deepEqual(result.details?.sessionTabTarget, { title: undefined, url: "about:blank" });
-			assert.doesNotMatch((result.content[0] as { text: string }).text, /^Warning:/);
-			const explicitAboutBlankActionIds = ((result.details?.nextActions as Array<{ id: string }> | undefined) ?? []).map((action) => action.id);
-			assert.equal(explicitAboutBlankActionIds.some((id) => ["list-tabs-for-about-blank-recovery", "select-intended-tab-after-drift", "snapshot-after-tab-recovery"].includes(id)), false);
-
-			const snapshot = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "snapshot", "-i"],
-			});
-			assert.equal(snapshot.isError, false, JSON.stringify(snapshot));
-			assert.equal(snapshot.details?.aboutBlankSessionMismatch, undefined);
-			assert.equal(snapshot.details?.sessionTabCorrection, undefined);
-			assert.deepEqual(snapshot.details?.sessionTabTarget, { title: undefined, url: "about:blank" });
-			assert.doesNotMatch((snapshot.content[0] as { text: string }).text, /^Warning:/);
-			const snapshotActionIds = ((snapshot.details?.nextActions as Array<{ id: string }> | undefined) ?? []).map((action) => action.id);
-			assert.equal(snapshotActionIds.some((id) => ["list-tabs-for-about-blank-recovery", "select-intended-tab-after-drift", "snapshot-after-tab-recovery"].includes(id)), false);
-
-			const invocations = await readInvocationLog(logPath);
-			assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "open", "about:blank"]);
-			assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "get", "url"]);
-			assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "snapshot", "-i"]);
-			assert.equal(
-				invocations.some((invocation) => JSON.stringify(invocation.args) === JSON.stringify(["--json", "--session", "named", "tab", "blank"])),
-				false,
-			);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension serializes overlapping same-session opens and keeps the newer target", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension serializes overlapping same-session opens and keeps the newer target",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -566,43 +790,71 @@ if (args.includes("https://example.com/slow-first")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: fast }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const slowOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--session", "named", "open", "https://example.com/slow-first"],
+				const slowOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "open", "https://example.com/slow-first"],
+				});
+				await waitForInvocation(logPath, (entry) =>
+					entry.args.includes("https://example.com/slow-first"),
+				);
+				const fastOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "open", "https://example.com/fast-second"],
+				});
+
+				const [slowOpen, fastOpen] = await Promise.all([slowOpenPromise, fastOpenPromise]);
+				assert.equal(slowOpen.isError, false, JSON.stringify(slowOpen));
+				assert.equal(fastOpen.isError, false, JSON.stringify(fastOpen));
+				assert.deepEqual(slowOpen.details?.sessionTabTarget, {
+					title: "Slow First",
+					url: "https://example.com/slow-first",
+				});
+				assert.deepEqual(fastOpen.details?.sessionTabTarget, {
+					title: "Fast Second",
+					url: "https://example.com/fast-second",
+				});
+				assert.equal(fastOpen.details.sessionTabTargetUnknown, undefined);
+
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(invocations.length, 4);
+				assert.deepEqual(invocations[0]?.args, [
+					"--json",
+					"--session",
+					"named",
+					"open",
+					"https://example.com/slow-first",
+				]);
+				assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[2]?.args, [
+					"--json",
+					"--session",
+					"named",
+					"open",
+					"https://example.com/fast-second",
+				]);
+				assert.deepEqual(invocations[3]?.args, ["--json", "--session", "named", "tab", "list"]);
 			});
-			await waitForInvocation(logPath, (entry) => entry.args.includes("https://example.com/slow-first"));
-			const fastOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--session", "named", "open", "https://example.com/fast-second"],
-			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const [slowOpen, fastOpen] = await Promise.all([slowOpenPromise, fastOpenPromise]);
-			assert.equal(slowOpen.isError, false, JSON.stringify(slowOpen));
-			assert.equal(fastOpen.isError, false, JSON.stringify(fastOpen));
-			assert.deepEqual(slowOpen.details?.sessionTabTarget, { title: "Slow First", url: "https://example.com/slow-first" });
-			assert.deepEqual(fastOpen.details?.sessionTabTarget, { title: "Fast Second", url: "https://example.com/fast-second" });
-			assert.equal(fastOpen.details?.sessionTabTargetUnknown, undefined);
-
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.length, 2);
-			assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "open", "https://example.com/slow-first"]);
-			assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "open", "https://example.com/fast-second"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension serializes a newer unverified target after prior navigation", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-unverified-target-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
+test(
+	"agentBrowserExtension serializes a newer unverified target after prior navigation",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-unverified-target-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("https://example.com/slow")) {
@@ -614,40 +866,61 @@ if (args.includes("https://example.com/slow")) {
   process.stdout.write(JSON.stringify({ success: true, data: { snapshot: "SECRET UNVERIFIED CONTENT" } }));
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: { ok: true } }));
-}`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const slowOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, { args: ["--session", "named", "open", "https://example.com/slow"] });
-			await waitForInvocation(logPath, (entry) => entry.args.includes("https://example.com/slow"));
-			const connectPromise = executeRegisteredTool(harness.tool, harness.ctx, { args: ["--session", "named", "connect", "9222"] });
-			const [firstOpen, connected] = await Promise.all([slowOpenPromise, connectPromise]);
-			assert.equal(firstOpen.isError, false, JSON.stringify(firstOpen));
-			assert.deepEqual(firstOpen.details?.sessionTabTarget, { title: "First", url: "https://example.com/slow" });
-			assert.equal(connected.isError, false, JSON.stringify(connected));
-			assert.equal(connected.details?.sessionTabTargetUnknown, true);
-			const invocationCount = (await readInvocationLog(logPath)).length;
-			const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["--session", "named", "snapshot", "-i"] });
-			assert.equal(snapshot.isError, true, JSON.stringify(snapshot));
-			assert.match(snapshot.content[0]?.text ?? "", /active page became unverified/);
-			assert.doesNotMatch(JSON.stringify(snapshot), /SECRET UNVERIFIED CONTENT/);
-			assert.equal((await readInvocationLog(logPath)).length, invocationCount);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+}`,
+		);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				const slowOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "open", "https://example.com/slow"],
+				});
+				await waitForInvocation(logPath, (entry) =>
+					entry.args.includes("https://example.com/slow"),
+				);
+				const connectPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "connect", "9222"],
+				});
+				const [firstOpen, connected] = await Promise.all([slowOpenPromise, connectPromise]);
+				assert.equal(firstOpen.isError, false, JSON.stringify(firstOpen));
+				assert.deepEqual(firstOpen.details?.sessionTabTarget, {
+					title: "First",
+					url: "https://example.com/slow",
+				});
+				assert.equal(connected.isError, false, JSON.stringify(connected));
+				assert.equal(connected.details?.sessionTabTargetUnknown, true);
+				const invocationCount = (await readInvocationLog(logPath)).length;
+				const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "snapshot", "-i"],
+				});
+				assert.equal(snapshot.isError, true, JSON.stringify(snapshot));
+				assert.match(readString(snapshot.content[0].text ?? ""), /active page became unverified/);
+				assert.doesNotMatch(JSON.stringify(snapshot), /SECRET UNVERIFIED CONTENT/);
+				assert.equal((await readInvocationLog(logPath)).length, invocationCount);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension serializes case-alias session and namespace identities on case-insensitive hosts", {
-	concurrency: false,
-	skip: process.platform === "darwin" || process.platform === "win32" ? false : "session daemon paths are case-sensitive on this host",
-}, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-session-case-alias-"));
-	const logPath = join(tempDir, "invocations.log");
-	const statePath = join(tempDir, "shared-session-state.json");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
+test(
+	"agentBrowserExtension serializes case-alias session and namespace identities on case-insensitive hosts",
+	{
+		concurrency: false,
+		skip:
+			process.platform === "darwin" || process.platform === "win32"
+				? false
+				: "session daemon paths are case-sensitive on this host",
+	},
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-session-case-alias-"));
+		const logPath = join(tempDir, "invocations.log");
+		const statePath = join(tempDir, "shared-session-state.json");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const namespaceIndex = args.indexOf("--namespace");
 const namespace = namespaceIndex >= 0 ? args[namespaceIndex + 1] : "";
@@ -667,44 +940,77 @@ if (args.includes("open")) {
   try { state = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, "utf8")); } catch {}
   fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: ["snapshot-finished", namespace, session] }) + "\\n");
   process.stdout.write(JSON.stringify({ success: true, data: { snapshot: state.url.includes("-secret") ? "SECRET CONTENT" : "SAFE CONTENT" } }));
-}`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const runAliasRace = async (readIdentityArgs: string[], writeIdentityArgs: string[], label: string): Promise<void> => {
-				const session = readIdentityArgs[readIdentityArgs.indexOf("--session") + 1]!;
-				const nextUrl = `https://example.com/${label}-secret`;
-				const opened = await executeRegisteredTool(harness.tool, harness.ctx, { args: [...readIdentityArgs, "open", "https://example.com/"] });
-				assert.equal(opened.isError, false, JSON.stringify(opened));
+}`,
+		);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				const runAliasRace = async (
+					readIdentityArgs: readonly string[],
+					writeIdentityArgs: readonly string[],
+					label: string,
+				): Promise<void> => {
+					const session = readIdentityArgs[readIdentityArgs.indexOf("--session") + 1];
+					const nextUrl = `https://example.com/${label}-secret`;
+					const opened = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: [...readIdentityArgs, "open", "https://example.com/"],
+					});
+					assert.equal(opened.isError, false, JSON.stringify(opened));
 
-				const snapshotPromise = executeRegisteredTool(harness.tool, harness.ctx, { args: [...readIdentityArgs, "snapshot", "-i"] });
-				await waitForInvocation(logPath, (entry) => entry.args.includes("snapshot") && entry.args.includes(session));
-				const nextOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, { args: [...writeIdentityArgs, "open", nextUrl] });
-				const [snapshot, nextOpen] = await Promise.all([snapshotPromise, nextOpenPromise]);
-				assert.equal(snapshot.isError, false, JSON.stringify(snapshot));
-				assert.doesNotMatch(JSON.stringify(snapshot), /SECRET CONTENT/);
-				assert.equal(nextOpen.isError, false, JSON.stringify(nextOpen));
+					const snapshotPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+						args: [...readIdentityArgs, "snapshot", "-i"],
+					});
+					await waitForInvocation(
+						logPath,
+						(entry) => entry.args.includes("snapshot") && entry.args.includes(session),
+					);
+					const nextOpenPromise = executeRegisteredTool(harness.tool, harness.ctx, {
+						args: [...writeIdentityArgs, "open", nextUrl],
+					});
+					const [snapshot, nextOpen] = await Promise.all([snapshotPromise, nextOpenPromise]);
+					assert.equal(snapshot.isError, false, JSON.stringify(snapshot));
+					assert.doesNotMatch(JSON.stringify(snapshot), /SECRET CONTENT/);
+					assert.equal(nextOpen.isError, false, JSON.stringify(nextOpen));
 
-				const invocations = await readInvocationLog(logPath);
-				const snapshotFinishedIndex = invocations.findIndex((entry) => entry.args[0] === "snapshot-finished" && entry.args[2] === session);
-				const nextOpenIndex = invocations.findIndex((entry) => entry.args.includes(nextUrl));
-				assert.ok(snapshotFinishedIndex >= 0 && nextOpenIndex > snapshotFinishedIndex, JSON.stringify(invocations));
-			};
-			await runAliasRace(["--session", "Foo"], ["--session", "foo"], "session-case");
-			await runAliasRace(["--namespace", "Straße", "--session", "namespace-sharp-s"], ["--namespace", "STRASSE", "--session", "namespace-sharp-s"], "namespace-sharp-s");
-			await runAliasRace(["--namespace", "Σ", "--session", "namespace-sigma"], ["--namespace", "ς", "--session", "namespace-sigma"], "namespace-sigma");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					const invocations = await readInvocationLog(logPath);
+					const snapshotFinishedIndex = invocations.findIndex(
+						(entry) => entry.args[0] === "snapshot-finished" && entry.args[2] === session,
+					);
+					const nextOpenIndex = invocations.findIndex((entry) => entry.args.includes(nextUrl));
+					assert.ok(
+						snapshotFinishedIndex >= 0 && nextOpenIndex > snapshotFinishedIndex,
+						JSON.stringify(invocations),
+					);
+				};
+				await runAliasRace(["--session", "Foo"], ["--session", "foo"], "session-case");
+				await runAliasRace(
+					["--namespace", "Straße", "--session", "namespace-sharp-s"],
+					["--namespace", "STRASSE", "--session", "namespace-sharp-s"],
+					"namespace-sharp-s",
+				);
+				await runAliasRace(
+					["--namespace", "Σ", "--session", "namespace-sigma"],
+					["--namespace", "ς", "--session", "namespace-sigma"],
+					"namespace-sigma",
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension propagates caller aborts during live page verification", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-live-page-abort-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
+test(
+	"agentBrowserExtension propagates caller aborts during live page verification",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-live-page-abort-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("get") && args.includes("url")) {
@@ -714,36 +1020,61 @@ if (args.includes("get") && args.includes("url")) {
   process.stdout.write(JSON.stringify({ success: true, data: { title: "Example", url: "https://example.com/" } }));
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: { snapshot: "SHOULD NOT RUN" } }));
-}`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const controller = new AbortController();
-			const snapshot = executeRegisteredTool(harness.tool, harness.ctx, { args: ["--session", "named", "snapshot", "-i"] }, controller.signal);
-			await waitForInvocation(logPath, (entry) => entry.args.includes("get") && entry.args.includes("url"));
-			controller.abort(new Error("caller cancelled"));
-			await assert.rejects(snapshot, /caller cancelled/);
+}`,
+		);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				const controller = new AbortController();
+				const snapshot = executeRegisteredTool(
+					harness.tool,
+					harness.ctx,
+					{ args: ["--session", "named", "snapshot", "-i"] },
+					controller.signal,
+				);
+				await waitForInvocation(
+					logPath,
+					(entry) => entry.args.includes("get") && entry.args.includes("url"),
+				);
+				controller.abort(new Error("caller cancelled"));
+				const cancelled = await snapshot;
+				const cancelledDetails = readRecord(cancelled.details);
+				assert.equal(cancelled.isError, true);
+				assert.equal(cancelledDetails.failureCategory, "aborted");
+				assert.match(readString(cancelled.content[0].text ?? ""), /caller cancelled/);
 
-			const reopened = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["--session", "named", "open", "https://example.com/"] });
-			assert.equal(reopened.isError, false, JSON.stringify(reopened));
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("snapshot")), false);
-			assert.equal(invocations.some((entry) => entry.args.includes("open")), true);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const reopened = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "open", "https://example.com/"],
+				});
+				assert.equal(reopened.isError, false, JSON.stringify(reopened));
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(
+					invocations.some((entry) => entry.args.includes("snapshot")),
+					false,
+				);
+				assert.equal(
+					invocations.some((entry) => entry.args.includes("open")),
+					true,
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension re-selects the intended tab after a successful command when focus drifts afterward", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const logPath = join(tempDir, "invocations.log");
-	const statePath = join(tempDir, "tab-state.json");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension re-selects the intended tab after a successful command when focus drifts afterward",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const logPath = join(tempDir, "invocations.log");
+		const statePath = join(tempDir, "tab-state.json");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 const exampleSite = { title: "Example Domain", url: "https://example.com/" };
@@ -760,8 +1091,8 @@ if (args.includes("tab") && args.includes("list")) {
   const inactiveSite = activeKey === "example" ? gemini : exampleSite;
   save();
   process.stdout.write(JSON.stringify({ success: true, data: { tabs: [
-    { tabId: activeKey === "example" ? "t1" : "t2", title: activeSite.title, url: activeSite.url, active: true },
-    { tabId: activeKey === "example" ? "t2" : "t1", title: inactiveSite.title, url: inactiveSite.url, active: false }
+    { tabId: activeKey === "example" ? "t1" : "t2", targetId: activeKey === "example" ? "TARGET_A" : "TARGET_B", title: activeSite.title, url: activeSite.url, active: true },
+    { tabId: activeKey === "example" ? "t2" : "t1", targetId: activeKey === "example" ? "TARGET_B" : "TARGET_A", title: inactiveSite.title, url: inactiveSite.url, active: false }
   ] } }));
 } else if (args.includes("click")) {
   state.active = "gemini";
@@ -775,46 +1106,58 @@ if (args.includes("tab") && args.includes("list")) {
   save();
   process.stdout.write(JSON.stringify({ success: true, data: exampleSite }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const resumedHarness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
-			});
-			await runExtensionEvent(resumedHarness.handlers, "session_start", { reason: "resume" }, resumedHarness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const resumedHarness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					resumedHarness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					resumedHarness.ctx,
+				);
 
-			const clickedSelector = await executeRegisteredTool(resumedHarness.tool, resumedHarness.ctx, {
-				args: ["--session", "named", "click", "@e9"],
-			});
-			assert.equal(clickedSelector.isError, false, JSON.stringify(clickedSelector));
-			assert.deepEqual(clickedSelector.details?.sessionTabCorrection, {
-				selectedTab: "t1",
-				selectionKind: "tabId",
-				targetTitle: "Example Domain",
-				targetUrl: "https://example.com/",
-			});
+				const clickedSelector = await executeRegisteredTool(
+					resumedHarness.tool,
+					resumedHarness.ctx,
+					{
+						args: ["--session", "named", "click", "@e9"],
+					},
+				);
+				const clickedSelectorDetails = readRecord(clickedSelector.details);
+				assert.equal(clickedSelector.isError, false, JSON.stringify(clickedSelector));
+				assert.deepEqual(clickedSelectorDetails.sessionTabCorrection, {
+					selectedTab: "t1",
+					selectionKind: "tabId",
+					targetTitle: "Example Domain",
+					targetUrl: "https://example.com/",
+				});
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.length, 5);
-			assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "get", "url"]);
-			assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "click", "@e9"]);
-			assert.deepEqual(invocations[3]?.args, ["--json", "--session", "named", "tab", "list"]);
-			assert.deepEqual(invocations[4]?.args, ["--json", "--session", "named", "tab", "t1"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(invocations.length, 6);
+				assert.deepEqual(invocations[0]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[1]?.args, ["--json", "--session", "named", "get", "url"]);
+				assert.deepEqual(invocations[2]?.args, ["--json", "--session", "named", "click", "@e9"]);
+				assert.deepEqual(invocations[3]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[4]?.args, ["--json", "--session", "named", "tab", "list"]);
+				assert.deepEqual(invocations[5]?.args, ["--json", "--session", "named", "tab", "t1"]);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

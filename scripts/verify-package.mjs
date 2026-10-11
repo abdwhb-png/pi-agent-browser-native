@@ -6,14 +6,20 @@
  * Invariants/Assumptions: The package is built directly from the current repo checkout, npm and tar are available on PATH, installed Pi SDK APIs match the current dev dependency, and the package should publish only canonical docs plus the extension source and license.
  */
 
-import { execFile as execFileCallback } from "node:child_process";
-import { access, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { delimiter, join, posix as posixPath, resolve, sep } from "node:path";
+import { access, readFile } from "node:fs/promises";
+
+import { posix as posixPath, resolve } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
-import { createAgentSession, DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+
+import { getDryRunPackResult } from "./package-pack.mjs";
+import { verifyPackagedPiLoad } from "./package-pi.mjs";
+export { packToTemporaryPackageDir } from "./package-pack.mjs";
+export {
+	evaluatePiSmokeResult,
+	executePackagedAgentBrowserSmoke,
+	verifyPackagedPiLoad,
+} from "./package-pi.mjs";
 import {
 	FORBIDDEN_PACKED_FILES,
 	FORBIDDEN_REPO_FILES,
@@ -23,14 +29,7 @@ import {
 
 export { FORBIDDEN_PACKED_FILES, FORBIDDEN_REPO_FILES, REQUIRED_REPO_FILES, loadPublishContract };
 
-const execFile = promisify(execFileCallback);
-const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
-const npmExecOptions = process.platform === "win32" ? { shell: true } : {};
-const tarCommand = process.platform === "win32" ? "tar.exe" : "tar";
 const SUPPORTED_ARGS = new Set(["--list-files", "--smoke-pi"]);
-const PACKAGED_AGENT_BROWSER_SMOKE_ARGS = ["--version"];
-const PACKAGED_AGENT_BROWSER_SMOKE_TOOL_CALL_ID = "verify-package-agent-browser-smoke";
-const FAKE_AGENT_BROWSER_VERSION = "agent-browser 0.0.0-packaged-smoke";
 
 class UsageError extends Error {
 	constructor(message) {
@@ -85,7 +84,9 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 
 	const unknownArgs = [...args].filter((arg) => !SUPPORTED_ARGS.has(arg));
 	if (unknownArgs.length > 0) {
-		throw new UsageError(`Unknown option${unknownArgs.length === 1 ? "" : "s"}: ${unknownArgs.join(", ")}`);
+		throw new UsageError(
+			`Unknown option${unknownArgs.length === 1 ? "" : "s"}: ${unknownArgs.join(", ")}`,
+		);
 	}
 
 	return {
@@ -99,6 +100,8 @@ async function collectMissingPaths(paths, cwd = process.cwd()) {
 	const missingPaths = [];
 	for (const path of paths) {
 		try {
+			// Bound stat pressure and preserve path-order diagnostics during package prerequisite inspection.
+			// oxlint-disable-next-line no-await-in-loop
 			await access(resolve(cwd, path));
 		} catch {
 			missingPaths.push(path);
@@ -111,6 +114,8 @@ async function collectPresentPaths(paths, cwd = process.cwd()) {
 	const presentPaths = [];
 	for (const path of paths) {
 		try {
+			// Bound stat pressure and preserve path-order diagnostics during package prerequisite inspection.
+			// oxlint-disable-next-line no-await-in-loop
 			await access(resolve(cwd, path));
 			presentPaths.push(path);
 		} catch {
@@ -120,78 +125,13 @@ async function collectPresentPaths(paths, cwd = process.cwd()) {
 	return presentPaths;
 }
 
-function parseSinglePackResult(stdout, stderr) {
-	const parsed = JSON.parse(stdout);
-	const results = Array.isArray(parsed)
-		? parsed
-		: parsed && typeof parsed === "object"
-			? Object.values(parsed)
-			: [];
-	if (results.length !== 1 || typeof results[0] !== "object" || results[0] === null) {
-		throw new Error(`Unexpected npm pack output.\nstdout:\n${stdout}\n\nstderr:\n${stderr}`);
-	}
-
-	return results[0];
-}
-
-async function getDryRunPackResult(cwd = process.cwd()) {
-	const { stdout, stderr } = await execFile(npmCommand, ["pack", "--json", "--dry-run"], {
-		...npmExecOptions,
-		cwd,
-		maxBuffer: 5 * 1024 * 1024,
-	});
-
-	return parseSinglePackResult(stdout, stderr);
-}
-
-export async function packToTemporaryPackageDir(cwd = process.cwd()) {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-package-"));
-	let tarballPath;
-
-	try {
-		const { stdout, stderr } = await execFile(
-			npmCommand,
-			["pack", "--json", "--pack-destination", tempDir, "--dry-run=false"],
-			{
-				...npmExecOptions,
-				cwd,
-				maxBuffer: 5 * 1024 * 1024,
-			},
-		);
-		const packResult = parseSinglePackResult(stdout, stderr);
-		if (typeof packResult.filename !== "string" || packResult.filename.length === 0) {
-			throw new Error(`Unexpected npm pack result without a filename.\nstdout:\n${stdout}\n\nstderr:\n${stderr}`);
-		}
-
-		tarballPath = resolve(tempDir, packResult.filename);
-		await execFile(tarCommand, [...(process.platform === "win32" ? ["--force-local"] : []), "-xzf", tarballPath, "-C", tempDir], {
-			maxBuffer: 5 * 1024 * 1024,
-		});
-
-		return {
-			cleanup: async () => {
-				await rm(tempDir, { force: true, recursive: true });
-				if (tarballPath) await rm(tarballPath, { force: true });
-			},
-			packageDir: join(tempDir, "package"),
-			packResult,
-		};
-	} catch (error) {
-		await rm(tempDir, { force: true, recursive: true });
-		if (tarballPath) await rm(tarballPath, { force: true });
-		throw error;
-	}
-}
-
 export function collectPackedPaths(files) {
 	return new Set(
-		files
-			.filter((entry) => typeof entry?.path === "string")
-			.map((entry) => entry.path),
+		files.filter((entry) => typeof entry?.path === "string").map((entry) => entry.path),
 	);
 }
 
-const MARKDOWN_LINK_PATTERN = /!?\[[^\]\n]*(?:\][^\[\]\n]*)*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+const MARKDOWN_LINK_PATTERN = /!?\[[^\]\n]*(?:\][^[\]\n]*)*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 const EXTERNAL_LINK_PATTERN = /^[a-z][a-z0-9+.-]*:/i;
 
 function stripMarkdownLinkFragment(target) {
@@ -201,8 +141,16 @@ function stripMarkdownLinkFragment(target) {
 
 function normalizePackedMarkdownTarget(sourcePath, rawTarget) {
 	const withoutFragment = stripMarkdownLinkFragment(rawTarget.trim());
-	if (!withoutFragment || withoutFragment.startsWith("#")) return undefined;
-	if (withoutFragment.startsWith("//") || withoutFragment.startsWith("/") || EXTERNAL_LINK_PATTERN.test(withoutFragment)) return undefined;
+	if (!withoutFragment || withoutFragment.startsWith("#")) {
+		return;
+	}
+	if (
+		withoutFragment.startsWith("//") ||
+		withoutFragment.startsWith("/") ||
+		EXTERNAL_LINK_PATTERN.test(withoutFragment)
+	) {
+		return;
+	}
 	let decoded = withoutFragment;
 	try {
 		decoded = decodeURI(withoutFragment);
@@ -213,10 +161,14 @@ function normalizePackedMarkdownTarget(sourcePath, rawTarget) {
 }
 
 function packedPathExists(packedPaths, targetPath) {
-	if (packedPaths.has(targetPath)) return true;
+	if (packedPaths.has(targetPath)) {
+		return true;
+	}
 	const directoryPrefix = targetPath.endsWith("/") ? targetPath : `${targetPath}/`;
 	for (const packedPath of packedPaths) {
-		if (packedPath.startsWith(directoryPrefix)) return true;
+		if (packedPath.startsWith(directoryPrefix)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -228,16 +180,24 @@ export async function collectPackedMarkdownLinkFailures(options) {
 	for (const sourcePath of markdownPaths) {
 		let text;
 		try {
+			// Inspect one packaged document at a time, bounding memory and retaining sorted failure order.
+			// oxlint-disable-next-line no-await-in-loop
 			text = await readFile(resolve(cwd, sourcePath), "utf8");
 		} catch (error) {
-			failures.push(`Packed Markdown file ${sourcePath} could not be read for link verification: ${error instanceof Error ? error.message : String(error)}`);
+			failures.push(
+				`Packed Markdown file ${sourcePath} could not be read for link verification: ${error instanceof Error ? error.message : String(error)}`,
+			);
 			continue;
 		}
 		for (const match of text.matchAll(MARKDOWN_LINK_PATTERN)) {
 			const rawTarget = match[1] ?? "";
 			const targetPath = normalizePackedMarkdownTarget(sourcePath, rawTarget);
-			if (!targetPath || packedPathExists(packedPaths, targetPath)) continue;
-			failures.push(`Packed Markdown link ${sourcePath} -> ${rawTarget} resolves to missing packed file ${targetPath}.`);
+			if (!targetPath || packedPathExists(packedPaths, targetPath)) {
+				continue;
+			}
+			failures.push(
+				`Packed Markdown link ${sourcePath} -> ${rawTarget} resolves to missing packed file ${targetPath}.`,
+			);
 		}
 	}
 	return failures;
@@ -247,185 +207,30 @@ export function pluralize(count, singular, plural = `${singular}s`) {
 	return count === 1 ? singular : plural;
 }
 
-function isInsidePath(childPath, parentPath) {
-	const normalizedChild = resolve(childPath);
-	const normalizedParent = resolve(parentPath);
-	return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}${sep}`);
-}
-
-export function evaluatePiSmokeResult(options) {
-	const { packageDir, tools } = options;
-	const agentBrowserTools = tools.filter((tool) => tool.name === "agent_browser");
-	const failures = [];
-
-	if (agentBrowserTools.length !== 1) {
-		failures.push(`Expected exactly one packaged agent_browser tool, found ${agentBrowserTools.length}.`);
-	}
-
-	for (const tool of agentBrowserTools) {
-		const sourcePath = tool.sourceInfo?.path ?? tool.source?.path ?? tool.path;
-		if (typeof sourcePath !== "string" || sourcePath.length === 0) {
-			failures.push("agent_browser tool did not expose source path metadata for package-path verification.");
-			continue;
-		}
-		if (!isInsidePath(sourcePath, packageDir)) {
-			failures.push(`agent_browser loaded from ${sourcePath}; expected a source inside packed package ${packageDir}.`);
-		}
-	}
-
-	return failures;
-}
-
-function summarizeToolResult(result) {
-	if (!result || typeof result !== "object") return String(result);
-
-	const textContent = Array.isArray(result.content)
-		? result.content
-				.filter((item) => item?.type === "text" && typeof item.text === "string")
-				.map((item) => item.text)
-				.join("\n")
-		: "";
-	const details = result.details && typeof result.details === "object" ? result.details : undefined;
-	const summaryParts = [
-		textContent.trim(),
-		details?.summary ? `summary: ${details.summary}` : undefined,
-		details?.exitCode !== undefined ? `exitCode: ${details.exitCode}` : undefined,
-		details?.spawnError ? `spawnError: ${details.spawnError}` : undefined,
-		details?.stderr ? `stderr: ${details.stderr}` : undefined,
-	].filter((part) => typeof part === "string" && part.length > 0);
-	const summary = summaryParts.join("\n");
-	return summary.length > 1_200 ? `${summary.slice(0, 1_197)}...` : summary;
-}
-
-async function createFakeAgentBrowserBinary() {
-	const binDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-fake-bin-"));
-	const nodeExecutable = JSON.stringify(process.execPath);
-	const fakeScript = `#!/usr/bin/env node
-const args = process.argv.slice(2);
-if (args.includes("--version") || args.includes("-V")) {
-  console.log(${JSON.stringify(FAKE_AGENT_BROWSER_VERSION)});
-  process.exit(0);
-}
-console.error("fake agent-browser only supports --version for packaged smoke validation; received: " + args.join(" "));
-process.exit(64);
-`;
-
-	const posixPath = join(binDir, "agent-browser");
-	await writeFile(posixPath, fakeScript, "utf8");
-	await chmod(posixPath, 0o755);
-
-	const cmdPath = join(binDir, "agent-browser.cmd");
-	await writeFile(cmdPath, `@echo off\n${nodeExecutable} "%~dp0agent-browser" %*\n`, "utf8");
-
-	return {
-		binDir,
-		cleanup: async () => {
-			await rm(binDir, { force: true, recursive: true });
-		},
-	};
-}
-
-async function withFakeAgentBrowserOnPath(work) {
-	const fakeBinary = await createFakeAgentBrowserBinary();
-	const previousPath = process.env.PATH;
-	try {
-		process.env.PATH = previousPath ? `${fakeBinary.binDir}${delimiter}${previousPath}` : fakeBinary.binDir;
-		return await work();
-	} finally {
-		if (previousPath === undefined) {
-			delete process.env.PATH;
-		} else {
-			process.env.PATH = previousPath;
-		}
-		await fakeBinary.cleanup();
-	}
-}
-
-export async function executePackagedAgentBrowserSmoke(options) {
-	const { packageDir, session } = options;
-	const toolDefinition =
-		typeof session.getToolDefinition === "function" ? session.getToolDefinition("agent_browser") : undefined;
-
-	if (!toolDefinition || typeof toolDefinition.execute !== "function") {
-		return {
-			failures: ["Packaged agent_browser tool definition was not executable via Pi session.getToolDefinition()."],
-			invocation: undefined,
-		};
-	}
-
-	const ctx =
-		typeof session.createReplacedSessionContext === "function"
-			? session.createReplacedSessionContext()
-			: {
-					cwd: packageDir,
-					sessionManager: {
-						getBranch: () => [],
-						getSessionDir: () => undefined,
-						getSessionFile: () => undefined,
-						getSessionId: () => undefined,
-					},
-				};
-	const updates = [];
-	let result;
-	try {
-		result = await toolDefinition.execute(
-			PACKAGED_AGENT_BROWSER_SMOKE_TOOL_CALL_ID,
-			{ args: PACKAGED_AGENT_BROWSER_SMOKE_ARGS },
-			undefined,
-			(update) => updates.push(update),
-			ctx,
-		);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			failures: [
-				`Packaged agent_browser invocation threw for args ${JSON.stringify(PACKAGED_AGENT_BROWSER_SMOKE_ARGS)}: ${message}`,
-			],
-			invocation: { args: PACKAGED_AGENT_BROWSER_SMOKE_ARGS, error: message, updates },
-		};
-	}
-
-	const text = summarizeToolResult(result);
-	const details = result && typeof result === "object" && result.details && typeof result.details === "object" ? result.details : {};
-	const failures = [];
-	if (result?.isError === true) {
-		failures.push(
-			`Packaged agent_browser invocation failed for args ${JSON.stringify(PACKAGED_AGENT_BROWSER_SMOKE_ARGS)}:\n${text}`,
-		);
-	}
-	if (details.inspection !== true) {
-		failures.push("Packaged agent_browser --version smoke did not report a plain-text inspection result.");
-	}
-	if (details.exitCode !== 0) {
-		failures.push(`Packaged agent_browser --version smoke exited with ${String(details.exitCode)}; expected 0.`);
-	}
-	if (!text.includes(FAKE_AGENT_BROWSER_VERSION)) {
-		failures.push(
-			`Packaged agent_browser --version smoke did not return expected fake version text ${JSON.stringify(FAKE_AGENT_BROWSER_VERSION)}.`,
-		);
-	}
-
-	return {
-		failures,
-		invocation: { args: PACKAGED_AGENT_BROWSER_SMOKE_ARGS, result, updates },
-	};
-}
-
 export function collectVerificationFailures(options) {
-	const { forbiddenPackedFiles, forbiddenRepoFiles, missingPackedFiles, missingRepoFiles } = options;
+	const { forbiddenPackedFiles, forbiddenRepoFiles, missingPackedFiles, missingRepoFiles } =
+		options;
 	const failures = [];
 
 	if (missingRepoFiles.length > 0) {
-		failures.push(`Missing required repo file${missingRepoFiles.length === 1 ? "" : "s"}: ${missingRepoFiles.join(", ")}`);
+		failures.push(
+			`Missing required repo file${missingRepoFiles.length === 1 ? "" : "s"}: ${missingRepoFiles.join(", ")}`,
+		);
 	}
 	if (forbiddenRepoFiles.length > 0) {
-		failures.push(`Forbidden repo file${forbiddenRepoFiles.length === 1 ? "" : "s"} present: ${forbiddenRepoFiles.join(", ")}`);
+		failures.push(
+			`Forbidden repo file${forbiddenRepoFiles.length === 1 ? "" : "s"} present: ${forbiddenRepoFiles.join(", ")}`,
+		);
 	}
 	if (missingPackedFiles.length > 0) {
-		failures.push(`Missing required packed file${missingPackedFiles.length === 1 ? "" : "s"}: ${missingPackedFiles.join(", ")}`);
+		failures.push(
+			`Missing required packed file${missingPackedFiles.length === 1 ? "" : "s"}: ${missingPackedFiles.join(", ")}`,
+		);
 	}
 	if (forbiddenPackedFiles.length > 0) {
-		failures.push(`Forbidden packed file${forbiddenPackedFiles.length === 1 ? "" : "s"} present: ${forbiddenPackedFiles.join(", ")}`);
+		failures.push(
+			`Forbidden packed file${forbiddenPackedFiles.length === 1 ? "" : "s"} present: ${forbiddenPackedFiles.join(", ")}`,
+		);
 	}
 
 	return failures;
@@ -434,9 +239,18 @@ export function collectVerificationFailures(options) {
 export function evaluatePackResult(options) {
 	const { forbiddenRepoFiles, missingRepoFiles, packResult, publishContract } = options;
 	const packedPaths = collectPackedPaths(Array.isArray(packResult.files) ? packResult.files : []);
-	const missingPackedFiles = publishContract.requiredPackedFiles.filter((path) => !packedPaths.has(path));
-	const forbiddenPackedFiles = publishContract.forbiddenPackedFiles.filter((path) =>
-		path.endsWith("/") ? [...packedPaths].some((packedPath) => packedPath.startsWith(path)) : packedPaths.has(path),
+	const missingPackedFiles = publishContract.requiredPackedFiles.filter(
+		(path) => !packedPaths.has(path),
+	);
+	// ponytail: Only the two canonical leak patterns are supported; add explicit rules if the publish contract grows.
+	const forbiddenPackedFiles = publishContract.forbiddenPackedFiles.filter((pattern) =>
+		[...packedPaths].some(
+			(path) =>
+				(pattern.endsWith("/") && path.startsWith(pattern)) ||
+				(pattern === ".env*" && path.startsWith(".env")) ||
+				(pattern === "**/*.tgz" && path.endsWith(".tgz")) ||
+				path === pattern,
+		),
 	);
 	const failures = collectVerificationFailures({
 		forbiddenPackedFiles,
@@ -459,7 +273,9 @@ export function evaluatePackResult(options) {
 
 function printVerificationReport(report, options) {
 	console.log(`Tarball: ${report.packResult.filename}`);
-	console.log(`Packed files: ${report.packResult.entryCount} ${pluralize(report.packResult.entryCount, "entry", "entries")}`);
+	console.log(
+		`Packed files: ${report.packResult.entryCount} ${pluralize(report.packResult.entryCount, "entry", "entries")}`,
+	);
 	console.log(`Tarball size: ${report.packResult.size} bytes`);
 	console.log(`Unpacked size: ${report.packResult.unpackedSize} bytes`);
 
@@ -505,8 +321,16 @@ export async function verifyPackageRelease(options = {}) {
 	const publishContract = await loadPublishContract({ cwd });
 	const missingRepoFiles = await collectMissingPaths(publishContract.requiredRepoFiles, cwd);
 	const forbiddenRepoFiles = await collectPresentPaths(publishContract.forbiddenRepoFiles, cwd);
-	const report = evaluatePackResult({ forbiddenRepoFiles, missingRepoFiles, packResult, publishContract });
-	const packedMarkdownLinkFailures = await collectPackedMarkdownLinkFailures({ cwd, packedPaths: report.packedPaths });
+	const report = evaluatePackResult({
+		forbiddenRepoFiles,
+		missingRepoFiles,
+		packResult,
+		publishContract,
+	});
+	const packedMarkdownLinkFailures = await collectPackedMarkdownLinkFailures({
+		cwd,
+		packedPaths: report.packedPaths,
+	});
 	return {
 		...report,
 		failures: [...report.failures, ...packedMarkdownLinkFailures],
@@ -514,71 +338,10 @@ export async function verifyPackageRelease(options = {}) {
 	};
 }
 
-export async function verifyPackagedPiLoad(options = {}) {
-	const cwd = options.cwd ?? process.cwd();
-	const { cleanup, packageDir, packResult } = await packToTemporaryPackageDir(cwd);
-	let session;
-	let tempAgentDir;
-
-	try {
-		tempAgentDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-agent-"));
-		// The tarball already contains dist; install only its runtime dependencies, as a consumer would.
-		await execFile(npmCommand, ["install", "--omit=dev", "--omit=peer", "--ignore-scripts", "--no-audit", "--no-fund"], {
-			...npmExecOptions,
-			cwd: packageDir,
-			maxBuffer: 5 * 1024 * 1024,
-		});
-		const resourceLoader = new DefaultResourceLoader({
-			agentDir: tempAgentDir,
-			cwd: packageDir,
-			additionalExtensionPaths: [packageDir],
-			noContextFiles: true,
-			noExtensions: true,
-			noPromptTemplates: true,
-			noSkills: true,
-			noThemes: true,
-		});
-		await resourceLoader.reload();
-		const result = await createAgentSession({
-			agentDir: tempAgentDir,
-			cwd: packageDir,
-			noTools: "builtin",
-			resourceLoader,
-		});
-		session = result.session;
-
-		const tools = session.getAllTools();
-		const failures = evaluatePiSmokeResult({ packageDir, tools });
-		failures.push(...resourceLoader.getExtensions().errors.map(({ path, error }) => `Packaged extension ${path} failed to load: ${error}`));
-		let invocation;
-
-		if (failures.length === 0) {
-			const executionReport = await withFakeAgentBrowserOnPath(() =>
-				executePackagedAgentBrowserSmoke({ packageDir, session }),
-			);
-			failures.push(...executionReport.failures);
-			invocation = executionReport.invocation;
-		}
-
-		return {
-			agentBrowserSmokeArgs: PACKAGED_AGENT_BROWSER_SMOKE_ARGS,
-			agentBrowserSmokeExecuted: invocation !== undefined,
-			agentBrowserToolCount: tools.filter((tool) => tool.name === "agent_browser").length,
-			failures,
-			invocation,
-			packageDir,
-			packResult,
-			tools,
-		};
-	} finally {
-		session?.dispose();
-		await cleanup();
-		if (tempAgentDir) await rm(tempAgentDir, { force: true, recursive: true });
-	}
-}
-
 function isDirectRun(metaUrl, argv = process.argv) {
-	if (!argv[1]) return false;
+	if (!argv[1]) {
+		return false;
+	}
 	return metaUrl === pathToFileURL(argv[1]).href;
 }
 
@@ -592,7 +355,9 @@ export async function main(argv = process.argv.slice(2)) {
 
 		const report = await verifyPackageRelease();
 		printVerificationReport(report, cliArgs);
-		if (report.failures.length > 0) return 1;
+		if (report.failures.length > 0) {
+			return 1;
+		}
 
 		if (cliArgs.smokePi) {
 			const smokeReport = await verifyPackagedPiLoad();
@@ -613,7 +378,12 @@ export async function main(argv = process.argv.slice(2)) {
 }
 
 if (isDirectRun(import.meta.url)) {
-	main().then((exitCode) => {
-		process.exitCode = exitCode;
-	});
+	main()
+		.then((exitCode) => {
+			process.exitCode = exitCode;
+		})
+		.catch((error) => {
+			console.error(error instanceof Error ? error.message : error);
+			process.exitCode = 1;
+		});
 }

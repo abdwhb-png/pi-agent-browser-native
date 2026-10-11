@@ -1,67 +1,103 @@
 import type { ChildProcess } from "node:child_process";
 
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
-import type { ElectronCleanupResult, ElectronLaunchStatus } from "../../electron/cleanup.js";
-import type { ElectronCdpTarget, ElectronLaunchRecord, ElectronLaunchSuccess } from "../../electron/launch.js";
-import type { AgentBrowserNetworkSourceLookupAnalysis, AgentBrowserQaPresetAnalysis, AgentBrowserSourceLookupAnalysis, CompiledAgentBrowserElectron, CompiledAgentBrowserJob, CompiledAgentBrowserNetworkSourceLookup, CompiledAgentBrowserQaPreset, CompiledAgentBrowserSemanticAction, CompiledAgentBrowserSourceLookup } from "../../input-modes/types.js";
+import type { ElectronCleanupResult } from "../../electron/cleanup.js";
+import type { ElectronLaunchRecord, ElectronLaunchSuccess } from "../../electron/launch.js";
+import type {
+	AgentBrowserNetworkSourceLookupAnalysis,
+	AgentBrowserQaPresetAnalysis,
+	AgentBrowserSourceLookupAnalysis,
+	CompiledAgentBrowserElectron,
+	CompiledAgentBrowserJob,
+	CompiledAgentBrowserNetworkSourceLookup,
+	CompiledAgentBrowserQaPreset,
+	CompiledAgentBrowserSemanticAction,
+	CompiledAgentBrowserSourceLookup,
+} from "../../input-modes/types.js";
 import type { runAgentBrowserProcess } from "../../process.js";
-import type { AgentBrowserEnvelope, AgentBrowserNextAction, NetworkRouteRecord, SessionArtifactManifest } from "../../results/contracts.js";
-import type { buildAgentBrowserResultCategoryDetails } from "../../results/categories.js";
-import type { buildToolPresentation } from "../../results/presentation.js";
-import type { RichInputRecoveryDiagnostic, VisibleRefFallbackDiagnostic } from "../../results/selector-recovery.js";
-import type { SessionPageState, SessionRefSnapshot, SessionRefSnapshotInvalidation, SessionTabTarget } from "../../session-page-state.js";
-import type { buildExecutionPlan, CompatibilityWorkaround, OpenResultTabCorrection } from "../../runtime.js";
-import type { ManagedSessionRestoreState, OwnedManagedSessionContext } from "../../managed-session-restore.js";
+import type {
+	AgentBrowserEnvelope,
+	AgentBrowserResultCategoryDetails,
+	NetworkRouteRecord,
+	SessionArtifactManifest,
+	ToolPresentation,
+} from "../../results/contracts.js";
+import type {
+	RichInputRecoveryDiagnostic,
+	VisibleRefFallbackDiagnostic,
+} from "../../results/selector-recovery.js";
+import type {
+	SessionPageState,
+	SessionRefSnapshot,
+	SessionRefSnapshotInvalidation,
+	SessionTabTarget,
+} from "../../session-page-state.js";
+import type {
+	ExecutionPlan,
+	CompatibilityWorkaround,
+	OpenResultTabCorrection,
+} from "../../runtime-contracts.js";
+import type {
+	ManagedSessionRestoreState,
+	OwnedManagedSessionContext,
+} from "../../managed-session-restore.js";
 import type { ManagedSessionPolicyLock } from "../../managed-session-policy-lock.js";
 import type { PromptPolicy } from "../../prompt-policy.js";
+import type { ActiveRecordingReservation } from "../../recording-reservations.js";
+import type { ReadConfirmation } from "../../read-confirmation.js";
 import type { AgentBrowserExecuteParams, ResolvedAgentBrowserValidInput } from "../input-plan.js";
 
-export type AgentBrowserToolResult = AgentToolResult<unknown> & { isError?: boolean };
+export type AgentBrowserToolResult = AgentToolResult<unknown> & { readonly isError?: boolean };
 export type AgentBrowserProcessResult = Awaited<ReturnType<typeof runAgentBrowserProcess>>;
-export type AgentBrowserExecutionPlan = ReturnType<typeof buildExecutionPlan>;
-export type AgentBrowserToolPresentation = Awaited<ReturnType<typeof buildToolPresentation>>;
-export type AgentBrowserResultCategoryDetails = ReturnType<typeof buildAgentBrowserResultCategoryDetails>;
+export type AgentBrowserExecutionPlan = ExecutionPlan;
+export type AgentBrowserToolPresentation = ToolPresentation;
+export type { AgentBrowserResultCategoryDetails };
 
 export type TraceOwner = "profiler" | "trace";
 export type { BatchCommandStep } from "../batch-stdin.js";
 
-export interface BrowserRunContext {
+export type BrowserRunContext = Readonly<{
 	cwd: string;
 	sessionDir?: string;
 	sessionManager: {
-		getSessionDir?: () => string;
-		getSessionId: () => string | undefined;
+		readonly getSessionDir?: () => string;
+		readonly getSessionId: () => string | undefined;
 	};
-}
+}>;
 
-export interface BrowserRunInputFields {
+export type BrowserRunInputFields = Readonly<{
 	compiledElectron?: CompiledAgentBrowserElectron;
 	compiledJob?: CompiledAgentBrowserJob;
 	compiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
 	compiledQaPreset?: CompiledAgentBrowserQaPreset;
 	compiledSemanticAction?: CompiledAgentBrowserSemanticAction;
 	compiledSourceLookup?: CompiledAgentBrowserSourceLookup;
-	redactedArgs: string[];
+	redactedArgs: readonly string[];
 	redactedCompiledElectron?: CompiledAgentBrowserElectron;
 	redactedCompiledJob?: CompiledAgentBrowserJob;
 	redactedCompiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
 	redactedCompiledQaPreset?: CompiledAgentBrowserQaPreset;
 	redactedCompiledSemanticAction?: CompiledAgentBrowserSemanticAction;
 	redactedCompiledSourceLookup?: CompiledAgentBrowserSourceLookup;
-	toolArgs: string[];
+	toolArgs: readonly string[];
 	toolStdin?: string;
-}
+}>;
 
-export interface OwnedManagedSessionReference {
+export type OwnedManagedSessionReference = Readonly<{
 	compatibilityWorkaround?: CompatibilityWorkaround;
 	cwd: string;
 	headedManagedAutosaveDisabled?: boolean;
 	headedManagedAutosaveInterval?: string;
 	namespace?: string;
 	sessionName: string;
-}
+	socketDir?: string;
+}>;
 
 export interface BrowserRunState {
+	observedBrowserEffects?: Record<string, unknown>;
+	confirmationPolicyIdentity?: string;
+	confirmationPolicyMayBeEstablished?: boolean;
+	activeRecordingReservations?: ReadonlyMap<string, ActiveRecordingReservation>;
 	attachedSessionKeys: Set<string>;
 	artifactManifest?: SessionArtifactManifest;
 	closedManagedSessionNames: Set<string>;
@@ -78,26 +114,29 @@ export interface BrowserRunState {
 	managedSessionName: string;
 	managedSessionNamespace?: string;
 	managedSessionRestoreState: ManagedSessionRestoreState;
-	networkRoutesBySession: Map<string, NetworkRouteRecord[]>;
+	networkRoutesBySession: ReadonlyMap<string, readonly NetworkRouteRecord[]>;
 	ownedManagedSessions: ReadonlyMap<string, OwnedManagedSessionReference>;
 	sessionPageState: SessionPageState;
 	traceOwners: Map<string, TraceOwner>;
 }
 
 export interface BrowserRunStatePatch {
-	artifactManifest?: SessionArtifactManifest;
-	freshSessionOrdinal?: number;
-	managedSessionActive?: boolean;
-	managedSessionCompatibilityWorkaround?: CompatibilityWorkaround;
-	managedSessionHeadedAutosaveDisabled?: boolean;
-	managedSessionHeadedAutosaveInterval?: string;
-	managedSessionCwd?: string;
-	managedSessionName?: string;
-	managedSessionNamespace?: string;
-	networkRoutesBySession?: Map<string, NetworkRouteRecord[]>;
+	readonly artifactManifest?: SessionArtifactManifest;
+	readonly freshSessionOrdinal?: number;
+	readonly managedSessionActive?: boolean;
+	readonly managedSessionCompatibilityWorkaround?: CompatibilityWorkaround;
+	readonly managedSessionHeadedAutosaveDisabled?: boolean;
+	readonly managedSessionHeadedAutosaveInterval?: string;
+	readonly managedSessionCwd?: string;
+	readonly managedSessionName?: string;
+	readonly managedSessionNamespace?: string;
+	readonly networkRoutesBySession?: ReadonlyMap<string, readonly NetworkRouteRecord[]>;
 }
 
-export interface BrowserRunOptions {
+export type BrowserRunOptions = Readonly<{
+	modelVisible?: boolean;
+	operationCwd?: string;
+	daemonInactive?: boolean;
 	ctx: BrowserRunContext;
 	cwd: string;
 	electronPostCommandStatusSettleMs: number;
@@ -113,323 +152,82 @@ export interface BrowserRunOptions {
 	sessionPageStateUpdate: ReturnType<SessionPageState["beginUpdate"]>;
 	signal?: AbortSignal;
 	state: BrowserRunState;
-}
+}>;
 
-export interface SemanticActionVisibleRefResolution {
-	args: string[];
-	snapshot: SessionRefSnapshot;
-}
+export type {
+	SemanticActionVisibleRefResolution,
+	NavigationSummary,
+	OverlayBlockerCandidate,
+	OverlayBlockerDiagnostic,
+	ClickDispatchProbeTarget,
+	ClickDispatchProbe,
+	ClickDispatchScrollContainerDiagnostic,
+	ClickDispatchDiagnostic,
+	SelectorTextVisibilityCandidate,
+	SelectorTextVisibilityDiagnostic,
+	ElectronBroadGetTextScopeDiagnostic,
+	QaAttachedTarget,
+	QaAttachedPreconditionFailure,
+	TimeoutArtifactEvidence,
+	TimeoutProgressStep,
+	TimeoutPartialProgress,
+	EvalStdinHint,
+	EvalResultWarning,
+	ArtifactCleanupGuidance,
+	ManagedSessionOutcome,
+	ScrollPositionSnapshot,
+	ScrollNoopDiagnostic,
+	ComboboxFocusDiagnostic,
+	RecordingDependencyWarning,
+	ScreenshotPathRequest,
+	PreparedAgentBrowserArgs,
+	ScreenshotArtifactRequest,
+	StaleRefPreflight,
+	AboutBlankSessionMismatch,
+	ElectronHandoffSummary,
+	ElectronManagedSessionTarget,
+	ElectronSessionMismatchReason,
+	ElectronSessionMismatch,
+	ElectronPostCommandHealthReason,
+	ElectronPostCommandHealthDiagnostic,
+	FillVerificationDiagnostic,
+	ElectronRefFreshnessDiagnostic,
+} from "./observation-types.js";
 
-export interface NavigationSummary {
-	title?: string;
-	url?: string;
-	urlChanged?: boolean;
-}
+import type {
+	AboutBlankSessionMismatch,
+	ArtifactCleanupGuidance,
+	ClickDispatchDiagnostic,
+	ClickDispatchProbe,
+	ComboboxFocusDiagnostic,
+	ElectronBroadGetTextScopeDiagnostic,
+	ElectronHandoffSummary,
+	ElectronPostCommandHealthDiagnostic,
+	ElectronRefFreshnessDiagnostic,
+	ElectronSessionMismatch,
+	EvalResultWarning,
+	EvalStdinHint,
+	FillVerificationDiagnostic,
+	ManagedSessionOutcome,
+	NavigationSummary,
+	OverlayBlockerDiagnostic,
+	PreparedAgentBrowserArgs,
+	QaAttachedTarget,
+	RecordingDependencyWarning,
+	ScreenshotArtifactRequest,
+	ScrollNoopDiagnostic,
+	ScrollPositionSnapshot,
+	SelectorTextVisibilityDiagnostic,
+	TimeoutPartialProgress,
+} from "./observation-types.js";
 
-export interface OverlayBlockerCandidate {
-	args: string[];
-	name?: string;
-	reason: string;
-	ref: string;
-	role?: string;
-}
-
-export interface OverlayBlockerDiagnostic {
-	candidates: OverlayBlockerCandidate[];
-	snapshot: SessionRefSnapshot;
-	summary: string;
-}
-
-export type ClickDispatchProbeTarget =
-	| {
-		kind: "selector";
-		selector: string;
-	}
-	| {
-		kind: "xpath";
-		selector: string;
-	}
-	| {
-		kind: "accessible";
-		name: string;
-		refId: string;
-		role: string;
-	};
-
-export interface ClickDispatchProbe {
-	cleaned?: boolean;
-	marker: string;
-	target: ClickDispatchProbeTarget;
-}
-
-export interface ClickDispatchScrollContainerDiagnostic {
-	selector?: string;
-	summary: string;
-	targetOutsideContainer?: boolean;
-	targetOutsideViewport?: boolean;
-}
-
-export interface ClickDispatchDiagnostic {
-	nativeEventCount: number;
-	reason: "native-click-produced-no-target-dom-event";
-	scrollContainer?: ClickDispatchScrollContainerDiagnostic;
-	status: "no-native-event-observed";
-	summary: string;
-	target: ClickDispatchProbeTarget;
-}
-
-export interface SelectorTextVisibilityCandidate {
-	index: number;
-	role?: string;
-	tagName: string;
-	textPreview?: string;
-}
-
-export interface SelectorTextVisibilityDiagnostic {
-	firstMatchVisible?: boolean;
-	firstVisibleTextPreview?: string;
-	matchCount: number;
-	selector: string;
-	summary: string;
-	visibleCandidates?: SelectorTextVisibilityCandidate[];
-	visibleCount: number;
-}
-
-export interface ElectronBroadGetTextScopeDiagnostic {
-	electronContext: {
-		launchId?: string;
-		sessionName?: string;
-		url?: string;
-	};
-	selector: string;
-	summary: string;
-}
-
-export interface QaAttachedTarget {
-	error?: string;
-	sessionName: string;
-	title?: string;
-	url?: string;
-}
-
-export interface QaAttachedPreconditionFailure {
-	error: string;
-	nextActions: AgentBrowserNextAction[];
-}
-
-export interface TimeoutArtifactEvidence {
-	absolutePath: string;
-	exists: boolean;
-	path: string;
-	sizeBytes?: number;
-	state: "missing" | "verified";
-	stepIndex: number;
-}
-
-export type TimeoutProgressStepStatus = "completed" | "failed" | "pending" | "unknown";
-
-export interface TimeoutProgressStep {
-	args: string[];
-	generatedFrom?: string;
-	index: number;
-	reason?: string;
-	retry?: { args: string[]; stdin: string };
-	status: TimeoutProgressStepStatus;
-}
-
-export interface TimeoutPartialProgress {
-	artifacts: TimeoutArtifactEvidence[];
-	currentPage?: {
-		source?: "live" | "planned";
-		title?: string;
-		url?: string;
-	};
-	liveUrlRecovered?: boolean;
-	openedButPostOpenTimedOut?: boolean;
-	retryStep?: TimeoutProgressStep;
-	steps?: TimeoutProgressStep[];
-	summary: string;
-}
-
-export interface EvalStdinHint {
-	reason: string;
-	suggestion: string;
-}
-
-export interface EvalResultWarning {
-	reason: string;
-	suggestion: string;
-}
-
-export interface ArtifactCleanupGuidance {
-	explicitArtifactPaths: string[];
-	note: string;
-	owner: "host-file-tools";
-	summary: string;
-}
-
-export interface ManagedSessionOutcome {
-	activeAfter: boolean;
-	activeBefore: boolean;
-	attemptedSessionName?: string;
-	currentSessionName: string;
-	currentSessionNamespace?: string;
-	previousSessionName: string;
-	replacedSessionClosed?: boolean;
-	replacedSessionName?: string;
-	replacedSessionNamespace?: string;
-	sessionMode: "auto" | "fresh";
-	status: "abandoned" | "closed" | "created" | "preserved" | "replaced" | "unchanged";
-	succeeded: boolean;
-	summary: string;
-}
-
-export interface ScrollPositionSnapshot {
-	containerCount: number;
-	containers: Array<{ id: string; scrollLeft: number; scrollTop: number }>;
-	innerHeight: number;
-	innerWidth: number;
-	scrollHeight: number;
-	scrollWidth: number;
-	scrollX: number;
-	scrollY: number;
-}
-
-export interface ScrollNoopDiagnostic {
-	after: ScrollPositionSnapshot;
-	before: ScrollPositionSnapshot;
-	message: string;
-	reason: "no-observed-scroll-position-change";
-	recommendations: string[];
-}
-
-export interface ComboboxFocusDiagnostic {
-	activeElement: {
-		expanded?: string;
-		hasPopup?: string;
-		name?: string;
-		role?: string;
-		tagName?: string;
-	};
-	message: string;
-	reason: "focused-combobox-without-visible-options";
-	recommendations: string[];
-	visibleListboxCount: number;
-	visibleOptionCount: number;
-}
-
-export interface RecordingDependencyWarning {
-	command: "record start" | "record restart";
-	dependency: "ffmpeg";
-	message: string;
-	reason: "ffmpeg-missing-for-recording";
-	recommendations: string[];
-}
-
-export interface ScreenshotPathRequest {
-	absolutePath: string;
-	path: string;
-}
-
-export interface PreparedAgentBrowserArgs {
-	args: string[];
-	batchScreenshotPathRequests?: Array<ScreenshotPathRequest | undefined>;
-	screenshotPathRequest?: ScreenshotPathRequest;
-	stdin?: string;
-}
-
-export interface ScreenshotArtifactRequest extends ScreenshotPathRequest {
-	status?: "missing" | "repaired-from-temp" | "saved" | "upstream-temp-only";
-	tempPath?: string;
-}
-
-export interface StaleRefPreflight {
-	message: string;
-	refIds: string[];
-	snapshot?: SessionRefSnapshot;
-	snapshotInvalidation?: SessionRefSnapshotInvalidation;
-}
-
-export interface AboutBlankSessionMismatch {
-	activeUrl: "about:blank";
-	recoveryApplied: boolean;
-	recoveryHint: string;
-	targetTitle?: string;
-	targetUrl: string;
-}
-
-export interface ElectronHandoffSummary {
-	error?: string;
-	failureCategory?: "aborted" | "upstream-error" | "validation-error";
-	handoff: "connect" | "snapshot" | "tabs";
-	refSnapshot?: SessionRefSnapshot;
-	snapshot?: unknown;
-	snapshotRetryCount?: number;
-	tabs?: unknown;
-}
-
-export interface ElectronManagedSessionTarget {
-	error?: string;
-	namespace?: string;
-	sessionName: string;
-	title?: string;
-	url?: string;
-}
-
-export type ElectronSessionMismatchReason =
-	| "launch-session-not-current"
-	| "managed-session-about-blank-while-launch-target-live"
-	| "managed-session-target-not-in-launch-status";
-
-export interface ElectronSessionMismatch {
-	launchId: string;
-	liveTarget?: ElectronCdpTarget;
-	managedSession: ElectronManagedSessionTarget;
-	nextActionIds: string[];
-	reason: ElectronSessionMismatchReason;
-	sessionName?: string;
-	statusTargets: ElectronCdpTarget[];
-	summary: string;
-}
-
-export type ElectronPostCommandHealthReason = "about-blank-no-live-target" | "debug-port-dead" | "process-dead";
-
-export interface ElectronPostCommandHealthDiagnostic {
-	appName: string;
-	command?: string;
-	launchId: string;
-	nextActionIds: string[];
-	reason: ElectronPostCommandHealthReason;
-	sessionName?: string;
-	status: ElectronLaunchStatus;
-	summary: string;
-	target?: SessionTabTarget;
-}
-
-export interface FillVerificationDiagnostic {
-	actual?: string;
-	expected: string;
-	method: "text" | "value";
-	nextActionIds: string[];
-	reason: "contenteditable-fill-mismatch" | "value-fill-mismatch";
-	selector: string;
-	status: "mismatch";
-	summary: string;
-}
-
-export interface ElectronRefFreshnessDiagnostic {
-	command?: string;
-	launchId: string;
-	nextActionIds: string[];
-	sessionName?: string;
-	summary: string;
-}
-
-export interface PreparedBrowserRun {
-	batchScreenshotArtifactRequests?: Array<ScreenshotArtifactRequest | undefined>;
+export type PreparedBrowserRun = Readonly<{
+	chromeStartupArgs?: string;
+	readConfirmation?: ReadConfirmation;
+	batchScreenshotArtifactRequests?: ReadonlyArray<ScreenshotArtifactRequest | undefined>;
 	headedLaunch: boolean;
 	providerLaunch: boolean;
-	commandTokens: string[];
+	commandTokens: readonly string[];
 	compiledElectron?: CompiledAgentBrowserElectron;
 	compiledJob?: CompiledAgentBrowserJob;
 	compiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
@@ -440,7 +238,7 @@ export interface PreparedBrowserRun {
 	electronFailedConnectCleanup?: ElectronCleanupResult;
 	electronHandoff?: ElectronHandoffSummary;
 	electronLaunch?: ElectronLaunchSuccess;
-	exactSensitiveValues: string[];
+	exactSensitiveValues: readonly string[];
 	executionPlan: AgentBrowserExecutionPlan;
 	managedSessionPolicyLock?: ManagedSessionPolicyLock;
 	ownedManagedSessionContext?: OwnedManagedSessionContext;
@@ -449,21 +247,21 @@ export interface PreparedBrowserRun {
 	priorRefSnapshotState?: SessionRefSnapshot;
 	priorSessionTabTarget?: SessionTabTarget;
 	priorSessionTabTargetUnknown?: true;
-	processArgs: string[];
+	processArgs: readonly string[];
 	processStdin?: string;
 	processTimeoutMs?: number;
-	redactedArgs: string[];
+	redactedArgs: readonly string[];
 	redactedCompiledElectron?: CompiledAgentBrowserElectron;
 	redactedCompiledJob?: CompiledAgentBrowserJob;
 	redactedCompiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
 	redactedCompiledQaPreset?: CompiledAgentBrowserQaPreset;
 	redactedCompiledSemanticAction?: CompiledAgentBrowserSemanticAction;
 	redactedCompiledSourceLookup?: CompiledAgentBrowserSourceLookup;
-	redactedEffectiveArgs: string[];
-	redactedProcessArgs: string[];
-	redactedRecoveryHint?: ReturnType<typeof import("../../runtime.js").buildExecutionPlan>["recoveryHint"];
+	redactedEffectiveArgs: readonly string[];
+	redactedProcessArgs: readonly string[];
+	redactedRecoveryHint?: AgentBrowserExecutionPlan["recoveryHint"];
 	resolvedSemanticActionRefSnapshot?: SessionRefSnapshot;
-	runtimeToolArgs: string[];
+	runtimeToolArgs: readonly string[];
 	runtimeToolStdin?: string;
 	screenshotArtifactRequest?: ScreenshotArtifactRequest;
 	scrollPositionBefore?: ScrollPositionSnapshot;
@@ -473,31 +271,35 @@ export interface PreparedBrowserRun {
 	shouldProbeScrollNoop: boolean;
 	statePatch: BrowserRunStatePatch;
 	userRequestedJson: boolean;
-}
+}>;
 
 export type PrepareBrowserRunResult =
-	| { kind: "early-result"; result: AgentBrowserToolResult; statePatch?: BrowserRunStatePatch }
-	| { kind: "ready"; prepared: PreparedBrowserRun };
+	| {
+			readonly kind: "early-result";
+			readonly result: AgentBrowserToolResult;
+			readonly statePatch?: BrowserRunStatePatch;
+	  }
+	| { readonly kind: "ready"; readonly prepared: PreparedBrowserRun };
 
 export interface ProcessBrowserOutputInput extends BrowserRunOptions {
-	artifactRunStartedAtMs: number;
-	prepared: PreparedBrowserRun;
-	processResult: AgentBrowserProcessResult;
+	readonly artifactRunStartedAtMs: number;
+	readonly prepared: PreparedBrowserRun;
+	readonly processResult: AgentBrowserProcessResult;
 }
 
-export interface BrowserProcessOutputResult {
+export type BrowserProcessOutputResult = Readonly<{
 	result: AgentBrowserToolResult;
 	statePatch: BrowserRunStatePatch;
-}
+}>;
 
-export interface ParseFailureOutput {
+export type ParseFailureOutput = Readonly<{
 	artifactManifest?: SessionArtifactManifest;
 	artifactRetentionSummary?: string;
 	fullOutputPath?: string;
 	fullOutputUnavailable?: string;
-}
+}>;
 
-export interface FinalRecoveryState {
+export type FinalRecoveryState = Readonly<{
 	categoryDetails: AgentBrowserResultCategoryDetails;
 	currentRefSnapshot?: SessionRefSnapshot;
 	currentRefSnapshotInvalidation?: SessionRefSnapshotInvalidation;
@@ -505,14 +307,15 @@ export interface FinalRecoveryState {
 	richInputRecoveryDiagnostic?: RichInputRecoveryDiagnostic;
 	visibleRefFallbackDiagnostic?: VisibleRefFallbackDiagnostic;
 	visibleRefFallbackSessionName?: string;
-}
+}>;
 
-export interface FinalResultInput {
+export type FinalResultInput = Readonly<{
+	modelVisible?: boolean;
 	aboutBlankSessionMismatch?: AboutBlankSessionMismatch;
 	artifactCleanup?: ArtifactCleanupGuidance;
 	categoryDetails: AgentBrowserResultCategoryDetails;
 	clickDispatchDiagnostic?: ClickDispatchDiagnostic;
-	commandTokens: string[];
+	commandTokens: readonly string[];
 	comboboxFocusDiagnostic?: ComboboxFocusDiagnostic;
 	compiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
 	compiledSemanticAction?: CompiledAgentBrowserSemanticAction;
@@ -521,7 +324,7 @@ export interface FinalResultInput {
 	currentRefSnapshotInvalidation?: SessionRefSnapshotInvalidation;
 	currentSessionTabTarget?: SessionTabTarget;
 	currentSessionTabTargetUnknown?: true;
-	electronBroadGetTextScopeDiagnostics: ElectronBroadGetTextScopeDiagnostic[];
+	electronBroadGetTextScopeDiagnostics: readonly ElectronBroadGetTextScopeDiagnostic[];
 	electronFailedConnectCleanup?: ElectronCleanupResult;
 	electronHandoff?: ElectronHandoffSummary;
 	electronLaunch?: ElectronLaunchSuccess;
@@ -534,7 +337,7 @@ export interface FinalResultInput {
 	errorText?: string;
 	evalStdinHint?: EvalStdinHint;
 	evalResultWarning?: EvalResultWarning;
-	exactSensitiveValues: string[];
+	exactSensitiveValues: readonly string[];
 	executionPlan: AgentBrowserExecutionPlan;
 	fillVerificationDiagnostic?: FillVerificationDiagnostic;
 	headedLaunch: boolean;
@@ -561,7 +364,7 @@ export interface FinalResultInput {
 	qaAttachedTarget?: QaAttachedTarget;
 	qaPreset?: AgentBrowserQaPresetAnalysis;
 	recordingDependencyWarning?: RecordingDependencyWarning;
-	redactedArgs: string[];
+	redactedArgs: readonly string[];
 	redactedCompiledElectron?: CompiledAgentBrowserElectron;
 	redactedCompiledJob?: CompiledAgentBrowserJob;
 	redactedCompiledNetworkSourceLookup?: CompiledAgentBrowserNetworkSourceLookup;
@@ -569,12 +372,12 @@ export interface FinalResultInput {
 	redactedCompiledSemanticAction?: CompiledAgentBrowserSemanticAction;
 	redactedCompiledSourceLookup?: CompiledAgentBrowserSourceLookup;
 	redactedContent: AgentBrowserToolResult["content"];
-	redactedProcessArgs: string[];
+	redactedProcessArgs: readonly string[];
 	redactedRecoveryHint?: AgentBrowserExecutionPlan["recoveryHint"];
 	resultArtifactManifest?: SessionArtifactManifest;
 	richInputRecoveryDiagnostic?: RichInputRecoveryDiagnostic;
 	scrollNoopDiagnostic?: ScrollNoopDiagnostic;
-	selectorTextVisibilityDiagnostics: SelectorTextVisibilityDiagnostic[];
+	selectorTextVisibilityDiagnostics: readonly SelectorTextVisibilityDiagnostic[];
 	sessionMode: "auto" | "fresh";
 	sessionTabCorrection?: OpenResultTabCorrection;
 	sourceLookup?: AgentBrowserSourceLookupAnalysis;
@@ -584,4 +387,4 @@ export interface FinalResultInput {
 	userRequestedJson: boolean;
 	visibleRefFallbackDiagnostic?: VisibleRefFallbackDiagnostic;
 	visibleRefFallbackSessionName?: string;
-}
+}>;

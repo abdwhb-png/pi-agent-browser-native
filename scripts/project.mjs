@@ -69,7 +69,8 @@ function printVerifyHelp() {
 	console.log(`npm run verify -- [mode] [options]
 
 Modes:
-  default             Docs check, typecheck, unit tests, and live command-reference check (default).
+  default             Complete quality, build, typecheck, unit, and documentation gate (default).
+  quality             Alias for the complete default gate.
   typecheck           Run TypeScript typecheck only.
   command-reference   Check generated command-reference block and live upstream help drift.
   pre-pr              Run default verification plus package-content checks for larger local handoffs.
@@ -156,6 +157,8 @@ function run(command, args, options = {}) {
 
 async function runSteps(steps) {
 	for (const step of steps) {
+		// Each verification step must pass before dependent checks run or release actions start.
+		// oxlint-disable-next-line no-await-in-loop
 		await run(step.command, step.args, { env: step.env });
 	}
 }
@@ -172,11 +175,20 @@ export function hostToolPath(pathValue = process.env.PATH ?? "") {
 }
 
 function localToolStep(command, args, env) {
-	return { command: join(process.cwd(), "node_modules", ".bin", `${command}${binSuffix}`), args, env };
+	if (command === "tsc" && process.platform === "android") {
+		return { command: "tsgo", args, env };
+	}
+	return {
+		command: join(process.cwd(), "node_modules", ".bin", `${command}${binSuffix}`),
+		args,
+		env,
+	};
 }
 
 export function parseDocsArgs(argv) {
-	if (argv.includes("-h") || argv.includes("--help")) return { showHelp: true };
+	if (argv.includes("-h") || argv.includes("--help")) {
+		return { showHelp: true };
+	}
 
 	let target = "all";
 	let mode = "check";
@@ -208,11 +220,14 @@ export function docsSteps(options) {
 }
 
 export function parseVerifyArgs(argv) {
-	if (argv.includes("-h") || argv.includes("--help")) return { mode: "default", passthrough: [], showHelp: true };
+	if (argv.includes("-h") || argv.includes("--help")) {
+		return { mode: "default", passthrough: [], showHelp: true };
+	}
 	const [rawMode, ...rest] = argv;
 	const mode = rawMode ?? "default";
 	const supportedModes = new Set([
 		"default",
+		"quality",
 		"typecheck",
 		"command-reference",
 		"pre-pr",
@@ -240,14 +255,18 @@ function validatePlatformSmokePassthrough(passthrough) {
 		const arg = passthrough[index];
 		if (allowedCommands.has(arg)) {
 			commandCount += 1;
-			if (commandCount > 1) throw new UsageError("platform-smoke accepts one command: doctor or run.");
+			if (commandCount > 1) {
+				throw new UsageError("platform-smoke accepts one command: doctor or run.");
+			}
 			continue;
 		}
 		if (!allowedFlags.has(arg)) {
 			throw new UsageError(`Option ${arg} is not supported for verify mode platform-smoke.`);
 		}
 		const value = passthrough[index + 1];
-		if (!value || value.startsWith("-")) throw new UsageError(`${arg} requires a value.`);
+		if (!value || value.startsWith("-")) {
+			throw new UsageError(`${arg} requires a value.`);
+		}
 		index += 1;
 	}
 }
@@ -259,6 +278,7 @@ function validatePassthrough(mode, passthrough) {
 	}
 	const allowedByMode = {
 		default: new Set(),
+		quality: new Set(),
 		typecheck: new Set(),
 		"command-reference": new Set(),
 		"pre-pr": new Set(),
@@ -269,7 +289,6 @@ function validatePassthrough(mode, passthrough) {
 		"package-pi": new Set(["--list-files"]),
 		lifecycle: new Set(["--keep-artifacts", "--model", "--verbose", "--timeout-ms"]),
 		"platform-target": new Set(),
-		"platform-smoke": new Set(),
 		release: new Set(),
 	};
 	const allowed = allowedByMode[mode];
@@ -278,24 +297,17 @@ function validatePassthrough(mode, passthrough) {
 		if (!allowed.has(arg)) {
 			throw new UsageError(`Option ${arg} is not supported for verify mode ${mode}.`);
 		}
-		if (arg === "--model") {
+		const valueFlags = new Map([
+			["--model", "a value"],
+			["--timeout-ms", "a value"],
+			["--artifact-dir", "a path"],
+			["--samples", "a value"],
+		]);
+		if (valueFlags.has(arg)) {
 			const value = passthrough[index + 1];
-			if (!value || value.startsWith("-")) throw new UsageError("--model requires a value.");
-			index += 1;
-		}
-		if (mode === "lifecycle" && arg === "--timeout-ms") {
-			const value = passthrough[index + 1];
-			if (!value) throw new UsageError("--timeout-ms requires a value.");
-			index += 1;
-		}
-		if (arg === "--artifact-dir") {
-			const value = passthrough[index + 1];
-			if (!value || value.startsWith("-")) throw new UsageError("--artifact-dir requires a path.");
-			index += 1;
-		}
-		if (mode === "startup-profile" && arg === "--samples") {
-			const value = passthrough[index + 1];
-			if (!value || value.startsWith("-")) throw new UsageError("--samples requires a value.");
+			if (!value || (arg !== "--timeout-ms" && value.startsWith("-"))) {
+				throw new UsageError(`${arg} requires ${valueFlags.get(arg)}.`);
+			}
 			index += 1;
 		}
 	}
@@ -312,15 +324,64 @@ function commandReferenceSteps() {
 	];
 }
 
+function qualitySteps() {
+	return [
+		buildStep(),
+		scriptStep(["./scripts/prepare-quality-checker.mjs"]),
+		scriptStep(["./scripts/code-quality.mjs", "scope"]),
+		scriptStep(["./scripts/code-quality.mjs", "check"]),
+		scriptStep(["./scripts/code-quality.mjs", "lint"]),
+		localToolStep("oxfmt", ["--check", "."]),
+	];
+}
+
+function realUpstreamSteps() {
+	const file = "test/agent-browser.real-upstream-contract.test.ts";
+	const env = { PI_AGENT_BROWSER_REAL_UPSTREAM: "1" };
+	return [
+		...["plugin list stays sessionless", "contract suite matches"].map((pattern) =>
+			localToolStep(
+				"tsx",
+				["--test", "--test-force-exit", "--test-name-pattern", pattern, file],
+				env,
+			),
+		),
+		localToolStep(
+			"tsx",
+			["--test", "--test-force-exit", "test/agent-browser.batch-fidelity.test.ts"],
+			env,
+		),
+	];
+}
+
+function platformTargetSteps() {
+	return [
+		...qualitySteps(),
+		localToolStep("tsc", ["--noEmit"]),
+		localToolStep("tsx", [
+			"--test",
+			"--test-concurrency=1",
+			"test/code-quality*.test.ts",
+			"test/project-verify.test.ts",
+			"test/platform-smoke.test.ts",
+			"test/verify-package.test.ts",
+			"test/agent-browser.runtime.test.ts",
+			"test/agent-browser.windows-argv.test.ts",
+		]),
+		...docsSteps({ mode: "check", target: "all" }),
+	];
+}
+
 export function verifySteps(options) {
 	validatePassthrough(options.mode, options.passthrough);
 	switch (options.mode) {
 		case "default":
+		case "quality":
 			return [
-				...docsSteps({ mode: "check", target: "playbook" }),
-				buildStep(),
+				...qualitySteps(),
 				localToolStep("tsc", ["--noEmit"]),
 				localToolStep("tsx", ["--test", "--test-concurrency=1", "test/**/*.test.ts"]),
+				...docsSteps({ mode: "check", target: "playbook" }),
 				...commandReferenceSteps(),
 			];
 		case "typecheck":
@@ -335,34 +396,24 @@ export function verifySteps(options) {
 		case "startup-profile":
 			return [scriptStep(["./scripts/profile-startup.mjs", ...options.passthrough])];
 		case "real-upstream":
-			return [
-				localToolStep("tsx", ["--test", "--test-force-exit", "--test-name-pattern", "plugin list stays sessionless", "test/agent-browser.real-upstream-contract.test.ts"], { PI_AGENT_BROWSER_REAL_UPSTREAM: "1" }),
-				localToolStep("tsx", ["--test", "--test-force-exit", "--test-name-pattern", "contract suite matches", "test/agent-browser.real-upstream-contract.test.ts"], { PI_AGENT_BROWSER_REAL_UPSTREAM: "1" }),
-				localToolStep("tsx", ["--test", "--test-force-exit", "test/agent-browser.batch-fidelity.test.ts"], { PI_AGENT_BROWSER_REAL_UPSTREAM: "1" }),
-			];
+			return realUpstreamSteps();
 		case "dogfood":
-			return [buildStep(), localToolStep("tsx", ["./scripts/verify-agent-browser-dogfood.ts", ...options.passthrough])];
+			return [
+				buildStep(),
+				localToolStep("tsx", ["./scripts/verify-agent-browser-dogfood.ts", ...options.passthrough]),
+			];
 		case "package":
 			return [scriptStep(["./scripts/verify-package.mjs", ...options.passthrough])];
 		case "package-pi":
 			return [scriptStep(["./scripts/verify-package.mjs", "--smoke-pi", ...options.passthrough])];
 		case "lifecycle":
-			return [scriptStep(["./scripts/verify-lifecycle.mjs", ...options.passthrough], { PATH: hostToolPath() })];
-		case "platform-target":
 			return [
-				...docsSteps({ mode: "check", target: "all" }),
-				buildStep(),
-				localToolStep("tsc", ["--noEmit"]),
-				localToolStep("tsx", [
-					"--test",
-					"--test-concurrency=1",
-					"test/project-verify.test.ts",
-					"test/platform-smoke.test.ts",
-					"test/verify-package.test.ts",
-					"test/agent-browser.runtime.test.ts",
-					"test/agent-browser.windows-argv.test.ts",
-				]),
+				scriptStep(["./scripts/verify-lifecycle.mjs", ...options.passthrough], {
+					PATH: hostToolPath(),
+				}),
 			];
+		case "platform-target":
+			return platformTargetSteps();
 		case "platform-smoke":
 			return [scriptStep(["./scripts/platform-smoke.mjs", ...options.passthrough])];
 		case "release":
@@ -371,7 +422,12 @@ export function verifySteps(options) {
 				...verifySteps({ mode: "lifecycle", passthrough: [], showHelp: false }),
 				...verifySteps({ mode: "package-pi", passthrough: [], showHelp: false }),
 				scriptStep(["./scripts/platform-smoke.mjs", "doctor"]),
-				scriptStep(["./scripts/platform-smoke.mjs", "run", "--target", "macos,ubuntu,windows-native"]),
+				scriptStep([
+					"./scripts/platform-smoke.mjs",
+					"run",
+					"--target",
+					"macos,ubuntu,windows-native",
+				]),
 			];
 	}
 }
@@ -408,14 +464,13 @@ function isDirectRun(metaUrl, argv = process.argv) {
 }
 
 if (isDirectRun(import.meta.url)) {
-	main().then(
-		(exitCode) => {
+	main()
+		.then((exitCode) => {
 			process.exitCode = exitCode;
-		},
-		(error) => {
+		})
+		.catch((error) => {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error(message);
 			process.exitCode = error instanceof UsageError ? 2 : 1;
-		},
-	);
+		});
 }

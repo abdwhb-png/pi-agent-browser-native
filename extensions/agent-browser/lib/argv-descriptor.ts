@@ -1,22 +1,27 @@
-import { GLOBAL_BOOLEAN_FLAGS_WITH_OPTIONAL_VALUES, VALUE_FLAGS, optionalGlobalValueFlagConsumesNext, stripUpstreamGlobalFlags } from "./argv-grammar.js";
+import {
+	GLOBAL_BOOLEAN_FLAGS_WITH_OPTIONAL_VALUES,
+	VALUE_FLAGS,
+	optionalGlobalValueFlagConsumesNext,
+	stripUpstreamGlobalFlags,
+} from "./argv-grammar.js";
 import { isOpenNavigationCommand } from "./command-taxonomy.js";
 
 export interface CommandInfo {
-	command?: string;
-	commandTokens?: string[];
-	subcommand?: string;
+	readonly command?: string;
+	readonly commandTokens?: readonly string[];
+	readonly subcommand?: string;
 }
 
 export interface ArgvDescriptor {
-	commandInfo: CommandInfo;
-	commandTokens: string[];
-	upstreamCommandTokens: string[];
+	readonly commandInfo: CommandInfo;
+	readonly commandTokens: readonly string[];
+	readonly upstreamCommandTokens: readonly string[];
 }
 
 export interface WaitCommandShape {
-	downloadPath?: string;
-	downloadPathIndex?: number;
-	subcommand?: string;
+	readonly downloadPath?: string;
+	readonly downloadPathIndex?: number;
+	readonly subcommand?: string;
 }
 
 function isBooleanLiteral(token: string | undefined): boolean {
@@ -24,23 +29,32 @@ function isBooleanLiteral(token: string | undefined): boolean {
 	return normalized === "true" || normalized === "false";
 }
 
-export function findCommandStartIndex(args: string[]): number | undefined {
+function flagConsumesFollowingToken(token: string, nextToken: string | undefined): boolean {
+	const normalizedToken = token.split("=", 1).at(0) ?? token;
+	if (optionalGlobalValueFlagConsumesNext(normalizedToken, nextToken)) {
+		return true;
+	}
+	if (token.includes("=")) {
+		return false;
+	}
+	return (
+		VALUE_FLAGS.has(normalizedToken) ||
+		(GLOBAL_BOOLEAN_FLAGS_WITH_OPTIONAL_VALUES.has(normalizedToken) && isBooleanLiteral(nextToken))
+	);
+}
+
+export function findCommandStartIndex(args: readonly string[]): number | undefined {
 	for (let index = 0; index < args.length; index += 1) {
 		const token = args[index];
-		if (token.startsWith("--session=") || token.startsWith("--namespace=") || token.startsWith("--restore=")) {
+		if (
+			token.startsWith("--session=") ||
+			token.startsWith("--namespace=") ||
+			token.startsWith("--restore=")
+		) {
 			continue;
 		}
 		if (token.startsWith("-")) {
-			const normalizedToken = token.split("=", 1)[0] ?? token;
-			if (optionalGlobalValueFlagConsumesNext(normalizedToken, args[index + 1])) {
-				index += 1;
-			} else if (VALUE_FLAGS.has(normalizedToken) && !token.includes("=")) {
-				index += 1;
-			} else if (
-				GLOBAL_BOOLEAN_FLAGS_WITH_OPTIONAL_VALUES.has(normalizedToken) &&
-				!token.includes("=") &&
-				isBooleanLiteral(args[index + 1])
-			) {
+			if (flagConsumesFollowingToken(token, args[index + 1])) {
 				index += 1;
 			}
 			continue;
@@ -50,37 +64,58 @@ export function findCommandStartIndex(args: string[]): number | undefined {
 	return undefined;
 }
 
-export function extractCommandTokens(args: string[]): string[] {
+export function extractCommandTokens(args: readonly string[]): string[] {
 	const commandStartIndex = findCommandStartIndex(args);
 	return commandStartIndex === undefined ? [] : args.slice(commandStartIndex);
 }
 
-export function extractUpstreamCommandTokens(args: string[]): string[] {
+export function extractUpstreamCommandTokens(args: readonly string[]): string[] {
 	return stripUpstreamGlobalFlags(extractCommandTokens(args));
 }
 
-export function parseWaitCommandTokens(commandTokens: string[]): WaitCommandShape {
-	if (commandTokens[0] !== "wait") return {};
+function waitDownloadShape(
+	considered: readonly { readonly token: string; readonly index: number }[],
+	downloadIndex: number,
+): WaitCommandShape {
+	const next = considered.at(downloadIndex + 1);
+	const candidate = next?.token.startsWith("--") === false ? next : undefined;
+	return {
+		downloadPath: candidate?.token,
+		downloadPathIndex: candidate?.index,
+		subcommand: considered[downloadIndex].token,
+	};
+}
+
+export function parseWaitCommandTokens(commandTokens: readonly string[]): WaitCommandShape {
+	if (commandTokens[0] !== "wait") {
+		return {};
+	}
 	const considered = commandTokens.slice(1).map((token, offset) => ({ index: offset + 1, token }));
 	const timeoutIndex = considered.findIndex((entry) => entry.token === "--timeout");
-	if (timeoutIndex >= 0) considered.splice(timeoutIndex, Math.min(2, considered.length - timeoutIndex));
-	for (const flags of [["--url", "-u"], ["--load", "-l"], ["--fn", "-f"], ["--text", "-t"]] as const) {
-		const match = considered.find((entry) => (flags as readonly string[]).includes(entry.token));
-		if (match) return { subcommand: match.token };
+	if (timeoutIndex >= 0) {
+		considered.splice(timeoutIndex, Math.min(2, considered.length - timeoutIndex));
 	}
-	const downloadIndex = considered.findIndex((entry) => entry.token === "--download" || entry.token === "-d");
+	for (const flags of [
+		["--url", "-u"],
+		["--load", "-l"],
+		["--fn", "-f"],
+		["--text", "-t"],
+	] as const) {
+		const match = considered.find((entry) => flags.some((flag) => flag === entry.token));
+		if (match) {
+			return { subcommand: match.token };
+		}
+	}
+	const downloadIndex = considered.findIndex(
+		(entry) => entry.token === "--download" || entry.token === "-d",
+	);
 	if (downloadIndex >= 0) {
-		const candidate = considered[downloadIndex + 1];
-		return {
-			downloadPath: candidate && !candidate.token.startsWith("--") ? candidate.token : undefined,
-			downloadPathIndex: candidate && !candidate.token.startsWith("--") ? candidate.index : undefined,
-			subcommand: considered[downloadIndex].token,
-		};
+		return waitDownloadShape(considered, downloadIndex);
 	}
 	return { subcommand: considered[0]?.token };
 }
 
-function getOpenCommandTarget(commandTokens: string[]): string | undefined {
+function getOpenCommandTarget(commandTokens: readonly string[]): string | undefined {
 	for (let index = 1; index < commandTokens.length; index += 1) {
 		const token = commandTokens[index];
 		if (token === "--init-script" || token === "--enable") {
@@ -98,22 +133,30 @@ function getOpenCommandTarget(commandTokens: string[]): string | undefined {
 	return undefined;
 }
 
-export function parseCommandInfoFromTokens(commandTokens: string[]): CommandInfo {
+function getCommandSubcommand(tokens: readonly string[]): string | undefined {
+	if (isOpenNavigationCommand(tokens.at(0))) {
+		return getOpenCommandTarget(tokens);
+	}
+	if (tokens.at(0) === "wait") {
+		return parseWaitCommandTokens(tokens).subcommand;
+	}
+	return tokens.at(1);
+}
+
+function parseCommandInfoFromTokens(commandTokens: readonly string[]): CommandInfo {
 	const upstreamCommandTokens = stripUpstreamGlobalFlags(commandTokens);
 	const command = upstreamCommandTokens[0];
 	return {
 		command,
-		subcommand: isOpenNavigationCommand(command)
-			? getOpenCommandTarget(upstreamCommandTokens)
-			: command === "wait" ? parseWaitCommandTokens(upstreamCommandTokens).subcommand : upstreamCommandTokens[1],
+		subcommand: getCommandSubcommand(upstreamCommandTokens),
 	};
 }
 
-export function parseCommandInfo(args: string[]): CommandInfo {
+export function parseCommandInfo(args: readonly string[]): CommandInfo {
 	return parseCommandInfoFromTokens(extractCommandTokens(args));
 }
 
-export function parseArgvDescriptor(args: string[]): ArgvDescriptor {
+export function parseArgvDescriptor(args: readonly string[]): ArgvDescriptor {
 	const commandTokens = extractCommandTokens(args);
 	const upstreamCommandTokens = stripUpstreamGlobalFlags(commandTokens);
 	return {

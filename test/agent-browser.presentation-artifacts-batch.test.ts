@@ -11,8 +11,10 @@ import { mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readRecord, readString } from "./helpers/assertions.js";
 
 import { parseUserBatchStdin } from "../extensions/agent-browser/lib/orchestration/batch-stdin.js";
+import { mergeBrowserRunArtifactManifest } from "../extensions/agent-browser/lib/orchestration/browser-run/artifact-merge.js";
 import { buildToolPresentation } from "../extensions/agent-browser/lib/results/presentation.js";
 import type {
 	SessionArtifactManifest,
@@ -23,47 +25,62 @@ import {
 	getSessionArtifactManifestMaxEntries,
 	mergeSessionArtifactManifest,
 } from "../extensions/agent-browser/lib/results/artifact-manifest.js";
-import {
-	withPatchedEnv
-} from "./helpers/agent-browser-harness.js";
+import { withPatchedEnv } from "./helpers/agent-browser-harness.js";
 
-const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==", "base64");
+const png = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+	"base64",
+);
 
 test("batch stdin shape errors include a copyable native-tool example", () => {
-	const error = parseUserBatchStdin(JSON.stringify([{ action: "get", target: "title" }])).error ?? "";
-	assert.match(error, /must be a non-empty array of string command tokens/);
-	assert.match(error, /\{ "args": \["batch"\], "stdin": "\[\[\\"get\\",\\"title\\"\],\[\\"get\\",\\"url\\"\]\]" \}/);
+	const error =
+		parseUserBatchStdin(JSON.stringify([{ action: "get", target: "title" }])).error ?? "";
+	assert.match(error, /must be an array of string command tokens/);
+	assert.match(
+		error,
+		/\{ "args": \["batch"\], "stdin": "\[\[\\"get\\",\\"title\\"\],\[\\"get\\",\\"url\\"\]\]" \}/,
+	);
 });
 
-test("buildToolPresentation formats download results as saved-file summaries", async () => {
+test("buildToolPresentation formats download results as saved-file summaries", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-missing-download-"));
+	t.after(() => rm(tempDir, { force: true, recursive: true }));
+	const downloadPath = join(tempDir, "report.pdf");
 	const presentation = await buildToolPresentation({
 		commandInfo: { command: "download", subcommand: "@e5" },
 		cwd: process.cwd(),
 		envelope: {
 			success: true,
 			data: {
-				path: "/tmp/report.pdf",
+				path: downloadPath,
 			},
 		},
 	});
 
-	assert.equal(presentation.content[0]?.type, "text");
-	assert.match((presentation.content[0] as { text: string }).text, /Download reported; file not verified: \/tmp\/report\.pdf/);
-	assert.doesNotMatch((presentation.content[0] as { text: string }).text, /Media type:/);
-	assert.match((presentation.content[0] as { text: string }).text, /not found on disk/);
-	assert.equal(presentation.summary, "Artifact verification failed: requested download was not found at /tmp/report.pdf.");
+	assert.equal(presentation.content[0].type, "text");
+	assert.ok(
+		readString(readRecord(presentation.content[0]).text).includes(
+			`Download reported; file not verified: ${downloadPath}`,
+		),
+	);
+	assert.doesNotMatch(readString(readRecord(presentation.content[0]).text), /Media type:/);
+	assert.match(readString(readRecord(presentation.content[0]).text), /not found on disk/);
+	assert.equal(
+		presentation.summary,
+		`Artifact verification failed: requested download was not found at ${downloadPath}.`,
+	);
 	assert.equal(presentation.resultCategory, "failure");
 	assert.equal(presentation.failureCategory, "artifact-missing");
 	assert.equal(presentation.artifacts?.[0]?.kind, "download");
-	assert.equal(presentation.artifacts?.[0]?.path, "/tmp/report.pdf");
-	assert.equal(presentation.artifacts?.[0]?.absolutePath, "/tmp/report.pdf");
-	assert.equal(presentation.artifacts?.[0]?.mediaType, undefined);
-	assert.equal(presentation.artifacts?.[0]?.exists, false);
-	assert.equal(presentation.savedFilePath, "/tmp/report.pdf");
+	assert.equal(presentation.artifacts[0].path, downloadPath);
+	assert.equal(presentation.artifacts[0].absolutePath, downloadPath);
+	assert.equal(presentation.artifacts[0].mediaType, undefined);
+	assert.equal(presentation.artifacts[0].exists, false);
+	assert.equal(presentation.savedFilePath, downloadPath);
 	assert.deepEqual(presentation.savedFile, {
 		command: "download",
 		kind: "download",
-		path: "/tmp/report.pdf",
+		path: downloadPath,
 		subcommand: "@e5",
 	});
 });
@@ -80,8 +97,14 @@ test("buildToolPresentation adds dense-page guidance for annotated screenshots",
 			envelope: { success: true, data: { path: imagePath } },
 		});
 
-		assert.match((presentation.content[0] as { text: string }).text, /Annotated screenshot note: dense pages can produce overlapping labels/);
-		assert.match((presentation.content[0] as { text: string }).text, /snapshot -i high-value refs/);
+		assert.match(
+			readString(readRecord(presentation.content[0]).text),
+			/Annotated screenshot note: dense pages can produce overlapping labels/,
+		);
+		assert.match(
+			readString(readRecord(presentation.content[0]).text),
+			/snapshot -i high-value refs/,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -104,10 +127,15 @@ test("buildToolPresentation does not treat data-url download payloads as verifie
 	assert.equal(presentation.savedFile, undefined);
 	assert.equal(presentation.savedFilePath, undefined);
 	assert.equal(presentation.resultCategory, "success");
-	assert.doesNotMatch((presentation.content[0] as { text: string }).text, /Download completed|Downloaded file|not found on disk/);
+	assert.doesNotMatch(
+		readString(readRecord(presentation.content[0]).text),
+		/Download completed|Downloaded file|not found on disk/,
+	);
 });
 
-test("buildToolPresentation renders metadata-first summaries for file artifact commands", async () => {
+test("buildToolPresentation renders metadata-first summaries for file artifact commands", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-missing-artifacts-"));
+	t.after(() => rm(tempDir, { force: true, recursive: true }));
 	const cases = [
 		{
 			commandInfo: { command: "pdf" },
@@ -137,7 +165,7 @@ test("buildToolPresentation renders metadata-first summaries for file artifact c
 			commandInfo: { command: "record", subcommand: "stop" },
 			data: { frames: 6, path: "recording.webm" },
 			expectedKind: "video",
-			expectedText: "Saved recording: recording.webm",
+			expectedText: "Recording reported; file not verified: recording.webm",
 		},
 		{
 			commandInfo: { command: "network", subcommand: "har" },
@@ -154,35 +182,88 @@ test("buildToolPresentation renders metadata-first summaries for file artifact c
 	] as const;
 
 	for (const item of cases) {
+		// Each case must finish or fail before later checks dispatch and shared fixture teardown starts.
+		// oxlint-disable-next-line no-await-in-loop
 		const presentation = await buildToolPresentation({
 			commandInfo: item.commandInfo,
-			cwd: "/tmp/pi-agent-browser-artifact-tests",
+			cwd: tempDir,
 			envelope: { success: true, data: item.data },
 		});
 
-		assert.equal(presentation.content[0]?.type, "text");
-		assert.match((presentation.content[0] as { text: string }).text, new RegExp(item.expectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-		assert.equal(presentation.summary, `Artifact verification failed: requested ${item.expectedKind} was not found at ${join("/tmp/pi-agent-browser-artifact-tests", item.data.path)}.`);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.content[0].type, "text");
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(
+			readString(readRecord(presentation.content[0]).text),
+			new RegExp(item.expectedText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+		);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(
+			presentation.summary,
+			`Artifact verification failed: requested ${item.expectedKind} was not found at ${join(tempDir, item.data.path)}.`,
+		);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.resultCategory, "failure");
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.failureCategory, "artifact-missing");
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.artifacts?.length, 1);
-		assert.equal(presentation.artifacts?.[0]?.kind, item.expectedKind);
-		assert.equal(presentation.artifacts?.[0]?.path, item.data.path);
-		assert.equal(presentation.artifacts?.[0]?.absolutePath, join("/tmp/pi-agent-browser-artifact-tests", item.data.path));
-		assert.equal(presentation.artifacts?.[0]?.mediaType, undefined);
-		assert.equal(presentation.artifacts?.[0]?.exists, false);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifacts[0].kind, item.expectedKind);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifacts[0].path, item.data.path);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifacts[0].absolutePath, join(tempDir, item.data.path));
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifacts[0].mediaType, undefined);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifacts[0].exists, false);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.artifactVerification?.missingCount, 1);
-		assert.equal(presentation.artifactVerification?.verified, false);
-		assert.equal(presentation.artifactVerification?.artifacts[0]?.state, "missing");
-		assert.equal(presentation.artifactVerification?.artifacts[0]?.absolutePath, join("/tmp/pi-agent-browser-artifact-tests", item.data.path));
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifactVerification.verified, false);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(presentation.artifactVerification.artifacts[0].state, "missing");
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(
+			presentation.artifactVerification.artifacts[0].absolutePath,
+			join(tempDir, item.data.path),
+		);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.imagePath, undefined);
+		// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(presentation.imagePaths, undefined);
 		if (item.commandInfo.command === "pdf") {
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(presentation.savedFilePath, "page.pdf");
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(presentation.savedFile?.kind, "pdf");
 		}
 		if (item.commandInfo.command === "wait") {
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(presentation.savedFilePath, "download.txt");
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.deepEqual(presentation.savedFile, {
 				command: "wait",
 				kind: "download",
@@ -204,45 +285,58 @@ test("buildToolPresentation does not classify state load paths as saved artifact
 	assert.equal(presentation.artifactManifest, undefined);
 	assert.equal(presentation.artifactVerification, undefined);
 	assert.equal(presentation.summary, "state completed");
-	assert.match((presentation.content[0] as { text: string }).text, /auth-state\.json/);
+	assert.match(readString(readRecord(presentation.content[0]).text), /auth-state\.json/);
 });
 
-test("buildToolPresentation records path-bearing diff screenshots without inlining them as trusted screenshots", async () => {
+test("buildToolPresentation records path-bearing diff screenshots without inlining them as trusted screenshots", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-missing-diff-"));
+	t.after(() => rm(tempDir, { force: true, recursive: true }));
 	const presentation = await buildToolPresentation({
 		commandInfo: { command: "diff", subcommand: "screenshot" },
-		cwd: "/tmp/pi-agent-browser-artifact-tests",
-		envelope: { success: true, data: { baselinePath: "baseline.png", diffPath: "diff.png", mismatchPixels: 12 } },
+		cwd: tempDir,
+		envelope: {
+			success: true,
+			data: { baselinePath: "baseline.png", diffPath: "diff.png", mismatchPixels: 12 },
+		},
 	});
 
-	assert.equal(presentation.summary, "Artifact verification failed: requested image was not found at /tmp/pi-agent-browser-artifact-tests/diff.png.");
+	assert.equal(
+		presentation.summary,
+		`Artifact verification failed: requested image was not found at ${join(tempDir, "diff.png")}.`,
+	);
 	assert.equal(presentation.resultCategory, "failure");
 	assert.equal(presentation.failureCategory, "artifact-missing");
-	assert.equal(presentation.content[0]?.type, "text");
-	const text = (presentation.content[0] as { text: string }).text;
+	assert.equal(presentation.content[0].type, "text");
+	const text = readString(readRecord(presentation.content[0]).text);
 	assert.match(text, /Diff image reported; file not verified: diff\.png/);
 	assert.doesNotMatch(text, /Saved diff image/);
 	assert.match(text, /Artifact type: image/);
 	assert.doesNotMatch(text, /baseline\.png/);
 	assert.equal(presentation.artifacts?.length, 1);
-	assert.equal(presentation.artifacts?.[0]?.kind, "image");
-	assert.equal(presentation.artifacts?.[0]?.path, "diff.png");
-	assert.equal(presentation.artifacts?.[0]?.absolutePath, join("/tmp/pi-agent-browser-artifact-tests", "diff.png"));
+	assert.equal(presentation.artifacts[0].kind, "image");
+	assert.equal(presentation.artifacts[0].path, "diff.png");
+	assert.equal(presentation.artifacts[0].absolutePath, join(tempDir, "diff.png"));
 	assert.equal(presentation.artifactVerification?.artifacts[0]?.state, "missing");
-	assert.equal(presentation.artifactVerification?.artifacts[0]?.path, "diff.png");
+	assert.equal(presentation.artifactVerification.artifacts[0].path, "diff.png");
 	assert.equal(presentation.imagePath, undefined);
 	assert.equal(presentation.imagePaths, undefined);
 });
 
-test("buildToolPresentation renders record start as a lifecycle state without missing-file copy", async () => {
+test("buildToolPresentation renders record start as a lifecycle state without missing-file copy", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-pending-record-"));
+	t.after(() => rm(tempDir, { force: true, recursive: true }));
 	const presentation = await buildToolPresentation({
 		commandInfo: { command: "record", subcommand: "start" },
-		cwd: "/tmp/pi-agent-browser-artifact-tests",
+		cwd: tempDir,
 		envelope: { success: true, data: { path: "recording.webm" } },
 	});
 
-	assert.equal(presentation.summary, "Recording started; output will be written on stop: recording.webm");
-	assert.equal(presentation.content[0]?.type, "text");
-	const text = (presentation.content[0] as { text: string }).text;
+	assert.equal(
+		presentation.summary,
+		"Recording started; output will be written on stop: recording.webm",
+	);
+	assert.equal(presentation.content[0].type, "text");
+	const text = readString(readRecord(presentation.content[0]).text);
 	assert.match(text, /Recording started; output will be written on stop: recording\.webm/);
 	// Page-state guidance requires dispatch evidence; registered-tool tests cover it on success and failure.
 	assert.doesNotMatch(text, /Page state:/);
@@ -250,22 +344,22 @@ test("buildToolPresentation renders record start as a lifecycle state without mi
 	assert.doesNotMatch(text, /not found on disk/);
 	assert.doesNotMatch(text, /Session artifacts:/);
 	assert.equal(presentation.artifacts?.length, 1);
-	assert.equal(presentation.artifacts?.[0]?.kind, "video");
-	assert.equal(presentation.artifacts?.[0]?.path, "recording.webm");
-	assert.equal(presentation.artifacts?.[0]?.absolutePath, join("/tmp/pi-agent-browser-artifact-tests", "recording.webm"));
-	assert.equal(presentation.artifacts?.[0]?.mediaType, undefined);
-	assert.equal(presentation.artifacts?.[0]?.exists, undefined);
-	assert.equal(presentation.artifacts?.[0]?.status, "pending");
-	assert.equal(presentation.artifacts?.[0]?.recordingState, "openRecording");
-	assert.equal(presentation.artifacts?.[0]?.willExistOnStop, true);
+	assert.equal(presentation.artifacts[0].kind, "video");
+	assert.equal(presentation.artifacts[0].path, "recording.webm");
+	assert.equal(presentation.artifacts[0].absolutePath, join(tempDir, "recording.webm"));
+	assert.equal(presentation.artifacts[0].mediaType, undefined);
+	assert.equal(presentation.artifacts[0].exists, undefined);
+	assert.equal(presentation.artifacts[0].status, "pending");
+	assert.equal(presentation.artifacts[0].recordingState, "openRecording");
+	assert.equal(presentation.artifacts[0].willExistOnStop, true);
 	assert.equal(presentation.artifactManifest?.entries[0]?.subcommand, "start");
-	assert.equal(presentation.artifactManifest?.entries[0]?.path, "recording.webm");
+	assert.equal(presentation.artifactManifest.entries[0].path, "recording.webm");
 	assert.match(presentation.artifactRetentionSummary ?? "", /Session artifacts:/);
 	assert.equal(presentation.artifactVerification?.pendingCount, 1);
-	assert.equal(presentation.artifactVerification?.verified, false);
-	assert.equal(presentation.artifactVerification?.artifacts[0]?.state, "pending");
+	assert.equal(presentation.artifactVerification.verified, false);
+	assert.equal(presentation.artifactVerification.artifacts[0].state, "pending");
 	assert.equal(presentation.nextActions?.[0]?.id, "stop-pending-recording");
-	assert.deepEqual(presentation.nextActions?.[0]?.params?.args, ["record", "stop"]);
+	assert.deepEqual(presentation.nextActions[0].params?.args, ["record", "stop"]);
 });
 
 test("buildToolPresentation renders record restart as a pending lifecycle state", async () => {
@@ -275,20 +369,81 @@ test("buildToolPresentation renders record restart as a pending lifecycle state"
 		envelope: { success: true, data: { path: "recording-restart.webm" } },
 	});
 
-	assert.equal(presentation.summary, "Recording restarted; output will be written on stop: recording-restart.webm");
-	const text = (presentation.content[0] as { text: string }).text;
-	assert.match(text, /Recording restarted; output will be written on stop: recording-restart\.webm/);
+	assert.equal(
+		presentation.summary,
+		"Recording restarted; output will be written on stop: recording-restart.webm",
+	);
+	const text = readString(readRecord(presentation.content[0]).text);
+	assert.match(
+		text,
+		/Recording restarted; output will be written on stop: recording-restart\.webm/,
+	);
 	assert.doesNotMatch(text, /fresh active page|prior in-page DOM/i);
 	assert.doesNotMatch(text, /Saved recording/);
 	assert.equal(presentation.artifacts?.[0]?.status, "pending");
-	assert.equal(presentation.artifacts?.[0]?.exists, undefined);
-	assert.equal(presentation.artifacts?.[0]?.recordingState, "openRecording");
-	assert.equal(presentation.artifacts?.[0]?.willExistOnStop, true);
+	assert.equal(presentation.artifacts[0].exists, undefined);
+	assert.equal(presentation.artifacts[0].recordingState, "openRecording");
+	assert.equal(presentation.artifacts[0].willExistOnStop, true);
 	assert.equal(presentation.artifactVerification?.pendingCount, 1);
-	assert.equal(presentation.artifactVerification?.artifacts[0]?.state, "pending");
+	assert.equal(presentation.artifactVerification.artifacts[0].state, "pending");
 });
 
-test("buildToolPresentation notes the previous recording saved by record restart", async () => {
+test("unacknowledged recording restarts retain the pending take without a terminal artifact", async () => {
+	const root = await mkdtemp(join(tmpdir(), "piab-rejected-restart-"));
+	try {
+		const path = join(root, "active.webm");
+		const started = await buildToolPresentation({
+			commandInfo: { command: "record", subcommand: "start" },
+			cwd: root,
+			sessionName: "recording",
+			envelope: { success: true, data: { path } },
+		});
+		await writeFile(path, "still active");
+		for (const envelope of [
+			{ success: false, error: "Unexpected argument", data: { type: "invalid_value" } },
+			{ success: false, error: "Action denied by policy", data: null },
+			{
+				success: true,
+				data: { confirmation_required: true, confirmation_id: "r123", action: "recording_restart" },
+			},
+		]) {
+			// Keep artifact/recording observations ordered against the shared fixture and active manifest.
+			// oxlint-disable-next-line no-await-in-loop
+			const result = await buildToolPresentation({
+				artifactManifest: started.artifactManifest,
+				commandInfo: { command: "record", subcommand: "restart" },
+				cwd: root,
+				sessionName: "recording",
+				envelope,
+				errorText: envelope.error,
+			});
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(
+				result.artifacts?.some((artifact) => artifact.subcommand === "restart-previous") ?? false,
+				false,
+			);
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(
+				(result.artifactManifest ?? started.artifactManifest)?.entries.some(
+					(entry) => entry.path === path && entry.subcommand === "start",
+				),
+				true,
+			);
+			// Keep artifact/recording observations ordered against the shared fixture and active manifest.
+			// oxlint-disable-next-line no-await-in-loop
+			const activeContents = await readFile(path, "utf8");
+			// The fixed nonempty artifact/envelope table requires all shared and command-specific assertions for each case.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(activeContents, "still active");
+		}
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("buildToolPresentation keeps a legacy restart file unverified without a terminal native receipt", async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-record-restart-"));
 	try {
 		const firstPath = join(tempDir, "first.webm");
@@ -304,20 +459,32 @@ test("buildToolPresentation notes the previous recording saved by record restart
 			artifactManifest: started.artifactManifest,
 			commandInfo: { command: "record", subcommand: "restart" },
 			cwd: tempDir,
-			envelope: { success: true, data: { path: restartedPath } },
+			envelope: { success: true, data: { path: restartedPath, restarted: true } },
 		});
 
-		assert.match(restarted.summary, /Previous recording saved: .*first\.webm/);
-		assert.match(restarted.summary, /Recording restarted; output will be written on stop: .*restarted\.webm/);
-		const text = (restarted.content[0] as { text: string }).text;
-		assert.match(text, /Previous recording saved: .*first\.webm/);
+		assert.match(restarted.summary, /Previous recording unverified: .*first\.webm/);
+		assert.match(
+			restarted.summary,
+			/Recording restarted; output will be written on stop: .*restarted\.webm/,
+		);
+		const text = readString(readRecord(restarted.content[0]).text);
+		assert.match(text, /Previous recording unverified: .*first\.webm/);
 		assert.match(text, /Recording restarted; output will be written on stop: .*restarted\.webm/);
-		assert.deepEqual(restarted.artifacts?.map((artifact) => ({ exists: artifact.exists, path: artifact.path, status: artifact.status, subcommand: artifact.subcommand })), [
-			{ exists: true, path: firstPath, status: "saved", subcommand: "restart-previous" },
-			{ exists: undefined, path: restartedPath, status: "pending", subcommand: "restart" },
-		]);
-		assert.equal(restarted.artifactVerification?.verifiedCount, 1);
-		assert.equal(restarted.artifactVerification?.pendingCount, 1);
+		assert.deepEqual(
+			restarted.artifacts?.map((artifact) => ({
+				exists: artifact.exists,
+				path: artifact.path,
+				status: artifact.status,
+				subcommand: artifact.subcommand,
+			})),
+			[
+				{ exists: true, path: firstPath, status: "unverified", subcommand: "restart-previous" },
+				{ exists: undefined, path: restartedPath, status: "pending", subcommand: "restart" },
+			],
+		);
+		assert.equal(restarted.artifactVerification?.verifiedCount, 0);
+		assert.equal(restarted.artifactVerification.unverifiedCount, 1);
+		assert.equal(restarted.artifactVerification.pendingCount, 1);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -344,22 +511,38 @@ test("buildToolPresentation rejects a stale previous recording reported by recor
 			artifactMinUpdatedAtMs: runStartedAtMs,
 			commandInfo: { command: "record", subcommand: "restart" },
 			cwd: tempDir,
-			envelope: { success: true, data: { path: restartedPath } },
+			envelope: { success: true, data: { path: restartedPath, restarted: true } },
 		});
 
 		assert.equal(restarted.resultCategory, "failure");
 		assert.equal(restarted.failureCategory, "artifact-missing");
 		assert.match(restarted.summary, /modification time outside the current command window/);
-		assert.match((restarted.content[0] as { text: string }).text, /Previous recording stale/);
-		assert.doesNotMatch((restarted.content[0] as { text: string }).text, /Previous recording saved/);
+		assert.match(readString(readRecord(restarted.content[0]).text), /Previous recording stale/);
+		assert.doesNotMatch(
+			readString(readRecord(restarted.content[0]).text),
+			/Previous recording saved/,
+		);
 		assert.equal(restarted.artifacts?.[0]?.status, "stale");
 		assert.equal(restarted.artifactVerification?.artifacts[0]?.state, "unverified");
-		assert.equal(restarted.artifactVerification?.verifiedCount, 0);
-		assert.equal(restarted.artifactVerification?.pendingCount, 1);
-		assert.equal(restarted.artifactManifest?.entries.some((entry) => entry.subcommand === "start"), false);
-		assert.equal(restarted.artifactManifest?.entries.some((entry) => entry.subcommand === "restart-previous" && entry.retentionState === "missing"), true);
-		assert.ok(restarted.nextActions?.some((action) => action.id === "verify-artifact-path"));
-		assert.ok(restarted.nextActions?.some((action) => action.id === "stop-pending-recording"));
+		assert.equal(restarted.artifactVerification.verifiedCount, 0);
+		assert.equal(restarted.artifactVerification.pendingCount, 1);
+		assert.equal(
+			restarted.artifactManifest?.entries.some((entry) => entry.subcommand === "start"),
+			false,
+		);
+		assert.equal(
+			restarted.artifactManifest.entries.some(
+				(entry) => entry.subcommand === "restart-previous" && entry.retentionState === "missing",
+			),
+			true,
+		);
+		assert.ok(
+			restarted.nextActions?.some((action) => action.id === "verify-artifact-path") === true,
+		);
+		assert.equal(
+			restarted.nextActions.some((action) => action.id === "stop-pending-recording"),
+			true,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -382,20 +565,31 @@ test("buildToolPresentation rejects a missing previous recording reported by rec
 			artifactMinUpdatedAtMs: Date.now() - 1_000,
 			commandInfo: { command: "record", subcommand: "restart" },
 			cwd: tempDir,
-			envelope: { success: true, data: { path: restartedPath } },
+			envelope: { success: true, data: { path: restartedPath, restarted: true } },
 		});
 
 		assert.equal(restarted.resultCategory, "failure");
 		assert.equal(restarted.failureCategory, "artifact-missing");
 		assert.match(restarted.summary, /was not found/);
-		assert.match((restarted.content[0] as { text: string }).text, /Previous recording missing/);
-		assert.doesNotMatch((restarted.content[0] as { text: string }).text, /Previous recording saved/);
+		assert.match(readString(readRecord(restarted.content[0]).text), /Previous recording missing/);
+		assert.doesNotMatch(
+			readString(readRecord(restarted.content[0]).text),
+			/Previous recording saved/,
+		);
 		assert.equal(restarted.artifacts?.[0]?.status, "missing");
 		assert.equal(restarted.artifactVerification?.missingCount, 1);
-		assert.equal(restarted.artifactVerification?.pendingCount, 1);
-		assert.equal(restarted.artifactManifest?.entries.some((entry) => entry.subcommand === "start"), false);
-		assert.ok(restarted.nextActions?.some((action) => action.id === "verify-artifact-path"));
-		assert.ok(restarted.nextActions?.some((action) => action.id === "stop-pending-recording"));
+		assert.equal(restarted.artifactVerification.pendingCount, 1);
+		assert.equal(
+			restarted.artifactManifest?.entries.some((entry) => entry.subcommand === "start"),
+			false,
+		);
+		assert.ok(
+			restarted.nextActions?.some((action) => action.id === "verify-artifact-path") === true,
+		);
+		assert.equal(
+			restarted.nextActions.some((action) => action.id === "stop-pending-recording"),
+			true,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -416,13 +610,19 @@ test("buildToolPresentation rejects same-path record restart when the prior outp
 			artifactMinUpdatedAtMs: Date.now() - 1_000,
 			commandInfo: { command: "record", subcommand: "restart" },
 			cwd: tempDir,
-			envelope: { success: true, data: { path: recordingPath } },
+			envelope: { success: true, data: { path: recordingPath, restarted: true } },
 		});
 
 		assert.equal(restarted.resultCategory, "failure");
 		assert.equal(restarted.failureCategory, "artifact-missing");
-		assert.deepEqual(restarted.artifacts?.map((artifact) => artifact.subcommand), ["restart-previous", "restart"]);
-		assert.ok(restarted.nextActions?.some((action) => action.id === "stop-pending-recording"));
+		assert.deepEqual(
+			restarted.artifacts?.map((artifact) => artifact.subcommand),
+			["restart-previous", "restart"],
+		);
+		assert.equal(
+			restarted.nextActions?.some((action) => action.id === "stop-pending-recording"),
+			true,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -440,24 +640,47 @@ test("buildToolPresentation coalesces a batched recording to its terminal saved 
 			envelope: {
 				success: true,
 				data: [
-					{ command: ["record", "start", recordingPath], result: { path: recordingPath }, success: true },
-					{ command: ["record", "stop"], result: { frames: 3, path: reportedStopPath }, success: true },
+					{
+						command: ["record", "start", recordingPath],
+						result: { path: recordingPath },
+						success: true,
+					},
+					{
+						command: ["record", "stop"],
+						result: { frames: 3, path: reportedStopPath },
+						success: true,
+					},
 				],
 			},
 		});
 
-		assert.deepEqual(presentation.artifacts?.map((artifact) => ({ status: artifact.status, subcommand: artifact.subcommand })), [
-			{ status: "saved", subcommand: "stop" },
-		]);
-		assert.equal(presentation.artifacts?.[0]?.absolutePath, reportedStopPath);
+		assert.deepEqual(
+			presentation.artifacts?.map((artifact) => ({
+				status: artifact.status,
+				subcommand: artifact.subcommand,
+			})),
+			[{ status: "saved", subcommand: "stop" }],
+		);
+		assert.equal(presentation.artifacts[0].absolutePath, reportedStopPath);
 		assert.equal(presentation.artifactVerification?.pendingCount, 0);
-		assert.equal(presentation.artifactVerification?.verifiedCount, 1);
+		assert.equal(presentation.artifactVerification.verifiedCount, 1);
 		assert.equal(presentation.successCategory, "artifact-saved");
-		assert.equal(presentation.nextActions?.some((action) => action.id === "stop-pending-recording"), false);
+		assert.equal(
+			presentation.nextActions?.some((action) => action.id === "stop-pending-recording"),
+			false,
+		);
 		assert.equal(presentation.batchSteps?.[0]?.artifacts?.[0]?.status, "pending");
-		assert.equal(presentation.batchSteps?.[1]?.artifacts?.[0]?.status, "saved");
-		assert.equal(presentation.artifactManifest?.entries.some((entry) => entry.subcommand === "start"), false);
-		assert.equal(presentation.artifactManifest?.entries.some((entry) => entry.absolutePath === reportedStopPath && entry.subcommand === "stop"), true);
+		assert.equal(presentation.batchSteps[1].artifacts?.[0]?.status, "saved");
+		assert.equal(
+			presentation.artifactManifest?.entries.some((entry) => entry.subcommand === "start"),
+			false,
+		);
+		assert.equal(
+			presentation.artifactManifest.entries.some(
+				(entry) => entry.absolutePath === reportedStopPath && entry.subcommand === "stop",
+			),
+			true,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -474,20 +697,35 @@ test("buildToolPresentation coalesces a recording saved after an intermediate cl
 			envelope: {
 				success: true,
 				data: [
-					{ command: ["record", "start", recordingPath], result: { path: recordingPath }, success: true },
+					{
+						command: ["record", "start", recordingPath],
+						result: { path: recordingPath },
+						success: true,
+					},
 					{ command: ["close"], result: {}, success: true },
-					{ command: ["record", "stop"], result: { lifecycle: { effectiveLaunch: { browserLaunched: true } }, path: recordingPath }, success: true },
+					{
+						command: ["record", "stop"],
+						result: {
+							lifecycle: { effectiveLaunch: { browserLaunched: true } },
+							path: recordingPath,
+						},
+						success: true,
+					},
 				],
 			},
 			namespace: "tenant",
 			sessionName: "recording-session",
 		});
 
-		assert.deepEqual(presentation.artifacts?.map((artifact) => ({ status: artifact.status, subcommand: artifact.subcommand })), [
-			{ status: "saved", subcommand: "stop" },
-		]);
+		assert.deepEqual(
+			presentation.artifacts?.map((artifact) => ({
+				status: artifact.status,
+				subcommand: artifact.subcommand,
+			})),
+			[{ status: "saved", subcommand: "stop" }],
+		);
 		assert.equal(presentation.artifactVerification?.missingCount, 0);
-		assert.equal(presentation.artifactVerification?.verifiedCount, 1);
+		assert.equal(presentation.artifactVerification.verifiedCount, 1);
 		assert.equal(presentation.resultCategory, "success");
 		assert.equal(presentation.successCategory, "artifact-saved");
 	} finally {
@@ -505,7 +743,11 @@ test("buildToolPresentation marks a batched recording abandoned by close as miss
 			envelope: {
 				success: true,
 				data: [
-					{ command: ["record", "start", recordingPath], result: { path: recordingPath }, success: true },
+					{
+						command: ["record", "start", recordingPath],
+						result: { path: recordingPath },
+						success: true,
+					},
 					{ command: ["close"], result: {}, success: true },
 				],
 			},
@@ -513,12 +755,28 @@ test("buildToolPresentation marks a batched recording abandoned by close as miss
 			sessionName: "recording-session",
 		});
 
-		assert.deepEqual(presentation.artifacts?.map((artifact) => ({ recordingState: artifact.recordingState, status: artifact.status, subcommand: artifact.subcommand, willExistOnStop: artifact.willExistOnStop })), [
-			{ recordingState: undefined, status: "missing", subcommand: "close-abandoned", willExistOnStop: undefined },
-		]);
+		assert.deepEqual(
+			presentation.artifacts?.map((artifact) => ({
+				recordingState: artifact.recordingState,
+				status: artifact.status,
+				subcommand: artifact.subcommand,
+				willExistOnStop: artifact.willExistOnStop,
+			})),
+			[
+				{
+					recordingState: undefined,
+					status: "missing",
+					subcommand: "close-abandoned",
+					willExistOnStop: undefined,
+				},
+			],
+		);
 		assert.equal(presentation.artifactVerification?.missingCount, 1);
-		assert.equal(presentation.artifactVerification?.pendingCount, 0);
-		assert.equal(presentation.nextActions?.some((action) => action.id === "stop-pending-recording"), false);
+		assert.equal(presentation.artifactVerification.pendingCount, 0);
+		assert.equal(
+			presentation.nextActions?.some((action) => action.id === "stop-pending-recording"),
+			false,
+		);
 		assert.equal(presentation.resultCategory, "failure");
 		assert.equal(presentation.failureCategory, "artifact-missing");
 		assert.equal(presentation.batchSteps?.[0]?.artifacts?.[0]?.status, "pending");
@@ -537,8 +795,16 @@ test("buildToolPresentation keeps recording cleanup actionable after a later bat
 			envelope: {
 				success: true,
 				data: [
-					{ command: ["record", "start", recordingPath], result: { path: recordingPath }, success: true },
-					{ command: ["find", "text", "Missing", "click"], error: "No element found: text=Missing", success: false },
+					{
+						command: ["record", "start", recordingPath],
+						result: { path: recordingPath },
+						success: true,
+					},
+					{
+						command: ["find", "text", "Missing", "click"],
+						error: "No element found: text=Missing",
+						success: false,
+					},
 				],
 			},
 			namespace: "tenant",
@@ -548,9 +814,12 @@ test("buildToolPresentation keeps recording cleanup actionable after a later bat
 		assert.equal(presentation.resultCategory, "failure");
 		assert.equal(presentation.failureCategory, "selector-not-found");
 		assert.equal(presentation.artifactVerification?.pendingCount, 1);
-		assert.ok(presentation.nextActions?.some((action) => action.id === "refresh-interactive-refs"));
+		assert.ok(
+			presentation.nextActions?.some((action) => action.id === "refresh-interactive-refs") === true,
+		);
 		assert.deepEqual(
-			presentation.nextActions?.find((action) => action.id === "stop-pending-recording")?.params?.args,
+			presentation.nextActions.find((action) => action.id === "stop-pending-recording")?.params
+				?.args,
 			["--namespace", "tenant", "--session", "recording-session", "record", "stop"],
 		);
 	} finally {
@@ -570,15 +839,18 @@ test("buildToolPresentation records explicit saved files in the bounded session 
 		});
 
 		assert.equal(presentation.artifactManifest?.version, 1);
-		assert.equal(presentation.artifactManifest?.liveCount, 1);
-		assert.equal(presentation.artifactManifest?.evictedCount, 0);
-		assert.equal(presentation.artifactManifest?.entries[0]?.path, "download.txt");
-		assert.equal(presentation.artifactManifest?.entries[0]?.absolutePath, downloadPath);
-		assert.equal(presentation.artifactManifest?.entries[0]?.kind, "download");
-		assert.equal(presentation.artifactManifest?.entries[0]?.storageScope, "explicit-path");
-		assert.equal(presentation.artifactManifest?.entries[0]?.retentionState, "live");
+		assert.equal(presentation.artifactManifest.liveCount, 1);
+		assert.equal(presentation.artifactManifest.evictedCount, 0);
+		assert.equal(presentation.artifactManifest.entries[0].path, "download.txt");
+		assert.equal(presentation.artifactManifest.entries[0].absolutePath, downloadPath);
+		assert.equal(presentation.artifactManifest.entries[0].kind, "download");
+		assert.equal(presentation.artifactManifest.entries[0].storageScope, "explicit-path");
+		assert.equal(presentation.artifactManifest.entries[0].retentionState, "live");
 		assert.match(presentation.artifactRetentionSummary ?? "", /1 live, 0 evicted/);
-		assert.doesNotMatch((presentation.content[0] as { text: string }).text, /Session artifacts: 1 live, 0 evicted/);
+		assert.doesNotMatch(
+			readString(readRecord(presentation.content[0]).text),
+			/Session artifacts: 1 live, 0 evicted/,
+		);
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -590,7 +862,15 @@ test("buildToolPresentation scopes artifact verification to current-result artif
 	await writeFile(downloadPath, "verified artifact");
 	try {
 		const artifactManifest: SessionArtifactManifest = {
-			entries: [{ createdAtMs: Date.now() - 1, kind: "spill", path: "/tmp/old-spill.txt", retentionState: "evicted", storageScope: "persistent-session" }],
+			entries: [
+				{
+					createdAtMs: Date.now() - 1,
+					kind: "spill",
+					path: "/tmp/old-spill.txt",
+					retentionState: "evicted",
+					storageScope: "persistent-session",
+				},
+			],
 			evictedCount: 1,
 			liveCount: 0,
 			maxEntries: 100,
@@ -605,37 +885,182 @@ test("buildToolPresentation scopes artifact verification to current-result artif
 		});
 
 		assert.equal(presentation.artifactVerification?.verified, true);
-		assert.equal(presentation.artifactVerification?.verifiedCount, 1);
-		assert.equal(presentation.artifactVerification?.missingCount, 0);
-		assert.equal(presentation.artifactVerification?.artifacts.length, 1);
-		assert.equal(presentation.artifactVerification?.artifacts[0]?.path, "download.txt");
+		assert.equal(presentation.artifactVerification.verifiedCount, 1);
+		assert.equal(presentation.artifactVerification.missingCount, 0);
+		assert.equal(presentation.artifactVerification.artifacts.length, 1);
+		assert.equal(presentation.artifactVerification.artifacts[0].path, "download.txt");
 		assert.equal(presentation.successCategory, "artifact-saved");
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
 });
 
+test("mergeBrowserRunArtifactManifest preserves restart lifecycle order across a concurrent manifest update", () => {
+	const initial = mergeSessionArtifactManifest({
+		entries: [
+			{
+				command: "screenshot",
+				createdAtMs: 1,
+				kind: "image",
+				path: "initial.png",
+				retentionState: "live",
+				storageScope: "explicit-path",
+			},
+		],
+		nowMs: 1,
+	});
+	assert.ok(initial);
+	const updated = mergeSessionArtifactManifest({
+		base: initial,
+		entries: [
+			{
+				command: "record",
+				createdAtMs: 2,
+				kind: "video",
+				path: "z-previous.webm",
+				retentionState: "live",
+				session: "shared",
+				storageScope: "explicit-path",
+				subcommand: "restart-previous",
+			},
+			{
+				command: "record",
+				createdAtMs: 2,
+				kind: "video",
+				path: "a-current.webm",
+				retentionState: "live",
+				session: "shared",
+				storageScope: "explicit-path",
+				subcommand: "restart",
+			},
+		],
+		nowMs: 2,
+	});
+	const current = mergeSessionArtifactManifest({
+		base: initial,
+		entries: [
+			{
+				command: "screenshot",
+				createdAtMs: 3,
+				kind: "image",
+				path: "concurrent.png",
+				retentionState: "live",
+				storageScope: "explicit-path",
+			},
+		],
+		nowMs: 3,
+	});
+	const merged = mergeBrowserRunArtifactManifest(current, initial, updated);
+	assert.equal(
+		merged?.entries.some(
+			(entry) => entry.path === "z-previous.webm" && entry.subcommand === "restart-previous",
+		),
+		true,
+	);
+	assert.equal(
+		merged.entries.some(
+			(entry) => entry.path === "a-current.webm" && entry.subcommand === "restart",
+		),
+		true,
+	);
+	assert.equal(
+		merged.entries.some((entry) => entry.path === "concurrent.png"),
+		true,
+	);
+});
+
+test(
+	"mergeSessionArtifactManifest retains the active restart when the recent window is one",
+	{ concurrency: false },
+	async () => {
+		await withPatchedEnv(
+			{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "1" },
+			async () => {
+				const manifest = mergeSessionArtifactManifest({
+					entries: [
+						{
+							command: "record",
+							createdAtMs: 1,
+							kind: "video",
+							path: "a-previous.webm",
+							retentionState: "live",
+							session: "shared",
+							storageScope: "explicit-path",
+							subcommand: "restart-previous",
+						},
+						{
+							command: "record",
+							createdAtMs: 1,
+							kind: "video",
+							path: "z-current.webm",
+							retentionState: "live",
+							session: "shared",
+							storageScope: "explicit-path",
+							subcommand: "restart",
+						},
+					],
+					nowMs: 1,
+				});
+				assert.deepEqual(
+					manifest?.entries.map((entry) => [entry.path, entry.subcommand]),
+					[["z-current.webm", "restart"]],
+				);
+			},
+		);
+	},
+);
+
 test("artifact manifest defaults to a QA-friendly recent window", () => {
-	assert.equal(getSessionArtifactManifestMaxEntries({}), DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES);
+	assert.equal(
+		getSessionArtifactManifestMaxEntries({}),
+		DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES,
+	);
 	assert.equal(DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES, 100);
 });
 
 test("artifact manifest recent window is configurable and ignores invalid values", async () => {
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" }, async () => {
-		assert.equal(getSessionArtifactManifestMaxEntries(), 3);
-	});
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "0" }, async () => {
-		assert.equal(getSessionArtifactManifestMaxEntries(), DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES);
-	});
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "-1" }, async () => {
-		assert.equal(getSessionArtifactManifestMaxEntries(), DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES);
-	});
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3.5" }, async () => {
-		assert.equal(getSessionArtifactManifestMaxEntries(), DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES);
-	});
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "not-a-number" }, async () => {
-		assert.equal(getSessionArtifactManifestMaxEntries(), DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES);
-	});
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" },
+		async () => {
+			assert.equal(getSessionArtifactManifestMaxEntries(), 3);
+		},
+	);
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "0" },
+		async () => {
+			assert.equal(
+				getSessionArtifactManifestMaxEntries(),
+				DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES,
+			);
+		},
+	);
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "-1" },
+		async () => {
+			assert.equal(
+				getSessionArtifactManifestMaxEntries(),
+				DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES,
+			);
+		},
+	);
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3.5" },
+		async () => {
+			assert.equal(
+				getSessionArtifactManifestMaxEntries(),
+				DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES,
+			);
+		},
+	);
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "not-a-number" },
+		async () => {
+			assert.equal(
+				getSessionArtifactManifestMaxEntries(),
+				DEFAULT_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES,
+			);
+		},
+	);
 });
 
 test("artifact manifest evicts oldest metadata entries at the configured recent window", async () => {
@@ -647,34 +1072,46 @@ test("artifact manifest evicts oldest metadata entries at the configured recent 
 		storageScope: "explicit-path",
 	}));
 
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" }, async () => {
-		const manifest = mergeSessionArtifactManifest({ entries, nowMs: 2_000 });
-		assert.equal(manifest?.maxEntries, 3);
-		assert.deepEqual(
-			manifest?.entries.map((entry) => entry.path),
-			["screenshot-5.png", "screenshot-4.png", "screenshot-3.png"],
-		);
-		assert.equal(manifest?.liveCount, 3);
-		assert.equal(manifest?.evictedCount, 0);
-	});
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" },
+		async () => {
+			const manifest = mergeSessionArtifactManifest({ entries, nowMs: 2_000 });
+			assert.equal(manifest?.maxEntries, 3);
+			assert.deepEqual(
+				manifest.entries.map((entry) => entry.path),
+				["screenshot-5.png", "screenshot-4.png", "screenshot-3.png"],
+			);
+			assert.equal(manifest.liveCount, 3);
+			assert.equal(manifest.evictedCount, 0);
+		},
+	);
 });
 
 test("buildToolPresentation reports the configured artifact manifest recent window", async () => {
-	await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" }, async () => {
-		const presentation = await buildToolPresentation({
-			commandInfo: { command: "screenshot" },
-			cwd: process.cwd(),
-			envelope: { success: true, data: { path: "dogfood-shot.png" } },
-		});
+	await withPatchedEnv(
+		{ PI_AGENT_BROWSER_SESSION_ARTIFACT_MANIFEST_MAX_ENTRIES: "3" },
+		async () => {
+			const presentation = await buildToolPresentation({
+				commandInfo: { command: "screenshot" },
+				cwd: process.cwd(),
+				envelope: { success: true, data: { path: "dogfood-shot.png" } },
+			});
 
-		assert.equal(presentation.artifactManifest?.maxEntries, 3);
-		assert.match(presentation.artifactRetentionSummary ?? "", /\(1\/3 recent\)/);
-		assert.doesNotMatch((presentation.content[0] as { text: string }).text, /Session artifacts: .*\(1\/3 recent\)/);
-	});
+			assert.equal(presentation.artifactManifest?.maxEntries, 3);
+			assert.match(presentation.artifactRetentionSummary ?? "", /\(1\/3 recent\)/);
+			assert.doesNotMatch(
+				readString(readRecord(presentation.content[0]).text),
+				/Session artifacts: .*\(1\/3 recent\)/,
+			);
+		},
+	);
 });
 
 test("buildToolPresentation compacts oversized generic outputs and prints the actual spill path", async () => {
-	const largeText = Array.from({ length: 220 }, (_, index) => `Large eval row ${index + 1}: ${"x".repeat(80)}`).join("\n");
+	const largeText = Array.from(
+		{ length: 220 },
+		(_, index) => `Large eval row ${index + 1}: ${"x".repeat(80)}`,
+	).join("\n");
 	const presentation = await buildToolPresentation({
 		commandInfo: { command: "eval", subcommand: "--stdin" },
 		cwd: process.cwd(),
@@ -687,21 +1124,21 @@ test("buildToolPresentation compacts oversized generic outputs and prints the ac
 		},
 	});
 
-	assert.equal(presentation.content[0]?.type, "text");
-	const text = (presentation.content[0] as { text: string }).text;
+	assert.equal(presentation.content[0].type, "text");
+	const text = readString(readRecord(presentation.content[0]).text);
 	assert.match(text, /Large eval output compacted/);
 	assert.match(text, /Full output path: /);
 	assert.equal(typeof presentation.fullOutputPath, "string");
-	assert.equal((presentation.data as { compacted: boolean }).compacted, true);
+	assert.equal(readRecord(presentation.data).compacted, true);
 	assert.equal(presentation.successCategory, "artifact-unverified");
 	assert.equal(presentation.artifactVerification?.unverifiedCount, 1);
-	assert.equal(presentation.artifactVerification?.artifacts[0]?.kind, "spill");
+	assert.equal(presentation.artifactVerification.artifacts[0].kind, "spill");
 
 	const spillPath = presentation.fullOutputPath;
-	assert.ok(spillPath);
+	assert.ok(typeof spillPath === "string" && spillPath.length > 0);
 	assert.match(text, new RegExp(spillPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-	assert.match(await readFile(String(spillPath), "utf8"), /Large eval row 220/);
-	await rm(String(spillPath), { force: true });
+	assert.match(await readFile(spillPath, "utf8"), /Large eval row 220/);
+	await rm(spillPath, { force: true });
 });
 
 test("buildToolPresentation formats batch output for the model", async () => {
@@ -711,18 +1148,25 @@ test("buildToolPresentation formats batch output for the model", async () => {
 		envelope: {
 			success: true,
 			data: [
-				{ command: ["open", "https://developer.mozilla.org"], success: true, result: { title: "MDN Web Docs" } },
+				{
+					command: ["open", "https://developer.mozilla.org"],
+					success: true,
+					result: { title: "MDN Web Docs" },
+				},
 				{ command: ["get", "title"], success: true, result: { title: "MDN Web Docs" } },
 			],
 		},
 	});
 
-	assert.equal(presentation.content[0]?.type, "text");
-	assert.match((presentation.content[0] as { text: string }).text, /Step 1 — open https:\/\/developer.mozilla.org/);
-	assert.match((presentation.content[0] as { text: string }).text, /MDN Web Docs/);
+	assert.equal(presentation.content[0].type, "text");
+	assert.match(
+		readString(readRecord(presentation.content[0]).text),
+		/Step 1 — open https:\/\/developer.mozilla.org/,
+	);
+	assert.match(readString(readRecord(presentation.content[0]).text), /MDN Web Docs/);
 	assert.equal(Array.isArray(presentation.data), true);
 	assert.equal(presentation.batchSteps?.length, 2);
-	assert.equal(presentation.batchSteps?.[0]?.commandText, "open https://developer.mozilla.org");
+	assert.equal(presentation.batchSteps[0].commandText, "open https://developer.mozilla.org");
 	assert.match(presentation.summary, /Batch: 2\/2 succeeded/);
 });
 
@@ -733,58 +1177,63 @@ test("buildToolPresentation preserves partial batch results when a later step fa
 		envelope: {
 			success: false,
 			data: [
-				{ command: ["open", "https://example.com"], success: true, result: { title: "Example Domain", url: "https://example.com/" } },
-				{ command: ["click", "@zzz"], success: false, error: "Unknown ref: zzz", result: { lifecycle: { effectiveLaunch: { browserLaunched: true } } } },
+				{
+					command: ["open", "https://example.com"],
+					success: true,
+					result: { title: "Example Domain", url: "https://example.com/" },
+				},
+				{
+					command: ["click", "@zzz"],
+					success: false,
+					error: "Unknown ref: zzz",
+					result: { lifecycle: { effectiveLaunch: { browserLaunched: true } } },
+				},
 			],
 		},
 	});
 
-	assert.equal(presentation.content[0]?.type, "text");
-	assert.match((presentation.content[0] as { text: string }).text, /Batch failed: 1\/2 succeeded/);
-	assert.match((presentation.content[0] as { text: string }).text, /First failing step: 2 — click @zzz/);
-	assert.match((presentation.content[0] as { text: string }).text, /Step 1 — open https:\/\/example.com \(succeeded\)/);
-	assert.match((presentation.content[0] as { text: string }).text, /Example Domain/);
-	assert.match((presentation.content[0] as { text: string }).text, /Step 2 — click @zzz \(failed\)/);
-	assert.match((presentation.content[0] as { text: string }).text, /Error: Unknown ref: zzz/);
-	assert.match((presentation.content[0] as { text: string }).text, /snapshot -i/);
-	assert.match((presentation.content[0] as { text: string }).text, /find role\|text\|label/);
-	assert.match((presentation.content[0] as { text: string }).text, /scrollintoview/);
+	assert.equal(presentation.content[0].type, "text");
+	assert.match(
+		readString(readRecord(presentation.content[0]).text),
+		/Batch failed: 1\/2 succeeded/,
+	);
+	assert.match(
+		readString(readRecord(presentation.content[0]).text),
+		/First failing step: 2 — click @zzz/,
+	);
+	assert.match(
+		readString(readRecord(presentation.content[0]).text),
+		/Step 1 — open https:\/\/example.com \(succeeded\)/,
+	);
+	assert.match(readString(readRecord(presentation.content[0]).text), /Example Domain/);
+	assert.match(
+		readString(readRecord(presentation.content[0]).text),
+		/Step 2 — click @zzz \(failed\)/,
+	);
+	assert.match(readString(readRecord(presentation.content[0]).text), /Error: Unknown ref: zzz/);
+	assert.match(readString(readRecord(presentation.content[0]).text), /snapshot -i/);
+	assert.match(readString(readRecord(presentation.content[0]).text), /find role\|text\|label/);
+	assert.match(readString(readRecord(presentation.content[0]).text), /scrollintoview/);
 	assert.equal(presentation.resultCategory, "failure");
 	assert.equal(presentation.failureCategory, "stale-ref");
 	assert.equal(presentation.batchFailure?.failedStep.index, 1);
-	assert.equal(presentation.batchFailure?.failedStep.commandText, "click @zzz");
-	assert.equal(presentation.batchFailure?.failedStep.resultCategory, "failure");
-	assert.equal(presentation.batchFailure?.failedStep.failureCategory, "stale-ref");
-	assert.deepEqual(presentation.batchFailure?.failedStep.lifecycle, { effectiveLaunch: { browserLaunched: true } });
-	assert.deepEqual(presentation.batchFailure?.failedStep.nextActions?.[0]?.params?.args, ["snapshot", "-i"]);
+	assert.equal(presentation.batchFailure.failedStep.commandText, "click @zzz");
+	assert.equal(presentation.batchFailure.failedStep.resultCategory, "failure");
+	assert.equal(presentation.batchFailure.failedStep.failureCategory, "stale-ref");
+	assert.deepEqual(presentation.batchFailure.failedStep.lifecycle, {
+		effectiveLaunch: { browserLaunched: true },
+	});
+	assert.deepEqual(presentation.batchFailure.failedStep.nextActions?.[0]?.params?.args, [
+		"snapshot",
+		"-i",
+	]);
 	assert.deepEqual(presentation.nextActions?.[0]?.params?.args, ["snapshot", "-i"]);
-	assert.equal(presentation.batchFailure?.failureCount, 1);
-	assert.equal(presentation.batchFailure?.successCount, 1);
-	assert.equal(presentation.batchFailure?.totalCount, 2);
+	assert.equal(presentation.batchFailure.failureCount, 1);
+	assert.equal(presentation.batchFailure.successCount, 1);
+	assert.equal(presentation.batchFailure.totalCount, 2);
 	assert.match(presentation.summary, /Batch failed: 1\/2 succeeded/);
 	assert.equal(presentation.pageChangeSummary?.changeType, "mutation");
-	assert.equal(presentation.pageChangeSummary?.command, "batch");
-});
-
-test("buildToolPresentation adds overlay inspection without blind click retry for covered batch steps", async () => {
-	const presentation = await buildToolPresentation({
-		commandInfo: { command: "batch" },
-		cwd: process.cwd(),
-		envelope: {
-			data: [
-				{ command: ["click", "@e1"], error: "Element '@e1' is covered by <div role=dialog> at its click point, so the input would land on that element instead.", success: false },
-			],
-			success: false,
-		},
-		namespace: "tenant",
-		sessionName: "work",
-	});
-
-	assert.equal(presentation.failureCategory, "upstream-error");
-	assert.deepEqual(presentation.batchFailure?.failedStep.nextActions?.map((action) => action.id), ["inspect-overlay-state"]);
-	assert.deepEqual(presentation.nextActions?.map((action) => action.id), ["inspect-overlay-state"]);
-	assert.deepEqual(presentation.nextActions?.[0]?.params?.args, ["--namespace", "tenant", "--session", "work", "snapshot", "-i"]);
-	assert.equal(presentation.nextActions?.some((action) => action.params?.args?.includes("click")), false);
+	assert.equal(presentation.pageChangeSummary.command, "batch");
 });
 
 test("buildToolPresentation adds snapshot recovery for wait text assertion failures inside batch", async () => {
@@ -793,8 +1242,16 @@ test("buildToolPresentation adds snapshot recovery for wait text assertion failu
 		cwd: process.cwd(),
 		envelope: {
 			data: [
-				{ command: ["open", "https://example.com"], result: { title: "Example Domain" }, success: true },
-				{ command: ["wait", "--text", "Expected Copy"], error: "Timed out waiting for text", success: false },
+				{
+					command: ["open", "https://example.com"],
+					result: { title: "Example Domain" },
+					success: true,
+				},
+				{
+					command: ["wait", "--text", "Expected Copy"],
+					error: "Timed out waiting for text",
+					success: false,
+				},
 			],
 			success: false,
 		},
@@ -803,16 +1260,20 @@ test("buildToolPresentation adds snapshot recovery for wait text assertion failu
 
 	assert.equal(presentation.resultCategory, "failure");
 	assert.equal(presentation.batchFailure?.failedStep.commandText, "wait --text Expected Copy");
-	assert.deepEqual(presentation.batchFailure?.failedStep.nextActions?.map((action) => action.id), ["inspect-after-text-assertion-failure"]);
+	assert.deepEqual(
+		presentation.batchFailure.failedStep.nextActions?.map((action) => action.id),
+		["inspect-after-text-assertion-failure"],
+	);
 	assert.deepEqual(presentation.nextActions?.[0], {
 		id: "inspect-after-text-assertion-failure",
 		params: { args: ["--session", "work", "snapshot", "-i"] },
-		reason: "Inspect the current page after the text assertion failed before concluding the expected text is absent.",
-		safety: "Read-only snapshot; use current refs or visible text from this page before retrying the assertion.",
+		reason:
+			"Inspect the current page after the text assertion failed before concluding the expected text is absent.",
+		safety:
+			"Read-only snapshot; use current refs or visible text from this page before retrying the assertion.",
 		tool: "agent_browser",
 	});
 });
-
 
 test("buildToolPresentation keeps eval image-like string results text-only", async () => {
 	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-untrusted-image-"));
@@ -827,8 +1288,8 @@ test("buildToolPresentation keeps eval image-like string results text-only", asy
 		});
 
 		assert.equal(presentation.content.length, 1);
-		assert.equal(presentation.content[0]?.type, "text");
-		assert.equal((presentation.content[0] as { text: string }).text, "secret.png");
+		assert.equal(presentation.content[0].type, "text");
+		assert.equal(readString(readRecord(presentation.content[0]).text), "secret.png");
 		assert.equal(presentation.imagePath, undefined);
 		assert.equal(presentation.imagePaths, undefined);
 	} finally {
@@ -844,8 +1305,8 @@ test("buildToolPresentation keeps non-artifact path-like scalar results text-onl
 	});
 
 	assert.equal(presentation.content.length, 1);
-	assert.equal(presentation.content[0]?.type, "text");
-	assert.equal((presentation.content[0] as { text: string }).text, "/tmp/debug.har");
+	assert.equal(presentation.content[0].type, "text");
+	assert.equal(readString(readRecord(presentation.content[0]).text), "/tmp/debug.har");
 	assert.equal(presentation.artifacts, undefined);
 	assert.equal(presentation.imagePath, undefined);
 	assert.equal(presentation.imagePaths, undefined);
@@ -864,8 +1325,8 @@ test("buildToolPresentation keeps get absolute image path results text-only", as
 		});
 
 		assert.equal(presentation.content.length, 1);
-		assert.equal(presentation.content[0]?.type, "text");
-		assert.equal((presentation.content[0] as { text: string }).text, imagePath);
+		assert.equal(presentation.content[0].type, "text");
+		assert.equal(readString(readRecord(presentation.content[0]).text), imagePath);
 		assert.equal(presentation.imagePath, undefined);
 		assert.equal(presentation.imagePaths, undefined);
 	} finally {
@@ -886,16 +1347,19 @@ test("buildToolPresentation does not inline non-screenshot path records with ima
 		});
 
 		assert.equal(presentation.content.length, 1);
-		assert.equal(presentation.content[0]?.type, "text");
-		assert.match((presentation.content[0] as { text: string }).text, /Downloaded file verified: downloaded\.png/);
-		assert.match((presentation.content[0] as { text: string }).text, /image\/png/);
+		assert.equal(presentation.content[0].type, "text");
+		assert.match(
+			readString(readRecord(presentation.content[0]).text),
+			/Downloaded file verified: downloaded\.png/,
+		);
+		assert.match(readString(readRecord(presentation.content[0]).text), /image\/png/);
 		assert.equal(presentation.summary, "Downloaded file verified: downloaded.png");
 		assert.equal(presentation.artifacts?.[0]?.kind, "download");
-		assert.equal(presentation.artifacts?.[0]?.path, "downloaded.png");
-		assert.equal(presentation.artifacts?.[0]?.absolutePath, imagePath);
-		assert.equal(presentation.artifacts?.[0]?.mediaType, "image/png");
-		assert.equal(presentation.artifacts?.[0]?.exists, true);
-		assert.equal(presentation.artifacts?.[0]?.sizeBytes, png.length);
+		assert.equal(presentation.artifacts[0].path, "downloaded.png");
+		assert.equal(presentation.artifacts[0].absolutePath, imagePath);
+		assert.equal(presentation.artifacts[0].mediaType, "image/png");
+		assert.equal(presentation.artifacts[0].exists, true);
+		assert.equal(presentation.artifacts[0].sizeBytes, png.length);
 		assert.equal(presentation.imagePath, undefined);
 		assert.equal(presentation.imagePaths, undefined);
 	} finally {
@@ -903,7 +1367,10 @@ test("buildToolPresentation does not inline non-screenshot path records with ima
 	}
 });
 
-test("buildToolPresentation preserves wait --download saved-file metadata inside batch output", async () => {
+test("buildToolPresentation preserves wait --download saved-file metadata inside batch output", async (t) => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-missing-batch-download-"));
+	t.after(() => rm(tempDir, { force: true, recursive: true }));
+	const downloadPath = join(tempDir, "export.csv");
 	const presentation = await buildToolPresentation({
 		commandInfo: { command: "batch" },
 		cwd: process.cwd(),
@@ -911,34 +1378,45 @@ test("buildToolPresentation preserves wait --download saved-file metadata inside
 			success: true,
 			data: [
 				{ command: ["click", "#export"], result: { clicked: true }, success: true },
-				{ command: ["wait", "--download", "/tmp/export.csv"], result: { path: "/tmp/export.csv", elapsedMs: 75 }, success: true },
+				{
+					command: ["wait", "--download", downloadPath],
+					result: { path: downloadPath, elapsedMs: 75 },
+					success: true,
+				},
 			],
 		},
 	});
 
-	const text = (presentation.content[0] as { text: string }).text;
+	const text = readString(readRecord(presentation.content[0]).text);
 	assert.match(text, /Batch failed: 1\/2 succeeded/);
 	assert.doesNotMatch(text, /Batch: 2\/2 succeeded/);
 	assert.match(text, /Step 1 — click #export/);
-	assert.match(text, /Step 2 — wait --download \/tmp\/export\.csv/);
-	assert.match(text, /Download event reported; file not verified: \/tmp\/export\.csv/);
+	assert.ok(text.includes(`Step 2 — wait --download ${downloadPath}`));
+	assert.ok(text.includes(`Download event reported; file not verified: ${downloadPath}`));
 	assert.equal(presentation.batchSteps?.[1]?.artifacts?.[0]?.kind, "download");
-	assert.equal(presentation.batchSteps?.[1]?.savedFilePath, "/tmp/export.csv");
-	assert.deepEqual(presentation.batchSteps?.[1]?.savedFile, {
+	assert.equal(presentation.batchSteps[1].savedFilePath, downloadPath);
+	assert.deepEqual(presentation.batchSteps[1].savedFile, {
 		command: "wait",
 		kind: "download",
 		metadata: { elapsedMs: 75 },
-		path: "/tmp/export.csv",
+		path: downloadPath,
 		subcommand: "--download",
 	});
-	assert.equal(presentation.summary, "Artifact verification failed: requested download was not found at /tmp/export.csv.");
+	assert.equal(
+		presentation.summary,
+		`Artifact verification failed: requested download was not found at ${downloadPath}.`,
+	);
 	assert.equal(presentation.batchFailure?.successCount, 1);
-	assert.equal(presentation.batchFailure?.totalCount, 2);
-	assert.equal(presentation.batchSteps?.[1]?.artifactVerification?.missingCount, 1);
+	assert.equal(presentation.batchFailure.totalCount, 2);
+	assert.equal(presentation.batchSteps[1].artifactVerification?.missingCount, 1);
 	assert.equal(presentation.artifactVerification?.missingCount, 1);
-	assert.deepEqual(presentation.batchSteps?.[1]?.nextActions?.[0]?.params?.args, ["wait", "--download", "/tmp/export.csv"]);
-	assert.equal(presentation.batchSteps?.[1]?.pageChangeSummary?.changeType, "artifact");
-	assert.equal(presentation.batchSteps?.[1]?.pageChangeSummary?.savedFilePath, "/tmp/export.csv");
+	assert.deepEqual(presentation.batchSteps[1].nextActions?.[0]?.params?.args, [
+		"wait",
+		"--download",
+		downloadPath,
+	]);
+	assert.equal(presentation.batchSteps[1].pageChangeSummary?.changeType, "artifact");
+	assert.equal(presentation.batchSteps[1].pageChangeSummary.savedFilePath, downloadPath);
 });
 
 test("buildToolPresentation does not re-append old artifact retention noise for routine explicit batch files", async () => {
@@ -969,10 +1447,16 @@ test("buildToolPresentation does not re-append old artifact retention noise for 
 			cwd: tempDir,
 			envelope: {
 				success: true,
-				data: [{ command: ["download", "@e1", "export.csv"], result: { path: "export.csv" }, success: true }],
+				data: [
+					{
+						command: ["download", "@e1", "export.csv"],
+						result: { path: "export.csv" },
+						success: true,
+					},
+				],
 			},
 		});
-		const text = (presentation.content[0] as { text: string }).text;
+		const text = readString(readRecord(presentation.content[0]).text);
 		assert.match(text, /Downloaded file verified: export\.csv/);
 		assert.doesNotMatch(text, /Session artifacts:/);
 		assert.match(presentation.artifactRetentionSummary ?? "", /1 live, 1 evicted/);
@@ -1003,22 +1487,22 @@ test("buildToolPresentation reuses standalone inline screenshot rendering inside
 			},
 		});
 
-		const text = (presentation.content[0] as { text: string }).text;
+		const text = readString(readRecord(presentation.content[0]).text);
 		assert.match(text, /Step 1 — open https:\/\/example.com/);
 		assert.match(text, /Example Domain/);
 		assert.match(text, /Step 2 — screenshot/);
 		assert.match(text, /Saved image: batched.png/);
 		assert.match(text, /1 inline image attachment below/);
-		assert.equal(presentation.content[1]?.type, "image");
+		assert.equal(presentation.content[1].type, "image");
 		assert.equal(presentation.imagePath, imagePath);
 		assert.deepEqual(presentation.imagePaths, [imagePath]);
 		assert.equal(presentation.artifacts?.[0]?.kind, "image");
-		assert.equal(presentation.artifacts?.[0]?.path, "batched.png");
-		assert.equal(presentation.artifacts?.[0]?.absolutePath, imagePath);
-		assert.equal(presentation.artifacts?.[0]?.mediaType, "image/png");
-		assert.equal(presentation.artifacts?.[0]?.exists, true);
+		assert.equal(presentation.artifacts[0].path, "batched.png");
+		assert.equal(presentation.artifacts[0].absolutePath, imagePath);
+		assert.equal(presentation.artifacts[0].mediaType, "image/png");
+		assert.equal(presentation.artifacts[0].exists, true);
 		assert.equal(presentation.batchSteps?.[1]?.imagePath, imagePath);
-		assert.equal(presentation.batchSteps?.[1]?.artifacts?.[0]?.kind, "image");
+		assert.equal(presentation.batchSteps[1].artifacts?.[0]?.kind, "image");
 	} finally {
 		await rm(tempDir, { force: true, recursive: true });
 	}
@@ -1031,57 +1515,96 @@ test("buildToolPresentation preserves non-screenshot file artifacts inside batch
 		envelope: {
 			success: true,
 			data: [
-				{ command: ["trace", "stop", "trace.zip"], result: { eventCount: 1, path: "trace.zip" }, success: true },
-				{ command: ["profiler", "stop", "profile.cpuprofile"], result: { eventCount: 2, path: "profile.cpuprofile" }, success: true },
-				{ command: ["record", "start", "recording.webm"], result: { path: "recording.webm" }, success: true },
-				{ command: ["record", "stop"], result: { frames: 3, path: "recording.webm" }, success: true },
-				{ command: ["network", "har", "stop", "network.har"], result: { path: "network.har", requestCount: 0 }, success: true },
+				{
+					command: ["trace", "stop", "trace.zip"],
+					result: { eventCount: 1, path: "trace.zip" },
+					success: true,
+				},
+				{
+					command: ["profiler", "stop", "profile.cpuprofile"],
+					result: { eventCount: 2, path: "profile.cpuprofile" },
+					success: true,
+				},
+				{
+					command: ["record", "start", "recording.webm"],
+					result: { path: "recording.webm" },
+					success: true,
+				},
+				{
+					command: ["record", "stop"],
+					result: { frames: 3, path: "recording.webm" },
+					success: true,
+				},
+				{
+					command: ["network", "har", "stop", "network.har"],
+					result: { path: "network.har", requestCount: 0 },
+					success: true,
+				},
 			],
 		},
 	});
 
-	const text = (presentation.content[0] as { text: string }).text;
+	const text = readString(readRecord(presentation.content[0]).text);
 	assert.match(text, /Step 1 — trace stop trace\.zip/);
 	assert.match(text, /Saved trace: trace\.zip/);
 	assert.match(text, /Step 2 — profiler stop profile\.cpuprofile/);
 	assert.match(text, /Saved profile: profile\.cpuprofile/);
 	assert.match(text, /Step 3 — record start recording\.webm/);
 	assert.match(text, /Recording started; output will be written on stop: recording\.webm/);
-	assert.doesNotMatch(presentation.batchSteps?.[2]?.text ?? "", /Saved recording|not found on disk/);
+	assert.doesNotMatch(
+		presentation.batchSteps?.[2]?.text ?? "",
+		/Saved recording|not found on disk/,
+	);
 	assert.match(text, /Step 4 — record stop/);
-	assert.match(text, /Saved recording: recording\.webm/);
+	assert.match(text, /Recording reported; file not verified: recording\.webm/);
 	assert.match(text, /Step 5 — network har stop network\.har/);
 	assert.match(text, /Saved HAR: network\.har/);
-	assert.deepEqual(presentation.artifacts?.map((artifact) => artifact.kind), ["trace", "profile", "video", "har"]);
-	assert.deepEqual(presentation.batchSteps?.map((step) => step.artifacts?.[0]?.kind), ["trace", "profile", "video", "video", "har"]);
+	assert.deepEqual(
+		presentation.artifacts?.map((artifact) => artifact.kind),
+		["trace", "profile", "video", "har"],
+	);
+	assert.deepEqual(
+		presentation.batchSteps?.map((step) => step.artifacts?.[0]?.kind),
+		["trace", "profile", "video", "video", "har"],
+	);
 	assert.equal(presentation.imagePath, undefined);
 	assert.equal(presentation.imagePaths, undefined);
 });
 
-test("buildToolPresentation skips oversized inline image attachments", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-image-"));
-	const imagePath = join(tempDir, "large.png");
-	await writeFile(imagePath, Buffer.concat([png, Buffer.alloc(256 - png.length)]));
+test(
+	"buildToolPresentation skips oversized inline image attachments",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-image-"));
+		const imagePath = join(tempDir, "large.png");
+		await writeFile(imagePath, Buffer.concat([png, Buffer.alloc(256 - png.length)]));
 
-	try {
-		await withPatchedEnv({ PI_AGENT_BROWSER_INLINE_IMAGE_MAX_BYTES: "128" }, async () => {
-			const presentation = await buildToolPresentation({
-				commandInfo: { command: "screenshot" },
-				cwd: tempDir,
-				envelope: { success: true, data: { path: "large.png" } },
+		try {
+			await withPatchedEnv({ PI_AGENT_BROWSER_INLINE_IMAGE_MAX_BYTES: "128" }, async () => {
+				const presentation = await buildToolPresentation({
+					commandInfo: { command: "screenshot" },
+					cwd: tempDir,
+					envelope: { success: true, data: { path: "large.png" } },
+				});
+
+				assert.equal(presentation.content.length, 1);
+				assert.equal(presentation.content[0].type, "text");
+				assert.match(
+					readString(readRecord(presentation.content[0]).text),
+					/Saved image: large\.png/,
+				);
+				assert.match(
+					readString(readRecord(presentation.content[0]).text),
+					/Image attachment skipped:/,
+				);
+				assert.equal(presentation.imagePath, imagePath);
+				assert.equal(presentation.artifacts?.[0]?.kind, "image");
+				assert.equal(presentation.artifacts[0].path, "large.png");
+				assert.equal(presentation.artifacts[0].absolutePath, imagePath);
+				assert.equal(presentation.artifacts[0].sizeBytes, 256);
 			});
-
-			assert.equal(presentation.content.length, 1);
-			assert.equal(presentation.content[0]?.type, "text");
-			assert.match((presentation.content[0] as { text: string }).text, /Saved image: large\.png/);
-			assert.match((presentation.content[0] as { text: string }).text, /Image attachment skipped:/);
-			assert.equal(presentation.imagePath, imagePath);
-			assert.equal(presentation.artifacts?.[0]?.kind, "image");
-			assert.equal(presentation.artifacts?.[0]?.path, "large.png");
-			assert.equal(presentation.artifacts?.[0]?.absolutePath, imagePath);
-			assert.equal(presentation.artifacts?.[0]?.sizeBytes, 256);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

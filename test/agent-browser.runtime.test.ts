@@ -7,6 +7,8 @@
  */
 
 import assert from "node:assert/strict";
+import { readArray, readRecord, readString } from "./helpers/assertions.js";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -19,8 +21,15 @@ import {
 } from "../extensions/agent-browser/lib/argv-grammar.js";
 import { isRecord, parsePositiveInteger } from "../extensions/agent-browser/lib/parsing.js";
 import { LAUNCH_SCOPED_FLAGS } from "../extensions/agent-browser/lib/launch-scoped-flags.js";
-import { QUICK_START_GUIDELINES, SHARED_BROWSER_PLAYBOOK_GUIDELINES, TOOL_PROMPT_GUIDELINES_SUFFIX } from "../extensions/agent-browser/lib/playbook.js";
-import { getAgentBrowserSocketDir, getAgentBrowserSocketPathValidationError } from "../extensions/agent-browser/lib/process.js";
+import {
+	QUICK_START_GUIDELINES,
+	SHARED_BROWSER_PLAYBOOK_GUIDELINES,
+	TOOL_PROMPT_GUIDELINES_SUFFIX,
+} from "../extensions/agent-browser/lib/playbook.js";
+import {
+	getAgentBrowserSocketDir,
+	getAgentBrowserSocketPathValidationError,
+} from "../extensions/agent-browser/lib/process.js";
 import {
 	buildExecutionPlan,
 	canUseHeadlessCompatibilityUserAgent,
@@ -34,9 +43,12 @@ import {
 	redactSensitiveText,
 	redactSensitiveValue,
 	resolveManagedSessionState,
-	restoreManagedSessionStateFromBranch,
+	restoreManagedSessionStateFromBranch as restoreCanonicalManagedSessionState,
 	validateToolArgs,
 } from "../extensions/agent-browser/lib/runtime.js";
+import { convertBrowserEntries } from "../extensions/agent-browser/lib/browser-session-conversion.js";
+const restoreManagedSessionStateFromBranch = (branch: readonly unknown[], baseName: string) =>
+	restoreCanonicalManagedSessionState(convertBrowserEntries([...branch]), baseName);
 import { createToolBranchEntry } from "./helpers/agent-browser-harness.js";
 
 test("buildExecutionPlan rejects ambiguous session identity flags without rejecting command text", () => {
@@ -62,7 +74,14 @@ test("buildExecutionPlan rejects ambiguous session identity flags without reject
 	);
 	assert.match(afterSentinel.validationError ?? "", /Multiple --session flags/);
 	const launchArgValue = buildExecutionPlan(
-		["--session", "piab-managed", "--args", "--session=browser-flag-value", "open", "https://example.com"],
+		[
+			"--session",
+			"piab-managed",
+			"--args",
+			"--session=browser-flag-value",
+			"open",
+			"https://example.com",
+		],
 		{ ...options, managedSessionActive: false },
 	);
 	assert.doesNotMatch(launchArgValue.validationError ?? "", /Multiple --session flags/);
@@ -74,9 +93,15 @@ test("buildExecutionPlan rejects ambiguous session identity flags without reject
 	assert.equal(commandFlagSmuggle.validationError, undefined);
 	assert.equal(commandFlagSmuggle.sessionName, "caller-owned");
 	assert.equal(commandFlagSmuggle.usedImplicitSession, false);
-	const helpWithUnsupportedEqualsSession = buildExecutionPlan(["--session=caller-owned", "--help"], options);
+	const helpWithUnsupportedEqualsSession = buildExecutionPlan(
+		["--session=caller-owned", "--help"],
+		options,
+	);
 	assert.equal(helpWithUnsupportedEqualsSession.validationError, undefined);
-	assert.deepEqual(helpWithUnsupportedEqualsSession.effectiveArgs, ["--session=caller-owned", "--help"]);
+	assert.deepEqual(helpWithUnsupportedEqualsSession.effectiveArgs, [
+		"--session=caller-owned",
+		"--help",
+	]);
 });
 
 test("createImplicitSessionName is stable for a persisted pi session", () => {
@@ -91,8 +116,18 @@ test("createImplicitSessionName is stable for a persisted pi session", () => {
 
 test("createImplicitSessionName hashes the full Pi session id", () => {
 	const cwd = "/Users/example/Projects/pi-agent-browser";
-	const one = createImplicitSessionName("019fe81c-92dd-7000-8000-000000000001", cwd, "ignored", "linux");
-	const two = createImplicitSessionName("019fe81c-92dd-7000-8000-000000000002", cwd, "ignored", "linux");
+	const one = createImplicitSessionName(
+		"019fe81c-92dd-7000-8000-000000000001",
+		cwd,
+		"ignored",
+		"linux",
+	);
+	const two = createImplicitSessionName(
+		"019fe81c-92dd-7000-8000-000000000002",
+		cwd,
+		"ignored",
+		"linux",
+	);
 
 	assert.notEqual(one, two);
 });
@@ -108,13 +143,22 @@ test("createImplicitSessionName includes cwd isolation for same-named checkouts"
 });
 
 test("Android managed session names retain full identity entropy within namespaced socket limits", () => {
-	const base = createImplicitSessionName("12345678-1234-5678-9abc-def012345678", "/data/data/com.termux/files/home/project", "ignored", "android");
+	const base = createImplicitSessionName(
+		"12345678-1234-5678-9abc-def012345678",
+		"/data/data/com.termux/files/home/project",
+		"ignored",
+		"android",
+	);
 	const fresh = createFreshSessionName(base, "seed", 1);
 	const socketDir = getAgentBrowserSocketDir("android", 10_589, "com.termux");
 
 	assert.match(base, /^piab-[a-f0-9]{20}$/);
 	assert.equal(
-		getAgentBrowserSocketPathValidationError({ args: ["--namespace", "termux", "--session", fresh, "open", "about:blank"], platform: "android", socketDir: String(socketDir) }),
+		getAgentBrowserSocketPathValidationError({
+			args: ["--namespace", "termux", "--session", fresh, "open", "about:blank"],
+			platform: "android",
+			socketDir: String(socketDir),
+		}),
 		undefined,
 	);
 });
@@ -122,7 +166,10 @@ test("Android managed session names retain full identity entropy within namespac
 test("getAgentBrowserSocketDir uses a short user-specific unix socket directory and skips windows", () => {
 	assert.equal(getAgentBrowserSocketDir("darwin", 501), "/private/tmp/piab-501");
 	assert.equal(getAgentBrowserSocketDir("linux", 1000), "/tmp/piab-1000");
-	assert.equal(getAgentBrowserSocketDir("android", 10_589, "com.termux"), "/data/data/com.termux/piab");
+	assert.equal(
+		getAgentBrowserSocketDir("android", 10_589, "com.termux"),
+		"/data/data/com.termux/piab",
+	);
 	assert.equal(getAgentBrowserSocketDir("android", 10_589, "../invalid"), "/tmp/piab-10589");
 	assert.equal(getAgentBrowserSocketDir("win32", undefined), undefined);
 });
@@ -140,25 +187,80 @@ test("shared parsing helpers preserve boundary parsing semantics", () => {
 	assert.equal(parsePositiveInteger("-1"), undefined);
 	assert.equal(parsePositiveInteger("1.5"), undefined);
 	assert.equal(parsePositiveInteger("9007199254740992"), undefined);
-	assert.equal(canonicalizeAgentBrowserNamespace("Next Dev Loop: /Users/me/worktree!"), "next-dev-loop-users-me-worktree");
+	assert.equal(
+		canonicalizeAgentBrowserNamespace("Next Dev Loop: /Users/me/worktree!"),
+		"next-dev-loop-users-me-worktree",
+	);
 	assert.equal(canonicalizeAgentBrowserNamespace(" --Agent__ "), "agent");
-	assert.equal(parseArgvDescriptor(["--hide-scrollbars", "open", "https://example.com"]).commandInfo.command, "open");
-	assert.equal(parseArgvDescriptor(["--hide-scrollbars", "false", "open", "https://example.com"]).commandInfo.command, "open");
-	assert.deepEqual(parseArgvDescriptor(["pdf", "--json", "demo.pdf"]).upstreamCommandTokens, ["pdf", "demo.pdf"]);
-	assert.deepEqual(parseArgvDescriptor(["pdf", "--restore", "demo.pdf"]).upstreamCommandTokens, ["pdf", "demo.pdf"]);
-	assert.deepEqual(parseArgvDescriptor(["pdf", "--quick", "true", "demo.pdf"]).upstreamCommandTokens, ["pdf", "demo.pdf"]);
-	assert.deepEqual(parseArgvDescriptor(["record", "--json", "start", "demo.webm"]).upstreamCommandTokens, ["record", "start", "demo.webm"]);
-	assert.deepEqual(parseArgvDescriptor(["pdf", "--restore=key", "demo.pdf"]).upstreamCommandTokens, ["pdf", "demo.pdf"]);
+	assert.equal(
+		parseArgvDescriptor(["--hide-scrollbars", "open", "https://example.com"]).commandInfo.command,
+		"open",
+	);
+	assert.equal(
+		parseArgvDescriptor(["--hide-scrollbars", "false", "open", "https://example.com"]).commandInfo
+			.command,
+		"open",
+	);
+	assert.deepEqual(parseArgvDescriptor(["pdf", "--json", "demo.pdf"]).upstreamCommandTokens, [
+		"pdf",
+		"demo.pdf",
+	]);
+	assert.deepEqual(parseArgvDescriptor(["pdf", "--restore", "demo.pdf"]).upstreamCommandTokens, [
+		"pdf",
+		"demo.pdf",
+	]);
+	assert.deepEqual(
+		parseArgvDescriptor(["pdf", "--quick", "true", "demo.pdf"]).upstreamCommandTokens,
+		["pdf", "demo.pdf"],
+	);
+	assert.deepEqual(
+		parseArgvDescriptor(["record", "--json", "start", "demo.webm"]).upstreamCommandTokens,
+		["record", "start", "demo.webm"],
+	);
+	assert.deepEqual(
+		parseArgvDescriptor(["pdf", "--restore=key", "demo.pdf"]).upstreamCommandTokens,
+		["pdf", "demo.pdf"],
+	);
 });
 
 test("extractRequestedRestoreKey mirrors optional values and post-command session fallback", () => {
-	assert.equal(extractRequestedRestoreKey(["open", "https://example.com"], "managed", "env-key"), "env-key");
+	assert.equal(
+		extractRequestedRestoreKey(["open", "https://example.com"], "managed", "env-key"),
+		"env-key",
+	);
 	assert.equal(extractRequestedRestoreKey(["open", "https://example.com"], "managed", ""), null);
-	assert.equal(extractRequestedRestoreKey(["--restore", "caller-key", "open", "https://example.com"], "managed", undefined), "caller-key");
-	assert.equal(extractRequestedRestoreKey(["open", "https://example.com", "--restore=caller-key"], "managed", undefined), "caller-key");
-	assert.equal(extractRequestedRestoreKey(["--restore=", "open", "https://example.com"], "managed", undefined), "managed");
-	assert.equal(extractRequestedRestoreKey(["--restore", "open", "https://example.com"], "managed", undefined), "managed");
-	assert.equal(extractRequestedRestoreKey(["open", "https://example.com", "--restore", "ignored"], "managed", undefined), "managed");
+	assert.equal(
+		extractRequestedRestoreKey(
+			["--restore", "caller-key", "open", "https://example.com"],
+			"managed",
+			undefined,
+		),
+		"caller-key",
+	);
+	assert.equal(
+		extractRequestedRestoreKey(
+			["open", "https://example.com", "--restore=caller-key"],
+			"managed",
+			undefined,
+		),
+		"caller-key",
+	);
+	assert.equal(
+		extractRequestedRestoreKey(["--restore=", "open", "https://example.com"], "managed", undefined),
+		"managed",
+	);
+	assert.equal(
+		extractRequestedRestoreKey(["--restore", "open", "https://example.com"], "managed", undefined),
+		"managed",
+	);
+	assert.equal(
+		extractRequestedRestoreKey(
+			["open", "https://example.com", "--restore", "ignored"],
+			"managed",
+			undefined,
+		),
+		"managed",
+	);
 });
 
 test("implicit session timeout helpers prefer explicit overrides and safe defaults", () => {
@@ -170,9 +272,22 @@ test("implicit session timeout helpers prefer explicit overrides and safe defaul
 		1200,
 	);
 	assert.equal(getImplicitSessionIdleTimeoutMs({ AGENT_BROWSER_IDLE_TIMEOUT_MS: "2100" }), 2100);
-	assert.equal(getImplicitSessionIdleTimeoutMs({ PI_AGENT_BROWSER_IMPLICIT_SESSION_IDLE_TIMEOUT_MS: "invalid" }), 900000);
-	assert.equal(getImplicitSessionCloseTimeoutMs({ PI_AGENT_BROWSER_IMPLICIT_SESSION_CLOSE_TIMEOUT_MS: "250" }), 250);
-	assert.equal(getImplicitSessionCloseTimeoutMs({ PI_AGENT_BROWSER_IMPLICIT_SESSION_CLOSE_TIMEOUT_MS: "invalid" }), 5_000);
+	assert.equal(
+		getImplicitSessionIdleTimeoutMs({
+			PI_AGENT_BROWSER_IMPLICIT_SESSION_IDLE_TIMEOUT_MS: "invalid",
+		}),
+		900000,
+	);
+	assert.equal(
+		getImplicitSessionCloseTimeoutMs({ PI_AGENT_BROWSER_IMPLICIT_SESSION_CLOSE_TIMEOUT_MS: "250" }),
+		250,
+	);
+	assert.equal(
+		getImplicitSessionCloseTimeoutMs({
+			PI_AGENT_BROWSER_IMPLICIT_SESSION_CLOSE_TIMEOUT_MS: "invalid",
+		}),
+		35_000,
+	);
 });
 
 test("resolveManagedSessionState only adopts successful managed sessions and identifies replaced sessions", () => {
@@ -237,7 +352,12 @@ test("resolveManagedSessionState only adopts successful managed sessions and ide
 			priorSessionName: "piab-demo-123",
 			succeeded: true,
 		}),
-		{ active: true, namespace: "review", sessionName: "piab-demo-123-fresh", replacedSessionName: "piab-demo-123" },
+		{
+			active: true,
+			namespace: "review",
+			sessionName: "piab-demo-123-fresh",
+			replacedSessionName: "piab-demo-123",
+		},
 	);
 });
 
@@ -494,7 +614,11 @@ test("restoreManagedSessionStateFromBranch preserves a terminal batch close thro
 					args: ["batch"],
 					batchSteps: [
 						{ command: ["close"], success: true },
-						{ command: ["stream", "status"], data: { lifecycle: { effectiveLaunch: { browserLaunched: false } } }, success: true },
+						{
+							command: ["stream", "status"],
+							data: { lifecycle: { effectiveLaunch: { browserLaunched: false } } },
+							success: true,
+						},
 					],
 					command: "batch",
 					sessionMode: "auto",
@@ -528,7 +652,11 @@ test("restoreManagedSessionStateFromBranch keeps a lifecycle-proven post-close r
 					args: ["batch"],
 					batchSteps: [
 						{ command: ["close"], success: true },
-						{ command: ["record", "stop"], data: { lifecycle: { effectiveLaunch: { browserLaunched: true } } }, success: true },
+						{
+							command: ["record", "stop"],
+							data: { lifecycle: { effectiveLaunch: { browserLaunched: true } } },
+							success: true,
+						},
 					],
 					command: "batch",
 					sessionMode: "auto",
@@ -764,8 +892,14 @@ test("restoreManagedSessionStateFromBranch treats upstream close aliases as mana
 			"piab-demo-123",
 		);
 
+		// All three close aliases must retire ownership in this fixed matrix.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(restored.active, false, command);
+		// All close aliases must retain the same restored session identity.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(restored.sessionName, "piab-demo-123", command);
+		// All close aliases must publish the retired session identity.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(restored.closedSessionName, "piab-demo-123", command);
 	}
 });
@@ -923,17 +1057,30 @@ test("restoreManagedSessionStateFromBranch honors namespaced Electron cleanup ma
 						action: "cleanup",
 						cleanup: {
 							partial: true,
-							results: [{
-								launchId: "electron-demo",
-								partial: true,
-								record: { cleanupState: "partial", launchId: "electron-demo", namespace: "record-fallback", port: 9222, version: 1 },
-								remainingResources: ["process"],
-								steps: [
-									{ namespace: "team", resource: "managed-session", sessionName: "piab-demo-123-fresh-electron", state: "removed" },
-									{ resource: "process", state: "failed" },
-								],
-								summary: "Electron cleanup was partial.",
-							}],
+							results: [
+								{
+									launchId: "electron-demo",
+									partial: true,
+									record: {
+										cleanupState: "partial",
+										launchId: "electron-demo",
+										namespace: "record-fallback",
+										port: 9222,
+										version: 1,
+									},
+									remainingResources: ["process"],
+									steps: [
+										{
+											namespace: "team",
+											resource: "managed-session",
+											sessionName: "piab-demo-123-fresh-electron",
+											state: "removed",
+										},
+										{ resource: "process", state: "failed" },
+									],
+									summary: "Electron cleanup was partial.",
+								},
+							],
 						},
 					},
 					resultCategory: "failure",
@@ -1035,19 +1182,36 @@ test("buildExecutionPlan injects --json and the implicit session when needed", (
 		sessionMode: "auto",
 	});
 
-	assert.deepEqual(plan.effectiveArgs, ["--json", "--session", "piab-demo-123", "open", "https://example.com"]);
+	assert.deepEqual(plan.effectiveArgs, [
+		"--json",
+		"--session",
+		"piab-demo-123",
+		"open",
+		"https://example.com",
+	]);
 	assert.equal(plan.managedSessionName, "piab-demo-123");
 	assert.equal(plan.sessionName, "piab-demo-123");
 	assert.equal(plan.usedImplicitSession, true);
 	assert.equal(plan.validationError, undefined);
 
-	const namespaced = buildExecutionPlan(["--namespace", "Review Team!", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
-	assert.deepEqual(namespaced.effectiveArgs, ["--json", "--namespace", "review-team", "--session", "piab-demo-123", "open", "https://example.com"]);
+	const namespaced = buildExecutionPlan(
+		["--namespace", "Review Team!", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
+	assert.deepEqual(namespaced.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"review-team",
+		"--session",
+		"piab-demo-123",
+		"open",
+		"https://example.com",
+	]);
 	assert.equal(namespaced.namespace, "review-team");
 });
 
@@ -1060,9 +1224,21 @@ test("buildExecutionPlan treats upstream close aliases as managed-session closes
 			sessionMode: "auto",
 		});
 
-		assert.deepEqual(plan.effectiveArgs, ["--json", "--session", "piab-demo-123", command], command);
+		// Every declared close alias must preserve exact upstream argv.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(
+			plan.effectiveArgs,
+			["--json", "--session", "piab-demo-123", command],
+			command,
+		);
+		// Every close alias must retain managed identity until its close executes.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.managedSessionName, "piab-demo-123", command);
+		// Every close alias must target the managed session.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.sessionName, "piab-demo-123", command);
+		// Every close alias must retain implicit routing in this fixed matrix.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, true, command);
 	}
 });
@@ -1080,13 +1256,24 @@ test("buildExecutionPlan respects explicit upstream sessions", () => {
 	assert.equal(plan.sessionName, "custom");
 	assert.equal(plan.usedImplicitSession, false);
 
-	const namespaced = buildExecutionPlan(["--session", "custom", "--namespace", "review", "snapshot", "-i"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
-	assert.deepEqual(namespaced.effectiveArgs, ["--json", "--namespace", "review", "--session", "custom", "snapshot", "-i"]);
+	const namespaced = buildExecutionPlan(
+		["--session", "custom", "--namespace", "review", "snapshot", "-i"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
+	assert.deepEqual(namespaced.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"review",
+		"--session",
+		"custom",
+		"snapshot",
+		"-i",
+	]);
 	assert.equal(namespaced.sessionName, "custom");
 	assert.equal(namespaced.namespace, "review");
 
@@ -1097,7 +1284,14 @@ test("buildExecutionPlan respects explicit upstream sessions", () => {
 		managedSessionNamespace: "prod",
 		sessionMode: "auto",
 	});
-	assert.deepEqual(defaultNamespace.effectiveArgs, ["--json", "--namespace", "", "--session", "custom", "close"]);
+	assert.deepEqual(defaultNamespace.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"",
+		"--session",
+		"custom",
+		"close",
+	]);
 	assert.equal(defaultNamespace.namespace, "");
 
 	const sameNamespace = buildExecutionPlan(["--namespace", "Review", "snapshot", "-i"], {
@@ -1107,7 +1301,15 @@ test("buildExecutionPlan respects explicit upstream sessions", () => {
 		managedSessionNamespace: "review",
 		sessionMode: "auto",
 	});
-	assert.deepEqual(sameNamespace.effectiveArgs, ["--json", "--namespace", "review", "--session", "piab-demo-123", "snapshot", "-i"]);
+	assert.deepEqual(sameNamespace.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"review",
+		"--session",
+		"piab-demo-123",
+		"snapshot",
+		"-i",
+	]);
 	assert.equal(sameNamespace.validationError, undefined);
 });
 
@@ -1123,12 +1325,15 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 		});
 		assert.equal(inherited.namespace, "review-space");
 		assert.deepEqual(inherited.effectiveArgs, ["--json", "--session", "custom", "snapshot", "-i"]);
-		const explicitDefault = buildExecutionPlan(["--namespace", "", "--session", "custom", "snapshot", "-i"], {
-			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-			managedSessionActive: true,
-			managedSessionName: "piab-demo-123",
-			sessionMode: "auto",
-		});
+		const explicitDefault = buildExecutionPlan(
+			["--namespace", "", "--session", "custom", "snapshot", "-i"],
+			{
+				freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+				managedSessionActive: true,
+				managedSessionName: "piab-demo-123",
+				sessionMode: "auto",
+			},
+		);
 		assert.equal(explicitDefault.namespace, "");
 		const wrapperManaged = buildExecutionPlan(["--session", "piab-demo-123", "close"], {
 			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
@@ -1137,7 +1342,12 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 			sessionMode: "auto",
 		});
 		assert.equal(wrapperManaged.namespace, undefined);
-		assert.deepEqual(wrapperManaged.effectiveArgs, ["--json", "--session", "piab-demo-123", "close"]);
+		assert.deepEqual(wrapperManaged.effectiveArgs, [
+			"--json",
+			"--session",
+			"piab-demo-123",
+			"close",
+		]);
 		const namespacedManaged = buildExecutionPlan(["--session", "piab-demo-123", "snapshot", "-i"], {
 			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
 			managedSessionActive: true,
@@ -1146,22 +1356,41 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 			sessionMode: "auto",
 		});
 		assert.equal(namespacedManaged.namespace, "review-space");
-		assert.deepEqual(namespacedManaged.effectiveArgs, ["--json", "--session", "piab-demo-123", "snapshot", "-i"]);
+		assert.deepEqual(namespacedManaged.effectiveArgs, [
+			"--json",
+			"--session",
+			"piab-demo-123",
+			"snapshot",
+			"-i",
+		]);
 		assert.equal(namespacedManaged.validationError, undefined);
-		const callerPrefixed = buildExecutionPlan(["--session", "piab-caller-owned", "snapshot", "-i"], {
-			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-			managedSessionActive: true,
-			managedSessionName: "piab-demo-123",
-			sessionMode: "auto",
-		});
+		const callerPrefixed = buildExecutionPlan(
+			["--session", "piab-caller-owned", "snapshot", "-i"],
+			{
+				freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+				managedSessionActive: true,
+				managedSessionName: "piab-demo-123",
+				sessionMode: "auto",
+			},
+		);
 		assert.equal(callerPrefixed.namespace, "review-space");
-		const wrapperExplicitDefault = buildExecutionPlan(["--namespace", "", "--session", "piab-demo-123", "close"], {
-			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-			managedSessionActive: true,
-			managedSessionName: "piab-demo-123",
-			sessionMode: "auto",
-		});
-		assert.deepEqual(wrapperExplicitDefault.effectiveArgs, ["--json", "--namespace", "", "--session", "piab-demo-123", "close"]);
+		const wrapperExplicitDefault = buildExecutionPlan(
+			["--namespace", "", "--session", "piab-demo-123", "close"],
+			{
+				freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+				managedSessionActive: true,
+				managedSessionName: "piab-demo-123",
+				sessionMode: "auto",
+			},
+		);
+		assert.deepEqual(wrapperExplicitDefault.effectiveArgs, [
+			"--json",
+			"--namespace",
+			"",
+			"--session",
+			"piab-demo-123",
+			"close",
+		]);
 		assert.equal(wrapperExplicitDefault.namespace, "");
 
 		for (const override of [undefined, "", "other"]) {
@@ -1173,11 +1402,23 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 				managedSessionNamespace: "owned-space",
 				sessionMode: "fresh",
 			});
+			// Every fixed namespace override must preserve native close-all routing.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(freshClose.namespace, override ?? "review-space");
+			// Every namespace variant must leave close-all argv unchanged.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.deepEqual(freshClose.effectiveArgs, ["--json", ...args]);
+			// Every close-all variant must avoid selecting a single session.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(freshClose.sessionName, undefined);
+			// Every close-all variant must avoid assigning managed identity.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(freshClose.managedSessionName, undefined);
+			// Every close-all variant must stay namespace-scoped, not implicit-session scoped.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(freshClose.usedImplicitSession, false);
+			// Every declared close-all variant must remain supported.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(freshClose.validationError, undefined);
 		}
 		for (const sessionMode of ["auto", "fresh"] as const) {
@@ -1189,11 +1430,29 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 				sessionMode,
 			});
 			const selectedSession = sessionMode === "fresh" ? freshSessionName : "piab-demo-123";
+			// Both fixed auto/fresh modes must use the default namespace.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(opened.namespace, undefined);
-			assert.deepEqual(opened.effectiveArgs, ["--json", "--session", selectedSession, "open", "https://example.com"]);
+			// Both fixed session modes must emit the exact selected-session argv.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.deepEqual(opened.effectiveArgs, [
+				"--json",
+				"--session",
+				selectedSession,
+				"open",
+				"https://example.com",
+			]);
+			// Both fixed session modes must select their expected identity.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(opened.sessionName, selectedSession);
+			// Both fixed session modes must retain their selected managed identity.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(opened.managedSessionName, selectedSession);
+			// The exhaustive mode matrix distinguishes ordinary implicit reuse from fresh selection.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(opened.usedImplicitSession, sessionMode === "auto");
+			// Both declared open modes must remain valid.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(opened.validationError, undefined);
 
 			const listed = buildExecutionPlan(["session", "list"], {
@@ -1203,16 +1462,31 @@ test("buildExecutionPlan resolves caller-owned session namespaces from argv befo
 				managedSessionNamespace: "owned-space",
 				sessionMode,
 			});
+			// Both session-mode variants must leave session listing in the native namespace.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(listed.namespace, "review-space");
+			// Both fixed session modes must leave local listing argv unchanged.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.deepEqual(listed.effectiveArgs, ["--json", "session", "list"]);
+			// Both fixed modes must keep local listing sessionless.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(listed.sessionName, undefined);
+			// Both fixed modes must avoid creating managed identity for local listing.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(listed.managedSessionName, undefined);
+			// Both fixed modes must avoid implicit-session injection for local listing.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(listed.usedImplicitSession, false);
+			// Both declared listing modes must remain valid.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.equal(listed.validationError, undefined);
 		}
 	} finally {
-		if (previousNamespace === undefined) delete process.env.AGENT_BROWSER_NAMESPACE;
-		else process.env.AGENT_BROWSER_NAMESPACE = previousNamespace;
+		if (previousNamespace === undefined) {
+			delete process.env.AGENT_BROWSER_NAMESPACE;
+		} else {
+			process.env.AGENT_BROWSER_NAMESPACE = previousNamespace;
+		}
 	}
 });
 
@@ -1225,7 +1499,15 @@ test("buildExecutionPlan preserves stored namespace for implicit managed session
 		sessionMode: "auto",
 	});
 
-	assert.deepEqual(plan.effectiveArgs, ["--json", "--namespace", "review", "--session", "piab-demo-123-fresh-aaa", "snapshot", "-i"]);
+	assert.deepEqual(plan.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"review",
+		"--session",
+		"piab-demo-123-fresh-aaa",
+		"snapshot",
+		"-i",
+	]);
 	assert.equal(plan.namespace, "review");
 	assert.equal(plan.managedSessionName, "piab-demo-123-fresh-aaa");
 	assert.equal(plan.sessionName, "piab-demo-123-fresh-aaa");
@@ -1241,11 +1523,23 @@ test("buildExecutionPlan keeps inspection commands stateless", () => {
 			sessionMode: "auto",
 		});
 
+		// Every fixed help/version shape must use native inspection output.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.plainTextInspection, true);
+		// Every fixed help/version shape must retain caller argv.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.effectiveArgs, [...args]);
+		// Every local/inspection fixture in these nonempty matrices must remain unmanaged.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.managedSessionName, undefined);
+		// Every local/inspection or invalid-argv fixture must avoid selecting a session.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.sessionName, undefined);
+		// Every local/inspection or invalid-argv fixture must avoid implicit injection.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, false);
+		// Every declared valid local/inspection case must remain supported.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.validationError, undefined);
 	}
 });
@@ -1306,13 +1600,27 @@ test("buildExecutionPlan keeps sessionless commands free of implicit managed ses
 			sessionMode: "auto",
 		});
 
-		const expectedEffectiveArgs = callerArgs.includes("--json") ? callerArgs : ["--json", ...callerArgs];
+		const expectedEffectiveArgs = callerArgs.includes("--json")
+			? callerArgs
+			: ["--json", ...callerArgs];
 
+		// Every fixed local-command case retains structured output, unlike help/version.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.plainTextInspection, false);
+		// Every local-command case must retain its exact argv plus required JSON output.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.effectiveArgs, expectedEffectiveArgs);
+		// Every local/inspection fixture in these nonempty matrices must remain unmanaged.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.managedSessionName, undefined);
+		// Every local/inspection or invalid-argv fixture must avoid selecting a session.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.sessionName, undefined);
+		// Every local/inspection or invalid-argv fixture must avoid implicit injection.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, false);
+		// Every declared valid local/inspection case must remain supported.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.validationError, undefined);
 	}
 });
@@ -1326,7 +1634,11 @@ test("validateToolArgs rejects one-shot mcp server calls but preserves --help/-h
 });
 
 test("buildExecutionPlan still injects managed sessions for browser-backed state and auth commands", () => {
-	for (const args of [["state", "save", "./auth.json"], ["state", "load", "./auth.json"], ["auth", "login", "demo"]] as const) {
+	for (const args of [
+		["state", "save", "./auth.json"],
+		["state", "load", "./auth.json"],
+		["auth", "login", "demo"],
+	] as const) {
 		const plan = buildExecutionPlan([...args], {
 			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
 			managedSessionActive: true,
@@ -1334,8 +1646,14 @@ test("buildExecutionPlan still injects managed sessions for browser-backed state
 			sessionMode: "auto",
 		});
 
+		// Every fixed browser-backed state/auth command must receive managed routing.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.effectiveArgs, ["--json", "--session", "piab-demo-123", ...args]);
+		// Every browser-backed state/auth fixture must retain implicit routing.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, true);
+		// Every browser-backed state/auth fixture must retain its managed identity.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.managedSessionName, "piab-demo-123");
 	}
 });
@@ -1363,7 +1681,15 @@ test("buildExecutionPlan limits sessionless allowlists to documented subcommands
 			sessionMode: "auto",
 		});
 
-		assert.deepEqual(plan.effectiveArgs, ["--json", "--session", "piab-demo-123", ...args], args.join(" "));
+		// Every unknown-subcommand fixture conservatively receives managed routing.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(
+			plan.effectiveArgs,
+			["--json", "--session", "piab-demo-123", ...args],
+			args.join(" "),
+		);
+		// Every declared browser-backed argv variant must retain implicit routing.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, true, args.join(" "));
 	}
 });
@@ -1378,8 +1704,18 @@ test("buildExecutionPlan rejects unsupported global equals assignments except re
 	for (const flag of [...GLOBAL_VALUE_FLAGS, ...GLOBAL_BOOLEAN_FLAGS_WITH_OPTIONAL_VALUES]) {
 		const args = [`${flag}=demo`, "open", "https://example.com"];
 		const plan = buildExecutionPlan(args, options);
-		assert.equal(plan.validationError?.includes(`does not support \`${flag}=<value>\``), true, args.join(" "));
+		// Validate every declared global flag; none are selected from a runtime result.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(
+			plan.validationError?.includes(`does not support \`${flag}=<value>\``),
+			true,
+			args.join(" "),
+		);
+		// Every global-equals fixture must fail before command discovery.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.commandInfo, {}, args.join(" "));
+		// Every fixed argv variant must retain the expected empty startup-flag set.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.startupScopedFlags, [], args.join(" "));
 	}
 
@@ -1391,7 +1727,9 @@ test("buildExecutionPlan rejects unsupported global equals assignments except re
 test("validateToolArgs applies global equals exceptions only at top level", () => {
 	assert.equal(validateToolArgs(["--user-agent", "TARS", "batch"]), undefined);
 	assert.match(
-		validateToolArgs(["screenshot", "page.png", "--user-agent=TARS", "--help"], { batchStep: true }) ?? "",
+		validateToolArgs(["screenshot", "page.png", "--user-agent=TARS", "--help"], {
+			batchStep: true,
+		}) ?? "",
 		/Move `--user-agent` and its value before `batch` as separate top-level args/,
 	);
 	assert.match(
@@ -1401,7 +1739,28 @@ test("validateToolArgs applies global equals exceptions only at top level", () =
 });
 
 test("buildExecutionPlan rejects missing values for global value-taking flags before launching upstream", () => {
-	for (const args of [["--session"], ["--namespace"], ["--args", ""], ["--allowed-domains"], ["--ca-cert"], ["--profile"], ["--executable-path"], ["--session-name"], ["--restore-save"], ["--restore-check-url"], ["--restore-check-text"], ["--restore-check-fn"], ["--cdp"], ["--state"], ["--init-script"], ["--enable"], ["--download-path"], ["--model"], ["--idle-timeout"], ["open", "https://example.com", "--profile"]] as const) {
+	for (const args of [
+		["--session"],
+		["--namespace"],
+		["--args", ""],
+		["--allowed-domains"],
+		["--ca-cert"],
+		["--profile"],
+		["--executable-path"],
+		["--session-name"],
+		["--restore-save"],
+		["--restore-check-url"],
+		["--restore-check-text"],
+		["--restore-check-fn"],
+		["--cdp"],
+		["--state"],
+		["--init-script"],
+		["--enable"],
+		["--download-path"],
+		["--model"],
+		["--idle-timeout"],
+		["open", "https://example.com", "--profile"],
+	] as const) {
 		const plan = buildExecutionPlan([...args], {
 			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
 			managedSessionActive: false,
@@ -1410,11 +1769,23 @@ test("buildExecutionPlan rejects missing values for global value-taking flags be
 		});
 
 		const expectedFlag = [...args].reverse().find((token) => token.startsWith("-"));
+		// Every fixed missing-value fixture must fail validation.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.match(plan.validationError ?? "", /requires a value/i);
+		// Every missing-value fixture must identify its own offending flag.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.invalidValueFlag?.flag, expectedFlag);
-		assert.equal(plan.invalidValueFlag?.reason, "missing-value");
+		// Every missing-value fixture must retain the structured failure reason.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(readRecord(plan.invalidValueFlag).reason, "missing-value");
+		// Every missing-value fixture must fail before discovering a command.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.commandInfo, {});
+		// Every local/inspection or invalid-argv fixture must avoid selecting a session.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.sessionName, undefined);
+		// Every local/inspection or invalid-argv fixture must avoid implicit injection.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, false);
 	}
 });
@@ -1437,6 +1808,8 @@ test("buildExecutionPlan leaves command-scoped flags and literal text to upstrea
 			sessionMode: "auto",
 		});
 
+		// Every fixed literal-operand or valid-global fixture must remain valid.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.validationError, undefined, args.join(" "));
 	}
 });
@@ -1448,35 +1821,47 @@ test("validateToolArgs rejects press/key commands with selector-like extra args"
 		["keydown", "@e1", "Enter"],
 		["keyup"],
 	] as const) {
-		assert.match(validateToolArgs([...args]) ?? "", /accepts exactly one key argument/, args.join(" "));
+		// Every fixed invalid keyboard argv must reject selector-like extra operands.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(
+			validateToolArgs([...args]) ?? "",
+			/accepts exactly one key argument/,
+			args.join(" "),
+		);
 	}
 	assert.equal(validateToolArgs(["press", "Enter"]), undefined);
 	assert.equal(validateToolArgs(["key", "Escape"]), undefined);
 });
 
 test("buildExecutionPlan rejects value-taking flags followed by another flag", () => {
-	const plan = buildExecutionPlan(["--cdp", "--profile", "Default", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const plan = buildExecutionPlan(
+		["--cdp", "--profile", "Default", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 
 	assert.match(plan.validationError ?? "", /received `--profile`/i);
 	assert.equal(plan.invalidValueFlag?.flag, "--cdp");
-	assert.equal(plan.invalidValueFlag?.reason, "unexpected-flag");
-	assert.equal(plan.invalidValueFlag?.receivedToken, "--profile");
+	assert.equal(readRecord(plan.invalidValueFlag).reason, "unexpected-flag");
+	assert.equal(readRecord(plan.invalidValueFlag).receivedToken, "--profile");
 	assert.deepEqual(plan.commandInfo, {});
 	assert.equal(plan.usedImplicitSession, false);
 });
 
 for (const flag of ["--download", "-d"]) {
 	test(`wait ${flag} keeps the next retained operand and its original index after timeout removal`, () => {
-		assert.deepEqual(parseWaitCommandTokens(["wait", flag, "--timeout", "30000", "-capture.csv", "ignored.csv"]), {
-			downloadPath: "-capture.csv",
-			downloadPathIndex: 4,
-			subcommand: flag,
-		});
+		assert.deepEqual(
+			parseWaitCommandTokens(["wait", flag, "--timeout", "30000", "-capture.csv", "ignored.csv"]),
+			{
+				downloadPath: "-capture.csv",
+				downloadPathIndex: 4,
+				subcommand: flag,
+			},
+		);
 	});
 }
 
@@ -1500,64 +1885,120 @@ test("buildExecutionPlan allows optional wait download path to be omitted", () =
 	});
 	assert.equal(shortPlan.validationError, undefined);
 	assert.deepEqual(shortPlan.commandInfo, { command: "wait", subcommand: "-d" });
-	assert.deepEqual(parseArgvDescriptor(["wait", "--timeout", "30000", "-d", "report.csv"]).commandInfo, { command: "wait", subcommand: "-d" });
-	assert.deepEqual(parseArgvDescriptor(["wait", "--timeout", "1", "--timeout", "--download", "report.csv"]).commandInfo, { command: "wait", subcommand: "--download" });
-	assert.deepEqual(parseArgvDescriptor(["wait", "--download", "report.csv", "--url", "**/done"]).commandInfo, { command: "wait", subcommand: "--url" });
-	assert.deepEqual(parseArgvDescriptor(["wait", "-d", "report.csv", "-t", "Ready"]).commandInfo, { command: "wait", subcommand: "-t" });
+	assert.deepEqual(
+		parseArgvDescriptor(["wait", "--timeout", "30000", "-d", "report.csv"]).commandInfo,
+		{ command: "wait", subcommand: "-d" },
+	);
+	assert.deepEqual(
+		parseArgvDescriptor(["wait", "--timeout", "1", "--timeout", "--download", "report.csv"])
+			.commandInfo,
+		{ command: "wait", subcommand: "--download" },
+	);
+	assert.deepEqual(
+		parseArgvDescriptor(["wait", "--download", "report.csv", "--url", "**/done"]).commandInfo,
+		{ command: "wait", subcommand: "--url" },
+	);
+	assert.deepEqual(parseArgvDescriptor(["wait", "-d", "report.csv", "-t", "Ready"]).commandInfo, {
+		command: "wait",
+		subcommand: "-t",
+	});
 
-	assert.match(validateToolArgs(["wait", "--download=report.csv"]) ?? "", /does not support `wait --download=<path>`/);
+	assert.match(
+		validateToolArgs(["wait", "--download=report.csv"]) ?? "",
+		/does not support `wait --download=<path>`/,
+	);
 });
 
 test("buildExecutionPlan parses restore and namespace globals before command discovery", () => {
 	for (const { args, command, subcommand } of [
 		{ args: ["--namespace", "review", "session", "info"], command: "session", subcommand: "info" },
-		{ args: ["--session", "work", "--restore", "open", "https://example.com"], command: "open", subcommand: "https://example.com" },
-		{ args: ["--session", "work", "--restore", "authstate", "open", "https://example.com"], command: "open", subcommand: "https://example.com" },
-		{ args: ["--restore=auth", "open", "https://example.com"], command: "open", subcommand: "https://example.com" },
+		{
+			args: ["--session", "work", "--restore", "open", "https://example.com"],
+			command: "open",
+			subcommand: "https://example.com",
+		},
+		{
+			args: ["--session", "work", "--restore", "authstate", "open", "https://example.com"],
+			command: "open",
+			subcommand: "https://example.com",
+		},
+		{
+			args: ["--restore=auth", "open", "https://example.com"],
+			command: "open",
+			subcommand: "https://example.com",
+		},
 		{ args: ["--restore", "snapshot", "-i"], command: "snapshot", subcommand: "-i" },
 		{ args: ["--restore", "wait", "--url", "**/dashboard"], command: "wait", subcommand: "--url" },
-		{ args: ["--restore-save", "never", "open", "https://example.com"], command: "open", subcommand: "https://example.com" },
+		{
+			args: ["--restore-save", "never", "open", "https://example.com"],
+			command: "open",
+			subcommand: "https://example.com",
+		},
 	] as const) {
 		const descriptor = parseArgvDescriptor([...args]);
+		// Every fixed restore-flag shape must identify the actual command.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(descriptor.commandInfo.command, command, args.join(" "));
+		// Every fixed restore-flag shape must retain its actual first operand.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(descriptor.commandInfo.subcommand, subcommand, args.join(" "));
 	}
 });
 
 test("buildExecutionPlan only relocates namespace occurrences recognized by upstream global parsing", () => {
-	const plan = buildExecutionPlan([
-		"--session", "caller",
-		"--args", "--namespace",
-		"--namespace", "team",
-		"open", "https://example.com",
-	], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const plan = buildExecutionPlan(
+		[
+			"--session",
+			"caller",
+			"--args",
+			"--namespace",
+			"--namespace",
+			"team",
+			"open",
+			"https://example.com",
+		],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 
 	assert.equal(plan.validationError, undefined);
 	assert.equal(plan.namespace, "team");
 	assert.deepEqual(plan.effectiveArgs, [
-		"--json", "--namespace", "team",
-		"--session", "caller",
-		"--args", "--namespace",
-		"open", "https://example.com",
+		"--json",
+		"--namespace",
+		"team",
+		"--session",
+		"caller",
+		"--args",
+		"--namespace",
+		"open",
+		"https://example.com",
 	]);
 });
 
 test("buildExecutionPlan allows dash-starting --args values", () => {
-	const plan = buildExecutionPlan(["--args", "--disable-gpu,--lang=en-US", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const plan = buildExecutionPlan(
+		["--args", "--disable-gpu,--lang=en-US", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 
 	assert.equal(plan.validationError, undefined);
 	assert.deepEqual(plan.commandInfo, { command: "open", subcommand: "https://example.com" });
-	assert.deepEqual(plan.effectiveArgs.slice(-4), ["--args", "--disable-gpu,--lang=en-US", "open", "https://example.com"]);
+	assert.deepEqual(plan.effectiveArgs.slice(-4), [
+		"--args",
+		"--disable-gpu,--lang=en-US",
+		"open",
+		"https://example.com",
+	]);
 });
 
 test("launch-scoped flag metadata is reflected in playbook and command reference guidance", () => {
@@ -1568,25 +2009,61 @@ test("launch-scoped flag metadata is reflected in playbook and command reference
 	].join("\n");
 	const commandReference = readFileSync("docs/COMMAND_REFERENCE.md", "utf8");
 	for (const flag of LAUNCH_SCOPED_FLAGS) {
-		assert.match(playbookText, new RegExp(flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `playbook missing ${flag}`);
-		assert.match(commandReference, new RegExp(flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), `command reference missing ${flag}`);
+		// Delimited token: `-p` must not be satisfied by "changed-pixel" and `--restore` by `--restore-save`.
+		const delimitedFlag = new RegExp(
+			`(?<![\\w-])${flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w-])`,
+		);
+		// Every declared launch flag must be documented; the inventory is the fixture.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(playbookText, delimitedFlag, `playbook missing ${flag}`);
+		// Every declared launch flag must also appear in the human command guide.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(commandReference, delimitedFlag, `command reference missing ${flag}`);
 	}
 });
 
 test("buildExecutionPlan blocks startup-scoped flags from silently reusing an active implicit session", () => {
 	for (const { args, flag } of [
 		{ args: ["--profile", "Default", "open", "https://example.com"], flag: "--profile" },
-		{ args: ["--allowed-domains", "example.com", "open", "https://example.com"], flag: "--allowed-domains" },
-		{ args: ["--executable-path", "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser", "open", "https://example.com"], flag: "--executable-path" },
+		{ args: ["--engine", "chrome", "open", "https://example.com"], flag: "--engine" },
+		{ args: ["--engine", "lightpanda", "open", "https://example.com"], flag: "--engine" },
+		{
+			args: ["--allowed-domains", "example.com", "open", "https://example.com"],
+			flag: "--allowed-domains",
+		},
+		{
+			args: [
+				"--executable-path",
+				"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+				"open",
+				"https://example.com",
+			],
+			flag: "--executable-path",
+		},
 		{ args: ["--namespace", "review", "open", "https://example.com"], flag: "--namespace" },
-		{ args: ["--session-name", "saved-auth", "open", "https://example.com"], flag: "--session-name" },
+		{
+			args: ["--session-name", "saved-auth", "open", "https://example.com"],
+			flag: "--session-name",
+		},
 		{ args: ["--restore", "open", "https://example.com"], flag: "--restore" },
 		{ args: ["--restore=auth", "open", "https://example.com"], flag: "--restore" },
 		{ args: ["--restore-save", "never", "open", "https://example.com"], flag: "--restore-save" },
-		{ args: ["--restore-check-url", "**/dashboard", "open", "https://example.com"], flag: "--restore-check-url" },
-		{ args: ["--restore-check-text", "Dashboard", "open", "https://example.com"], flag: "--restore-check-text" },
-		{ args: ["--restore-check-fn", "!!localStorage.length", "open", "https://example.com"], flag: "--restore-check-fn" },
-		{ args: ["--cdp", "ws://127.0.0.1:9222/devtools/browser/demo", "open", "https://example.com"], flag: "--cdp" },
+		{
+			args: ["--restore-check-url", "**/dashboard", "open", "https://example.com"],
+			flag: "--restore-check-url",
+		},
+		{
+			args: ["--restore-check-text", "Dashboard", "open", "https://example.com"],
+			flag: "--restore-check-text",
+		},
+		{
+			args: ["--restore-check-fn", "!!localStorage.length", "open", "https://example.com"],
+			flag: "--restore-check-fn",
+		},
+		{
+			args: ["--cdp", "ws://127.0.0.1:9222/devtools/browser/demo", "open", "https://example.com"],
+			flag: "--cdp",
+		},
 		{ args: ["--ca-cert", "/tmp/proxy-ca.pem", "open", "https://example.com"], flag: "--ca-cert" },
 		{ args: ["--no-ca-cert", "open", "https://example.com"], flag: "--no-ca-cert" },
 		{ args: ["--state", "/tmp/auth.json", "open", "https://example.com"], flag: "--state" },
@@ -1597,7 +2074,10 @@ test("buildExecutionPlan blocks startup-scoped flags from silently reusing an ac
 		{ args: ["--no-webmcp", "open", "https://example.com"], flag: "--no-webmcp" },
 		{ args: ["--no-webmcp", "false", "open", "https://example.com"], flag: "--no-webmcp" },
 		{ args: ["open", "--enable", "react-devtools", "https://example.com"], flag: "--enable" },
-		{ args: ["open", "--init-script", "/tmp/setup.js", "https://example.com"], flag: "--init-script" },
+		{
+			args: ["open", "--init-script", "/tmp/setup.js", "https://example.com"],
+			flag: "--init-script",
+		},
 		{ args: ["--idle-timeout", "5000", "open", "https://example.com"], flag: "--idle-timeout" },
 		{ args: ["--args", "--disable-gpu", "open", "https://example.com"], flag: "--args" },
 		{ args: ["--user-agent", "Custom/1", "open", "https://example.com"], flag: "--user-agent" },
@@ -1611,12 +2091,67 @@ test("buildExecutionPlan blocks startup-scoped flags from silently reusing an ac
 			sessionMode: "auto",
 		});
 
+		// Every fixed active-session launch-flag fixture must reject ignored launch options.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.match(plan.validationError ?? "", /launch-scoped flags/i);
+		// Every fixed launch-flag fixture has exactly one startup option.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.startupScopedFlags.length, 1);
+		// Every fixed launch-flag fixture must identify its own option.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.startupScopedFlags[0], flag);
+		// Every local/inspection or invalid-argv fixture must avoid implicit injection.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, false);
+		// Every fixed active-session launch fixture must provide fresh-session recovery.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.recoveryHint?.recommendedSessionMode, "fresh");
-		assert.deepEqual(plan.recoveryHint?.exampleParams, { args: [...args], sessionMode: "fresh" });
+		// Every fixed launch-flag fixture must retain its exact recovery argv.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(readRecord(plan.recoveryHint).exampleParams, {
+			args: [...args],
+			sessionMode: "fresh",
+		});
+	}
+});
+
+test("buildExecutionPlan preserves engine selection for new, fresh and caller-owned sessions", () => {
+	for (const engine of ["chrome", "lightpanda"]) {
+		for (const mode of ["new", "fresh", "caller"] as const) {
+			const args = [
+				...(mode === "caller" ? ["--session", "caller"] : []),
+				"--engine",
+				engine,
+				"open",
+				"https://example.com",
+			];
+			const plan = buildExecutionPlan(args, {
+				freshSessionName: "piab-fresh",
+				managedSessionActive: mode !== "new",
+				managedSessionName: "piab-current",
+				sessionMode: mode === "fresh" ? "fresh" : "auto",
+			});
+			// The complete fixed engine/mode matrix must remain supported.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(plan.validationError, undefined, `${engine} ${mode}`);
+			// Every engine/mode pair must select the fixture's expected identity.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(
+				plan.sessionName,
+				{ caller: "caller", fresh: "piab-fresh", new: "piab-current" }[mode],
+			);
+			// Every engine/mode pair must preserve the caller's engine and command tail.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.deepEqual(plan.effectiveArgs.slice(-4), [
+				"--engine",
+				engine,
+				"open",
+				"https://example.com",
+			]);
+			// The exhaustive mode matrix distinguishes new implicit selection from explicit/fresh.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
+			assert.equal(plan.usedImplicitSession, mode === "new");
+		}
 	}
 });
 
@@ -1636,7 +2171,13 @@ test("buildExecutionPlan treats wait --state as command-scoped after the command
 });
 
 test("buildExecutionPlan only treats the last exact lowercase auto-connect false as disabled", () => {
-	assert.equal(isBooleanFlagEnabled(["--args", "--auto-connect", "open", "https://example.com"], "--auto-connect"), false);
+	assert.equal(
+		isBooleanFlagEnabled(
+			["--args", "--auto-connect", "open", "https://example.com"],
+			"--auto-connect",
+		),
+		false,
+	);
 	const plan = buildExecutionPlan(["--auto-connect", "false", "open", "https://example.com"], {
 		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
 		managedSessionActive: true,
@@ -1649,28 +2190,37 @@ test("buildExecutionPlan only treats the last exact lowercase auto-connect false
 	assert.equal(plan.usedImplicitSession, true);
 	assert.deepEqual(plan.commandInfo, { command: "open", subcommand: "https://example.com" });
 
-	const uppercaseFalse = buildExecutionPlan(["--auto-connect", "FALSE", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const uppercaseFalse = buildExecutionPlan(
+		["--auto-connect", "FALSE", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.match(uppercaseFalse.validationError ?? "", /launch-scoped flags.*--auto-connect/i);
 
-	const lastEnabled = buildExecutionPlan(["--auto-connect", "false", "--auto-connect", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const lastEnabled = buildExecutionPlan(
+		["--auto-connect", "false", "--auto-connect", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.match(lastEnabled.validationError ?? "", /launch-scoped flags.*--auto-connect/i);
 
-	const lastDisabled = buildExecutionPlan(["--auto-connect", "--auto-connect", "false", "open", "https://example.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const lastDisabled = buildExecutionPlan(
+		["--auto-connect", "--auto-connect", "false", "open", "https://example.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(lastDisabled.validationError, undefined);
 	assert.deepEqual(lastDisabled.startupScopedFlags, []);
 });
@@ -1690,10 +2240,22 @@ test("buildExecutionPlan treats pin-tab as a sticky global boolean, not launch-s
 		["--no-pin-tab", "false", "open", "https://example.com"],
 	] as const) {
 		const plan = buildExecutionPlan([...args], options);
+		// Every fixed literal-operand or valid-global fixture must remain valid.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.validationError, undefined, args.join(" "));
+		// Every fixed argv variant must retain the expected empty startup-flag set.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.deepEqual(plan.startupScopedFlags, [], args.join(" "));
+		// Every declared browser-backed argv variant must retain implicit routing.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.usedImplicitSession, true, args.join(" "));
-		assert.deepEqual(plan.commandInfo, { command: "open", subcommand: "https://example.com" }, args.join(" "));
+		// Every fixed pinning-flag fixture must discover the unchanged open command.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(
+			plan.commandInfo,
+			{ command: "open", subcommand: "https://example.com" },
+			args.join(" "),
+		);
 	}
 });
 
@@ -1710,13 +2272,24 @@ test("buildExecutionPlan treats provider and iOS device flags as launch-scoped",
 			sessionMode: "auto",
 		});
 
+		// Every fixed provider-selection fixture must reject active-session relaunch flags.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.match(plan.validationError ?? "", /launch-scoped flags/i, args.join(" "));
+		// Every fixed provider fixture must recommend a genuinely fresh launch.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.recoveryHint?.recommendedSessionMode, "fresh", args.join(" "));
 	}
 });
 
 test("buildExecutionPlan assigns a new managed session for fresh session mode", () => {
-	const args = ["--namespace", "review", "--profile", "Default", "open", "https://example.com/profile"];
+	const args = [
+		"--namespace",
+		"review",
+		"--profile",
+		"Default",
+		"open",
+		"https://example.com/profile",
+	];
 	const freshSessionName = createFreshSessionName("piab-demo-123", "seed", 1);
 	const plan = buildExecutionPlan(args, {
 		freshSessionName,
@@ -1728,7 +2301,17 @@ test("buildExecutionPlan assigns a new managed session for fresh session mode", 
 	assert.equal(plan.validationError, undefined);
 	assert.equal(plan.usedImplicitSession, false);
 	assert.equal(plan.managedSessionName, freshSessionName);
-	assert.deepEqual(plan.effectiveArgs, ["--json", "--namespace", "review", "--session", freshSessionName, "--profile", "Default", "open", "https://example.com/profile"]);
+	assert.deepEqual(plan.effectiveArgs, [
+		"--json",
+		"--namespace",
+		"review",
+		"--session",
+		freshSessionName,
+		"--profile",
+		"Default",
+		"open",
+		"https://example.com/profile",
+	]);
 	assert.equal(plan.namespace, "review");
 	assert.equal(plan.recoveryHint, undefined);
 });
@@ -1745,11 +2328,19 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 			managedSessionName: "piab-demo-123",
 			sessionMode: "auto",
 		});
+		// Every fixed affected-site fixture must select its expected workaround.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(plan.compatibilityWorkaround?.id, expectedId);
 		const userAgentFlagIndex = plan.effectiveArgs.indexOf("--user-agent");
+		// Every fixed affected-site fixture must actually inject a user-agent option.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.ok(userAgentFlagIndex >= 0);
-		assert.match(plan.effectiveArgs[userAgentFlagIndex + 1] ?? "", /Chrome\/146\.0\.0\.0/);
-		assert.doesNotMatch(plan.effectiveArgs[userAgentFlagIndex + 1] ?? "", /HeadlessChrome/);
+		// Every fixed affected-site fixture must use the qualified Chrome user agent.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(readString(plan.effectiveArgs[userAgentFlagIndex + 1]), /Chrome\/146\.0\.0\.0/);
+		// Every fixed affected-site fixture must omit the problematic headless brand.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.doesNotMatch(readString(plan.effectiveArgs[userAgentFlagIndex + 1]), /HeadlessChrome/);
 	}
 
 	const cloudflarePlan = buildExecutionPlan(["open", "https://dash.cloudflare.com"], {
@@ -1766,41 +2357,68 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 		sessionMode: "auto",
 	});
 	assert.equal(cloudflareFollowup.compatibilityWorkaround?.id, "cloudflare-headless-user-agent");
-	assert.equal(cloudflareFollowup.effectiveArgs.filter((token) => token === "--user-agent").length, 0);
+	assert.equal(
+		cloudflareFollowup.effectiveArgs.filter((token) => token === "--user-agent").length,
+		0,
+	);
 
-	const explicitCloudflareFollowup = buildExecutionPlan(["--session", "piab-demo-123", "snapshot", "-i"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
-	assert.equal(explicitCloudflareFollowup.compatibilityWorkaround?.id, "cloudflare-headless-user-agent");
-	assert.equal(explicitCloudflareFollowup.effectiveArgs.filter((token) => token === "--user-agent").length, 0);
+	const explicitCloudflareFollowup = buildExecutionPlan(
+		["--session", "piab-demo-123", "snapshot", "-i"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
+	assert.equal(
+		explicitCloudflareFollowup.compatibilityWorkaround?.id,
+		"cloudflare-headless-user-agent",
+	);
+	assert.equal(
+		explicitCloudflareFollowup.effectiveArgs.filter((token) => token === "--user-agent").length,
+		0,
+	);
 
-	const explicitUserAgentFollowup = buildExecutionPlan(["--session", "piab-demo-123", "--user-agent", "Custom/1", "snapshot", "-i"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const explicitUserAgentFollowup = buildExecutionPlan(
+		["--session", "piab-demo-123", "--user-agent", "Custom/1", "snapshot", "-i"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(explicitUserAgentFollowup.compatibilityWorkaround, undefined);
-	assert.match(explicitUserAgentFollowup.validationError ?? "", /launch-scoped flags.*--user-agent/i);
+	assert.match(
+		explicitUserAgentFollowup.validationError ?? "",
+		/launch-scoped flags.*--user-agent/i,
+	);
 	assert.deepEqual(explicitUserAgentFollowup.recoveryHint?.exampleParams, {
 		args: ["--user-agent", "Custom/1", "snapshot", "-i"],
 		sessionMode: "fresh",
 	});
-	assert.equal(explicitUserAgentFollowup.effectiveArgs.filter((token) => token === "--user-agent").length, 1);
-	const explicitUserAgentRetry = buildExecutionPlan(explicitUserAgentFollowup.recoveryHint?.exampleArgs ?? [], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 2),
-		managedSessionActive: true,
-		managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "fresh",
-	});
+	assert.equal(
+		explicitUserAgentFollowup.effectiveArgs.filter((token) => token === "--user-agent").length,
+		1,
+	);
+	const explicitUserAgentRetry = buildExecutionPlan(
+		readArray(readRecord(explicitUserAgentFollowup.recoveryHint).exampleArgs).map(readString),
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 2),
+			managedSessionActive: true,
+			managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "fresh",
+		},
+	);
 	assert.equal(explicitUserAgentRetry.validationError, undefined);
-	assert.equal(explicitUserAgentRetry.managedSessionName, createFreshSessionName("piab-demo-123", "seed", 2));
+	assert.equal(
+		explicitUserAgentRetry.managedSessionName,
+		createFreshSessionName("piab-demo-123", "seed", 2),
+	);
 
 	const compatibilityUpgrade = buildExecutionPlan(["open", "https://dash.cloudflare.com"], {
 		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
@@ -1808,26 +2426,35 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 		managedSessionName: "piab-demo-123",
 		sessionMode: "auto",
 	});
-	assert.match(compatibilityUpgrade.validationError ?? "", /fresh.*compatibility user agent|compatibility user agent.*fresh/i);
+	assert.match(
+		compatibilityUpgrade.validationError ?? "",
+		/fresh.*compatibility user agent|compatibility user agent.*fresh/i,
+	);
 	assert.equal(compatibilityUpgrade.compatibilityWorkaround, undefined);
 	assert.equal(compatibilityUpgrade.effectiveArgs.includes("--user-agent"), false);
 
-	const wrongNamespaceFollowup = buildExecutionPlan(["--namespace", "other", "--session", "piab-demo-123", "snapshot", "-i"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: true,
-		managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
-		managedSessionName: "piab-demo-123",
-		managedSessionNamespace: "team",
-		sessionMode: "auto",
-	});
+	const wrongNamespaceFollowup = buildExecutionPlan(
+		["--namespace", "other", "--session", "piab-demo-123", "snapshot", "-i"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: true,
+			managedSessionCompatibilityWorkaround: cloudflarePlan.compatibilityWorkaround,
+			managedSessionName: "piab-demo-123",
+			managedSessionNamespace: "team",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(wrongNamespaceFollowup.compatibilityWorkaround, undefined);
 
-	const rawArgsPlan = buildExecutionPlan(["--args", "--disable-gpu", "open", "https://dash.cloudflare.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const rawArgsPlan = buildExecutionPlan(
+		["--args", "--disable-gpu", "open", "https://dash.cloudflare.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(rawArgsPlan.compatibilityWorkaround, undefined);
 	assert.equal(rawArgsPlan.effectiveArgs.includes("--user-agent"), false);
 
@@ -1848,30 +2475,42 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 		},
 	);
 	assert.equal(callerProvidedUserAgentPlan.compatibilityWorkaround, undefined);
-	assert.equal(callerProvidedUserAgentPlan.effectiveArgs.filter((token) => token === "--user-agent").length, 1);
+	assert.equal(
+		callerProvidedUserAgentPlan.effectiveArgs.filter((token) => token === "--user-agent").length,
+		1,
+	);
 
-	const headedPlan = buildExecutionPlan(["--profile", "Default", "--headed", "open", "https://chatgpt.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const headedPlan = buildExecutionPlan(
+		["--profile", "Default", "--headed", "open", "https://chatgpt.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(headedPlan.compatibilityWorkaround, undefined);
 
-	const disabledAutoConnectPlan = buildExecutionPlan(["--auto-connect", "false", "open", "https://chatgpt.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const disabledAutoConnectPlan = buildExecutionPlan(
+		["--auto-connect", "false", "open", "https://chatgpt.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(disabledAutoConnectPlan.compatibilityWorkaround?.id, "chatgpt-headless-user-agent");
 
-	const enabledAutoConnectPlan = buildExecutionPlan(["--auto-connect", "open", "https://chatgpt.com"], {
-		freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-		managedSessionActive: false,
-		managedSessionName: "piab-demo-123",
-		sessionMode: "auto",
-	});
+	const enabledAutoConnectPlan = buildExecutionPlan(
+		["--auto-connect", "open", "https://chatgpt.com"],
+		{
+			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+			managedSessionActive: false,
+			managedSessionName: "piab-demo-123",
+			sessionMode: "auto",
+		},
+	);
 	assert.equal(enabledAutoConnectPlan.compatibilityWorkaround, undefined);
 
 	for (const env of [
@@ -1883,14 +2522,65 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 		{ AGENT_BROWSER_USER_AGENT: "Custom/1" },
 		{ AGENT_BROWSER_AUTO_CONNECT: "true" },
 	]) {
-		assert.equal(canUseHeadlessCompatibilityUserAgent(["open", "https://dash.cloudflare.com"], env), false);
+		// Every fixed caller launch-environment fixture must suppress wrapper compatibility defaults.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(
+			canUseHeadlessCompatibilityUserAgent(["open", "https://dash.cloudflare.com"], env),
+			false,
+		);
 	}
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--args", "--disable-gpu", "open", "https://dash.cloudflare.com"]), false);
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--engine", "chrome", "open", "https://dash.cloudflare.com"], { AGENT_BROWSER_ENGINE: "lightpanda" }), true);
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--headed", "false", "open", "https://dash.cloudflare.com"], { AGENT_BROWSER_HEADED: "1" }), true);
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--auto-connect", "false", "open", "https://dash.cloudflare.com"], { AGENT_BROWSER_AUTO_CONNECT: "true" }), true);
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--engine", "chrome", "--engine", "lightpanda", "open", "https://dash.cloudflare.com"]), false);
-	assert.equal(canUseHeadlessCompatibilityUserAgent(["--engine", "lightpanda", "--engine", "chrome", "open", "https://dash.cloudflare.com"]), true);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent([
+			"--args",
+			"--disable-gpu",
+			"open",
+			"https://dash.cloudflare.com",
+		]),
+		false,
+	);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent(
+			["--engine", "chrome", "open", "https://dash.cloudflare.com"],
+			{ AGENT_BROWSER_ENGINE: "lightpanda" },
+		),
+		true,
+	);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent(
+			["--headed", "false", "open", "https://dash.cloudflare.com"],
+			{ AGENT_BROWSER_HEADED: "1" },
+		),
+		true,
+	);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent(
+			["--auto-connect", "false", "open", "https://dash.cloudflare.com"],
+			{ AGENT_BROWSER_AUTO_CONNECT: "true" },
+		),
+		true,
+	);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent([
+			"--engine",
+			"chrome",
+			"--engine",
+			"lightpanda",
+			"open",
+			"https://dash.cloudflare.com",
+		]),
+		false,
+	);
+	assert.equal(
+		canUseHeadlessCompatibilityUserAgent([
+			"--engine",
+			"lightpanda",
+			"--engine",
+			"chrome",
+			"open",
+			"https://dash.cloudflare.com",
+		]),
+		true,
+	);
 
 	const previousEngine = process.env.AGENT_BROWSER_ENGINE;
 	const previousHeaded = process.env.AGENT_BROWSER_HEADED;
@@ -1907,56 +2597,261 @@ test("buildExecutionPlan injects and retains site-specific headless compatibilit
 
 		delete process.env.AGENT_BROWSER_ENGINE;
 		process.env.AGENT_BROWSER_HEADED = "1";
-		const explicitHeadlessPlan = buildExecutionPlan(["--headed", "false", "open", "https://dash.cloudflare.com"], {
-			freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
-			managedSessionActive: false,
-			managedSessionName: "piab-demo-123",
-			sessionMode: "auto",
-		});
-		assert.equal(explicitHeadlessPlan.compatibilityWorkaround?.id, "cloudflare-headless-user-agent");
+		const explicitHeadlessPlan = buildExecutionPlan(
+			["--headed", "false", "open", "https://dash.cloudflare.com"],
+			{
+				freshSessionName: createFreshSessionName("piab-demo-123", "seed", 1),
+				managedSessionActive: false,
+				managedSessionName: "piab-demo-123",
+				sessionMode: "auto",
+			},
+		);
+		assert.equal(
+			explicitHeadlessPlan.compatibilityWorkaround?.id,
+			"cloudflare-headless-user-agent",
+		);
 	} finally {
-		if (previousEngine === undefined) delete process.env.AGENT_BROWSER_ENGINE;
-		else process.env.AGENT_BROWSER_ENGINE = previousEngine;
-		if (previousHeaded === undefined) delete process.env.AGENT_BROWSER_HEADED;
-		else process.env.AGENT_BROWSER_HEADED = previousHeaded;
+		if (previousEngine === undefined) {
+			delete process.env.AGENT_BROWSER_ENGINE;
+		} else {
+			process.env.AGENT_BROWSER_ENGINE = previousEngine;
+		}
+		if (previousHeaded === undefined) {
+			delete process.env.AGENT_BROWSER_HEADED;
+		} else {
+			process.env.AGENT_BROWSER_HEADED = previousHeaded;
+		}
+	}
+});
+
+test("redaction preserves harmless URL spelling", () => {
+	for (const url of [
+		"https://EXAMPLE.com",
+		"HTTPS://EXAMPLE.com:443/A%2fb?q=a%20b&state=open&nonce=7#part",
+		"ws://127.0.0.1:9222",
+	]) {
+		// Every harmless URL fixture must retain exact source spelling.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(`Read ${url}`), `Read ${url}`);
+		// Every harmless URL fixture must retain exact invocation spelling.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(redactInvocationArgs(["open", url]), ["open", url]);
+		const serialized = JSON.stringify(
+			{ evidence: { prehydration: JSON.stringify({ url }) } },
+			null,
+			2,
+		);
+		// Every harmless serialized URL fixture must remain byte-preserving.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(serialized), serialized);
+		// Every harmless nested URL fixture must remain unchanged.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(redactSensitiveValue({ result: serialized }), { result: serialized });
+	}
+});
+
+test("redactSensitiveText masks plaintext lowercase password assignments", () => {
+	const text = "password=synthetic-secret-123";
+	assert.equal(redactSensitiveText(text), "password=[REDACTED]");
+	assert.deepEqual(redactSensitiveValue({ text }), { text: "password=[REDACTED]" });
+	assert.equal(
+		redactSensitiveText("Redirect /?password=synthetic-secret-123&ok=1"),
+		"Redirect /?password=[REDACTED]&ok=1",
+	);
+	assert.equal(
+		redactSensitiveText("password=synthetic-secret-123&role=admin"),
+		"password=[REDACTED]&role=admin",
+	);
+	assert.equal(
+		redactSensitiveText("password=synthetic-secret-123&token=other-secret"),
+		"password=[REDACTED]&token=[REDACTED]",
+	);
+});
+
+test("redactSensitiveText preserves nested serialized JSON through repeated redaction", () => {
+	const prehydration = {
+		url: "https://example.test/callback?authorization_session_id=private-fixture&state=flow-fixture",
+		label: 'A "quoted" value',
+		count: 2,
+		ready: true,
+		missing: null,
+	};
+	const serialized = JSON.stringify(
+		{
+			evidence: { prehydration: JSON.stringify(prehydration), apiKey: "adjacent-fixture" },
+			values: [1, false, null],
+		},
+		null,
+		2,
+	);
+	const redacted = redactSensitiveText(serialized);
+	const parsed = readRecord(JSON.parse(redacted));
+	assert.equal(typeof readRecord(parsed.evidence).prehydration, "string");
+	assert.deepEqual(JSON.parse(readString(readRecord(parsed.evidence).prehydration)), {
+		...prehydration,
+		url: "https://example.test/callback?authorization_session_id=%5BREDACTED%5D&state=%5BREDACTED%5D",
+	});
+	assert.equal(readRecord(parsed.evidence).apiKey, "[REDACTED]");
+	assert.deepEqual(parsed.values, [1, false, null]);
+	assert.doesNotMatch(redacted, /private-fixture|flow-fixture|adjacent-fixture/);
+	assert.equal(redactSensitiveText(redacted), redacted);
+	assert.deepEqual(redactSensitiveValue({ result: redacted }), { result: redacted });
+});
+
+test("redactSensitiveText redacts every serialized JSON member without dropping duplicates", () => {
+	for (const [source, expected] of [
+		[
+			'{"url":"https://example.test/callback?token=synthetic-secret","url":"https://example.test/safe"}',
+			'{"url":"https://example.test/callback?token=%5BREDACTED%5D","url":"https://example.test/safe"}',
+		],
+		[
+			'{"value":"Authorization: Bearer synthetic-secret","value":"ordinary"}',
+			'{"value":"Authorization: Bearer [REDACTED]","value":"ordinary"}',
+		],
+		[
+			'{"value":"Cookie: sid=synthetic-secret","value":"ordinary"}',
+			'{"value":"Cookie: [REDACTED]","value":"ordinary"}',
+		],
+		[
+			'{"\\u0061piKey":{"nested":"synthetic-first"},"apiKey":["synthetic-second"],"apiKey":1234,"apiKey":false,"apiKey":null,"apiKey":"synthetic-third"}',
+			'{"\\u0061piKey":"[REDACTED]","apiKey":"[REDACTED]","apiKey":"[REDACTED]","apiKey":"[REDACTED]","apiKey":"[REDACTED]","apiKey":"[REDACTED]"}',
+		],
+	]) {
+		const redacted = redactSensitiveText(source);
+		// Every fixed duplicate-key fixture must retain the independently specified redacted bytes.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redacted, expected);
+		// Every fixed duplicate-key fixture must also be redaction-idempotent.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(redacted), expected);
+		// Every fixed duplicate-key fixture must retain nested redaction behavior.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(redactSensitiveValue({ result: source }), { result: expected });
+	}
+});
+
+test("redactSensitiveText preserves serialized JSON numeric and literal source", () => {
+	const source =
+		'{\n  "url" : "https://example.test/callback?token=synthetic-secret",\n  "requestId":9007199254740993,\n  "values":[-0,1.2300e+02,"0","false","null",null,true,false],\n  "label":"\\u0041"\n}\n';
+	const harmless = source.replace("token=synthetic-secret", "view=all");
+	assert.equal(redactSensitiveText(harmless), harmless);
+	const expected = source.replace("synthetic-secret", "%5BREDACTED%5D");
+	assert.equal(redactSensitiveText(source), expected);
+	assert.equal(redactSensitiveText(expected), expected);
+	for (const value of ['"\\u0041"', '[null,true,false,9007199254740993,"0","false","null"]']) {
+		// Both fixed primitive-JSON fixtures must retain exact noncredential bytes.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(value), value);
+	}
+});
+
+test("redactSensitiveText redacts auth URL keys in serialized JSON text", () => {
+	const source = '{ "https://example.test/callback?token=synthetic-secret" : 9007199254740993 }';
+	const expected = '{ "https://example.test/callback?token=%5BREDACTED%5D" : 9007199254740993 }';
+	assert.equal(redactSensitiveText(source), expected);
+	assert.equal(redactSensitiveText(expected), expected);
+});
+
+test("redactSensitiveText masks embedded JSON secrets before plaintext URL redaction", () => {
+	const source =
+		"Payload: " +
+		JSON.stringify({
+			evidence: {
+				prehydration: JSON.stringify({
+					url: "https://example.test/callback?authorization_session_id=private-fixture&state=flow-fixture",
+				}),
+				apiKey: "adjacent-fixture",
+			},
+		});
+	const redacted = redactSensitiveText(source);
+	assert.match(redacted, /^Payload: /);
+	assert.match(redacted, /"apiKey":"\[REDACTED\]"/);
+	assert.doesNotMatch(redacted, /private-fixture|flow-fixture|adjacent-fixture/);
+	assert.equal(redactSensitiveText(redacted), redacted);
+});
+
+test("redactSensitiveText finds embedded secrets after malformed JSON prefixes", () => {
+	const value = { label: 'brackets [ { ] } and a "quoted" value', apiKey: "synthetic-secret" };
+	const source = JSON.stringify(value);
+	const expected = JSON.stringify({ ...value, apiKey: "[REDACTED]" });
+	for (const prefix of [
+		"Payload: ",
+		"Payload: [",
+		"Payload: [{]",
+		'Payload: ["unclosed ',
+		String.raw`Payload: [\"escaped `,
+	]) {
+		// Every fixed malformed-prefix fixture must still redact embedded credentials.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(prefix + source), prefix + expected);
 	}
 });
 
 test("redactInvocationArgs masks sensitive flags and auth-bearing urls", () => {
-	assert.deepEqual(redactInvocationArgs(["--headers", '{"Authorization":"Bearer demo"}', "open", "https://user:pass@example.com/path?token=abc&ok=1#access_token=xyz"]), [
-		"--headers",
-		"[REDACTED]",
-		"open",
-		"https://%5BREDACTED%5D:%5BREDACTED%5D@example.com/path?token=%5BREDACTED%5D&ok=1#access_token=%5BREDACTED%5D",
-	]);
-	assert.deepEqual(redactInvocationArgs(["open", "https://example.com/?SAMLRequest=request-secret#state=oauth-secret&nonce=oidc-secret"]), [
-		"open",
-		"https://example.com/?SAMLRequest=%5BREDACTED%5D#state=%5BREDACTED%5D&nonce=%5BREDACTED%5D",
-	]);
-	assert.deepEqual(redactInvocationArgs(["open", "https://example.com/sso?SAMLRequest=request-secret&RelayState=relay-secret&state=oauth-secret&nonce=oidc-secret&ok=1"]), [
-		"open",
-		"https://example.com/sso?SAMLRequest=%5BREDACTED%5D&RelayState=%5BREDACTED%5D&state=%5BREDACTED%5D&nonce=%5BREDACTED%5D&ok=1",
-	]);
-	assert.deepEqual(redactInvocationArgs(["open", "https://example.com/orders?state=open&nonce=7"]), [
-		"open",
-		"https://example.com/orders?state=open&nonce=7",
-	]);
-	assert.deepEqual(redactInvocationArgs(["open", "https://example.com/path?apiKey=abc&refreshToken=def&ok=1"]), [
-		"open",
-		"https://example.com/path?apiKey=%5BREDACTED%5D&refreshToken=%5BREDACTED%5D&ok=1",
-	]);
-	assert.deepEqual(redactInvocationArgs(["--proxy=http://user:pass@proxy.example:8080", "open", "https://example.com"]), [
-		"--proxy=[REDACTED]",
-		"open",
-		"https://example.com/",
-	]);
-	assert.deepEqual(redactInvocationArgs(["network", "route", "**/api", "--body", '{"token":"route-secret"}']), [
-		"network",
-		"route",
-		"**/api",
-		"--body",
-		"[REDACTED]",
-	]);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"--headers",
+			'{"Authorization":"Bearer demo"}',
+			"open",
+			"https://user:pass@example.com/path?token=abc&ok=1#access_token=xyz",
+		]),
+		[
+			"--headers",
+			"[REDACTED]",
+			"open",
+			"https://%5BREDACTED%5D:%5BREDACTED%5D@example.com/path?token=%5BREDACTED%5D&ok=1#access_token=%5BREDACTED%5D",
+		],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"open",
+			"https://example.com/?SAMLRequest=request-secret#state=oauth-secret&nonce=oidc-secret",
+		]),
+		[
+			"open",
+			"https://example.com/?SAMLRequest=%5BREDACTED%5D#state=%5BREDACTED%5D&nonce=%5BREDACTED%5D",
+		],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"open",
+			"https://example.com/sso?SAMLRequest=request-secret&RelayState=relay-secret&state=oauth-secret&nonce=oidc-secret&ok=1",
+		]),
+		[
+			"open",
+			"https://example.com/sso?SAMLRequest=%5BREDACTED%5D&RelayState=%5BREDACTED%5D&state=%5BREDACTED%5D&nonce=%5BREDACTED%5D&ok=1",
+		],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"open",
+			"https://signin.example.invalid/?client_id=EXAMPLE_CLIENT&redirect_uri=https%3A%2F%2Fexample.invalid%2Freturn&state=EXAMPLE_STATE&nonce=EXAMPLE_NONCE&Authorization%2DSession%2DId=EXAMPLE_ID",
+		]),
+		[
+			"open",
+			"https://signin.example.invalid/?client_id=EXAMPLE_CLIENT&redirect_uri=https%3A%2F%2Fexample.invalid%2Freturn&state=%5BREDACTED%5D&nonce=%5BREDACTED%5D&Authorization-Session-Id=%5BREDACTED%5D",
+		],
+	);
+	assert.deepEqual(
+		redactInvocationArgs(["open", "https://example.com/orders?state=open&nonce=7"]),
+		["open", "https://example.com/orders?state=open&nonce=7"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs(["open", "https://example.com/path?apiKey=abc&refreshToken=def&ok=1"]),
+		["open", "https://example.com/path?apiKey=%5BREDACTED%5D&refreshToken=%5BREDACTED%5D&ok=1"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"--proxy=http://user:pass@proxy.example:8080",
+			"open",
+			"https://example.com",
+		]),
+		["--proxy=[REDACTED]", "open", "https://example.com"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs(["network", "route", "**/api", "--body", '{"token":"route-secret"}']),
+		["network", "route", "**/api", "--body", "[REDACTED]"],
+	);
 	assert.deepEqual(redactInvocationArgs(["auth", "save", "demo", "--password", "secret-value"]), [
 		"auth",
 		"save",
@@ -1970,84 +2865,219 @@ test("redactInvocationArgs masks sensitive flags and auth-bearing urls", () => {
 		"demo",
 		"--password=[REDACTED]",
 	]);
-	assert.deepEqual(redactInvocationArgs(["set", "credentials", "user@example.com", "secret-value"]), [
-		"set",
-		"credentials",
-		"[REDACTED]",
-		"[REDACTED]",
+	assert.deepEqual(
+		redactInvocationArgs(["set", "credentials", "user@example.com", "secret-value"]),
+		["set", "credentials", "[REDACTED]", "[REDACTED]"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"--json",
+			"--session",
+			"demo",
+			"cookies",
+			"set",
+			"sid",
+			"cookie-secret",
+			"--url",
+			"https://example.com",
+		]),
+		[
+			"--json",
+			"--session",
+			"demo",
+			"cookies",
+			"set",
+			"sid",
+			"[REDACTED]",
+			"--url",
+			"https://example.com",
+		],
+	);
+	for (const args of [
+		["cookies", "set", "--curl", "/tmp/cookies.txt"],
+		["--json", "--session", "demo", "cookies", "set", "--curl", "/tmp/cookie file.txt"],
+		["cookies", "set", "--domain", "example.test", "--curl", "/tmp/cookies.txt"],
+		["cookies", "set", "unused", "ignored", "--curl", "/tmp/cookies.txt"],
+		["batch", "cookies set --curl '/tmp/cookie file.txt'"],
+	]) {
+		// Every fixed curl-cookie path fixture must remain a usable native file operand.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(redactInvocationArgs(args), args);
+	}
+	assert.deepEqual(
+		redactInvocationArgs(["--session", "--curl", "cookies", "set", "sid", "cookie-secret"]),
+		["--session", "--curl", "cookies", "set", "sid", "[REDACTED]"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"cookies",
+			"set",
+			"--curl",
+			"/tmp/cookies.txt",
+			"--headers",
+			'{"Authorization":"Bearer cookie-secret"}',
+		]),
+		["cookies", "set", "--curl", "/tmp/cookies.txt", "--headers", "[REDACTED]"],
+	);
+	assert.deepEqual(redactInvocationArgs(["batch", "cookies set sid cookie-secret"]), [
+		"batch",
+		"'cookies' 'set' 'sid' '[REDACTED]'",
 	]);
-	assert.deepEqual(redactInvocationArgs(["--json", "--session", "demo", "cookies", "set", "sid", "cookie-secret", "--url", "https://example.com"]), [
-		"--json",
-		"--session",
-		"demo",
-		"cookies",
-		"set",
-		"sid",
-		"[REDACTED]",
-		"--url",
-		"https://example.com/",
-	]);
-	assert.deepEqual(redactInvocationArgs(["storage", "local", "set", "authToken", "storage-secret"]), [
-		"storage",
-		"local",
-		"set",
-		"authToken",
-		"[REDACTED]",
-	]);
-	assert.deepEqual(redactInvocationArgs(["--json", "--session", "demo", "clipboard", "write", "clipboard-secret", "extra-secret"]), [
-		"--json",
-		"--session",
-		"demo",
-		"clipboard",
-		"write",
-		"[REDACTED]",
-		"[REDACTED]",
-	]);
+	assert.deepEqual(
+		redactInvocationArgs(["storage", "local", "set", "authToken", "storage-secret"]),
+		["storage", "local", "set", "authToken", "[REDACTED]"],
+	);
+	assert.deepEqual(
+		redactInvocationArgs([
+			"--json",
+			"--session",
+			"demo",
+			"clipboard",
+			"write",
+			"clipboard-secret",
+			"extra-secret",
+		]),
+		["--json", "--session", "demo", "clipboard", "write", "[REDACTED]", "[REDACTED]"],
+	);
 	assert.deepEqual(redactInvocationArgs(["chat", "Summarize Authorization: Bearer chat-secret"]), [
 		"chat",
 		"Summarize Authorization: Bearer [REDACTED]",
 	]);
 });
 
-test("redactSensitiveText preserves help placeholders while redacting bearer credentials", () => {
+test("redactSensitiveText redacts bearer tokens before Windows path separators", () => {
+	const path = String.raw`C:\fixture\Bearer directory-secret\out.png`;
+	const redacted = String.raw`C:\fixture\Bearer [REDACTED]\out.png`;
+	assert.equal(redactSensitiveText(path), redacted);
+	assert.equal(redactSensitiveText(JSON.stringify({ path })), JSON.stringify({ path: redacted }));
+	assert.equal(redactSensitiveText(`mkdir '${path}'`), `mkdir '${redacted}'`);
+});
+
+test("redactSensitiveText preserves bearer prose while redacting credential contexts", () => {
+	for (const text of [
+		"The endpoint requires a bearer token.",
+		"Bearer authentication uses an access token.",
+		"Do not log bearer tokens or bearer credentials.",
+		"The phrase “bearer token.” is public.",
+		"Description: Bearer authentication uses an access token.",
+		"Authorization bearer tokens are credentials.",
+		"Bearer <code>token</code>",
+		"Bearer https://docs.example/guide",
+		"Use `bearer token.` or **bearer authentication.** as technical terms.",
+	]) {
+		// Every fixed public bearer-description fixture must remain unredacted.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(redactSensitiveText(text), text);
+	}
 	assert.equal(
-		redactSensitiveText('Headers help: --headers <json> (e.g., Authorization bearer token)'),
-		'Headers help: --headers <json> (e.g., Authorization bearer token)',
+		redactSensitiveText("Headers help: --headers <json> (e.g., Authorization bearer token)"),
+		"Headers help: --headers <json> (e.g., Authorization bearer token)",
 	);
-	assert.equal(redactSensitiveText("Error: Authorization: Bearer raw-token)"), "Error: Authorization: Bearer [REDACTED])");
-	assert.equal(redactSensitiveText("Authorization bearer raw-token."), "Authorization bearer [REDACTED].");
-	assert.equal(redactSensitiveText("Authorization bearer secrettoken"), "Authorization bearer [REDACTED]");
-	assert.equal(redactSensitiveText("Authorization bearer token,"), "Authorization bearer [REDACTED],");
+	assert.equal(
+		redactSensitiveText("Error: Authorization: Bearer raw-token)"),
+		"Error: Authorization: Bearer [REDACTED])",
+	);
+	assert.equal(
+		redactSensitiveText("Authorization bearer raw-token."),
+		"Authorization bearer [REDACTED].",
+	);
+	assert.equal(
+		redactSensitiveText("Authorization bearer secrettoken"),
+		"Authorization bearer secrettoken",
+	);
+	assert.equal(redactSensitiveText("Authorization bearer token,"), "Authorization bearer token,");
 	assert.equal(redactSensitiveText("curl -H 'Bearer secrettoken'"), "curl -H 'Bearer [REDACTED]'");
 	assert.equal(redactSensitiveText("curl -H 'Bearer abc123'"), "curl -H 'Bearer [REDACTED]'");
 	assert.equal(redactSensitiveText("curl -H 'Bearer token.'"), "curl -H 'Bearer [REDACTED].'");
+	const proxyHeader = redactSensitiveText("Proxy-Authorization: Bearer token");
+	assert.match(proxyHeader, /^Proxy-Authorization:.*\[REDACTED\]$/);
+	assert.doesNotMatch(proxyHeader, /\btoken\b/);
 	assert.equal(
-		redactSensitiveText("OPENAI_API_KEY=openai-secret AWS_SECRET_ACCESS_KEY: aws-secret export STRIPE_SECRET_KEY='stripe-secret' PRIVATE_KEY=-----BEGIN_PRIVATE_KEY----- X-Private-Key: prose-header-secret private-key=prose-key API-KEY=prose-api Secret-Key: prose-secret apiKey=camel-api privateKey: camel-private connectionString=camel-connection databaseUrl: camel-db mongodbUri=mongodb://user:pass@example/db MONGODB_URI=mongodb://user:pass@example/db failedChecks=true"),
+		redactSensitiveText("curl --header='Bearer token'"),
+		"curl --header='Bearer [REDACTED]'",
+	);
+	for (const text of [
+		"Authorization: 'Bearer canary'",
+		"Authorization=Bearer canary",
+		"X-Api-Key: Bearer canary",
+	]) {
+		const redacted = redactSensitiveText(text);
+		// Every fixed authorization-header fixture must replace its credential.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(redacted, /\[REDACTED\]/);
+		// Every fixed authorization-header fixture must remove its independent canary.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.doesNotMatch(redacted, /canary/);
+	}
+	assert.equal(
+		redactSensitiveText("Observed Bearer mF_9.B5f-4.1JqM."),
+		"Observed Bearer [REDACTED].",
+	);
+	assert.deepEqual(
+		redactSensitiveValue({
+			Authorization: "Bearer token",
+			"Proxy-Authorization": "Bearer credentials",
+		}),
+		{ Authorization: "[REDACTED]", "Proxy-Authorization": "[REDACTED]" },
+	);
+	assert.equal(
+		redactSensitiveText(
+			"OPENAI_API_KEY=openai-secret AWS_SECRET_ACCESS_KEY: aws-secret export STRIPE_SECRET_KEY='stripe-secret' PRIVATE_KEY=-----BEGIN_PRIVATE_KEY----- X-Private-Key: prose-header-secret private-key=prose-key API-KEY=prose-api Secret-Key: prose-secret apiKey=camel-api privateKey: camel-private connectionString=camel-connection databaseUrl: camel-db mongodbUri=mongodb://user:pass@example/db MONGODB_URI=mongodb://user:pass@example/db failedChecks=true",
+		),
 		"OPENAI_API_KEY=[REDACTED] AWS_SECRET_ACCESS_KEY: [REDACTED] export STRIPE_SECRET_KEY=[REDACTED] PRIVATE_KEY=[REDACTED] X-Private-Key: [REDACTED] private-key=[REDACTED] API-KEY=[REDACTED] Secret-Key: [REDACTED] apiKey=[REDACTED] privateKey: [REDACTED] connectionString=[REDACTED] databaseUrl: [REDACTED] mongodbUri=[REDACTED] MONGODB_URI=[REDACTED] failedChecks=true",
 	);
+	for (const prefix of ["API_KEY=", "X-Api-Key: "]) {
+		// Both fixed secret-field spellings must redact their JSON-shaped assignment.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(
+			redactSensitiveText(`${prefix}{"value":"assignment-fixture"} status=ok`),
+			`${prefix}[REDACTED] status=ok`,
+		);
+	}
 	assert.equal(
-		redactSensitiveText("Redirect /sso?SAMLRequest=request-secret&SAMLResponse=response-secret&RelayState=relay-secret#state=oauth-secret&nonce=oidc-secret"),
+		redactSensitiveText(
+			"Redirect /sso?SAMLRequest=request-secret&SAMLResponse=response-secret&RelayState=relay-secret#state=oauth-secret&nonce=oidc-secret",
+		),
 		"Redirect /sso?SAMLRequest=[REDACTED]&SAMLResponse=[REDACTED]&RelayState=[REDACTED]#state=[REDACTED]&nonce=[REDACTED]",
 	);
-	assert.equal(redactSensitiveText("Login help. Status /orders?state=open&nonce=7"), "Login help. Status /orders?state=open&nonce=7");
 	assert.equal(
-		redactSensitiveText("Redirect /?SAMLRequest=request-secret#state=oauth-secret then /orders?state=open"),
+		redactSensitiveText(
+			"Redirect /?authorizationSessionId=EXAMPLE_ID&state=EXAMPLE_STATE#nonce=EXAMPLE_NONCE&view=table",
+		),
+		"Redirect /?authorizationSessionId=[REDACTED]&state=[REDACTED]#nonce=[REDACTED]&view=table",
+	);
+	assert.equal(
+		redactSensitiveText("Login help. Status /orders?state=open&nonce=7"),
+		"Login help. Status /orders?state=open&nonce=7",
+	);
+	assert.equal(
+		redactSensitiveText(
+			"Redirect /?SAMLRequest=request-secret#state=oauth-secret then /orders?state=open",
+		),
 		"Redirect /?SAMLRequest=[REDACTED]#state=[REDACTED] then /orders?state=open",
 	);
 	assert.equal(
-		redactSensitiveText("https://o914390.ingest.sentry.io/api/envelope/?sentry_key=sentry-secret&writeKey=write-secret&ok=1"),
+		redactSensitiveText(
+			"https://o914390.ingest.sentry.io/api/envelope/?sentry_key=sentry-secret&writeKey=write-secret&ok=1",
+		),
 		"https://o914390.ingest.sentry.io/api/envelope/?sentry_key=%5BREDACTED%5D&writeKey=%5BREDACTED%5D&ok=1",
 	);
 	assert.equal(
-		redactSensitiveText("https://example.com/?private_key=url-private-secret&connection_string=db-secret&mongo_uri=mongo-secret&redis_url=redis-secret&database_url=database-secret&ok=1"),
+		redactSensitiveText(
+			"https://example.com/?private_key=url-private-secret&connection_string=db-secret&mongo_uri=mongo-secret&redis_url=redis-secret&database_url=database-secret&ok=1",
+		),
 		"https://example.com/?private_key=%5BREDACTED%5D&connection_string=%5BREDACTED%5D&mongo_uri=%5BREDACTED%5D&redis_url=%5BREDACTED%5D&database_url=%5BREDACTED%5D&ok=1",
 	);
 	assert.equal(
-		redactSensitiveText("Error mongodb://user:pass@example/db and mongodb+srv://srv-user:srv-pass@example/db and redis://redis-user:redis-pass@example/0"),
+		redactSensitiveText(
+			"Error mongodb://user:pass@example/db and mongodb+srv://srv-user:srv-pass@example/db and redis://redis-user:redis-pass@example/0",
+		),
 		"Error mongodb://%5BREDACTED%5D:%5BREDACTED%5D@example/db and mongodb+srv://%5BREDACTED%5D:%5BREDACTED%5D@example/db and redis://%5BREDACTED%5D:%5BREDACTED%5D@example/0",
 	);
 	assert.equal(
-		redactSensitiveText("Error mongodb://user:pa)ss@example/db?token=secret&ok=1 mongodb://user:p]ss@example/db?private_key=secret&ok=1 mongodb://user:p>ss@example/db#access_token=secret&ok=1"),
+		redactSensitiveText(
+			"Error mongodb://user:pa)ss@example/db?token=secret&ok=1 mongodb://user:p]ss@example/db?private_key=secret&ok=1 mongodb://user:p>ss@example/db#access_token=secret&ok=1",
+		),
 		"Error mongodb://[REDACTED]:[REDACTED]@example/db?token=[REDACTED]&ok=1 mongodb://[REDACTED]:[REDACTED]@example/db?private_key=[REDACTED]&ok=1 mongodb://[REDACTED]:[REDACTED]@example/db#access_token=[REDACTED]&ok=1",
 	);
 	assert.equal(
@@ -2060,11 +3090,47 @@ test("redactSensitiveText scans long tokens without blocking the host", () => {
 	const input = "A".repeat(200_000);
 	const startedAt = Date.now();
 	assert.equal(redactSensitiveText(input), input);
-	assert.ok(Date.now() - startedAt < 1_000, "redacting a 200k token should finish in under one second");
+	assert.ok(
+		Date.now() - startedAt < 1_000,
+		"redacting a 200k token should finish in under one second",
+	);
+});
+
+test("redactSensitiveText does not rescan unmatched JSON prefixes", () => {
+	// A separate process makes the watchdog effective even if redaction blocks the event loop.
+	const probe = spawnSync(
+		process.execPath,
+		[
+			"--import",
+			"tsx",
+			"--input-type=module",
+			"-e",
+			`
+		import assert from "node:assert/strict";
+		import { redactSensitiveText } from ${JSON.stringify(new URL("../extensions/agent-browser/lib/runtime.ts", import.meta.url).href)};
+		for (const input of [
+			"[".repeat(64_000),
+			"[".repeat(64_000) + "]",
+			'{\\\\"'.repeat(32_000),
+			'["' + '[\\\\"'.repeat(64_000) + '"' + "x".repeat(64_000),
+		]) assert.equal(redactSensitiveText(input), input);
+	`,
+		],
+		{ encoding: "utf8", timeout: 5_000 },
+	);
+	assert.equal(
+		probe.error,
+		undefined,
+		`redaction did not finish: ${probe.error?.message ?? "none"}`,
+	);
+	assert.equal(probe.status, 0, probe.stderr);
 });
 
 test("redactSensitiveValue masks obvious secret-bearing object keys", () => {
-	assert.deepEqual(redactSensitiveValue({ state: "ready", nonceCount: 3 }), { state: "ready", nonceCount: 3 });
+	assert.deepEqual(redactSensitiveValue({ state: "ready", nonceCount: 3 }), {
+		state: "ready",
+		nonceCount: 3,
+	});
 	assert.deepEqual(
 		redactSensitiveValue({
 			apiKey: "abc",
@@ -2112,4 +3178,3 @@ test("redactSensitiveValue masks obvious secret-bearing object keys", () => {
 		},
 	);
 });
-

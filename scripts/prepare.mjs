@@ -7,15 +7,15 @@
  */
 
 import { execFile as execFileCallback } from "node:child_process";
-import { createRequire } from "node:module";
+import { existsSync } from "node:fs";
 import { basename, join } from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
 
 const execFile = promisify(execFileCallback);
-const require = createRequire(import.meta.url);
 const REQUIRED_SOURCE_BUILD_MODULES = [
 	"typescript",
+	"esbuild",
 	"typebox",
 	"@earendil-works/pi-coding-agent",
 	"@earendil-works/pi-tui",
@@ -24,8 +24,7 @@ const REQUIRED_SOURCE_BUILD_MODULES = [
 function canResolveBuildDependencies() {
 	return REQUIRED_SOURCE_BUILD_MODULES.every((moduleName) => {
 		try {
-			require.resolve(moduleName);
-			return true;
+			return existsSync(new URL(import.meta.resolve(moduleName)));
 		} catch {
 			return false;
 		}
@@ -33,19 +32,29 @@ function canResolveBuildDependencies() {
 }
 
 async function runNpmInstallDevDependencies() {
-	const packageManager = /^bun(?:\.exe)?$/iu.test(basename(process.env.npm_execpath ?? "")) ? "bun" : "npm";
-	const args = packageManager === "bun"
-		? ["install", "--ignore-scripts"]
-		: ["install", "--include=dev", "--ignore-scripts"];
+	const npmExecPath = process.env.npm_execpath;
 	const options = process.platform === "win32" ? { shell: true } : {};
-	let socketFirewallAvailable = false;
-	try {
-		await execFile("sfw", ["--version"], options);
-		socketFirewallAvailable = true;
-	} catch (error) {
-		if (error.code !== "ENOENT") throw error;
+	if (/^bun(?:\.exe)?$/iu.test(basename(npmExecPath ?? ""))) {
+		await execFile("sfw", ["--", "bun", "install", "--ignore-scripts"], {
+			...options,
+			cwd: process.cwd(),
+			maxBuffer: 20 * 1024 * 1024,
+		});
+		return;
 	}
-	await execFile(socketFirewallAvailable ? "sfw" : packageManager, socketFirewallAvailable ? ["--", packageManager, ...args] : args, {
+	if (npmExecPath) {
+		await execFile(
+			process.execPath,
+			[npmExecPath, "install", "--include=dev", "--ignore-scripts"],
+			{
+				...options,
+				cwd: process.cwd(),
+				maxBuffer: 20 * 1024 * 1024,
+			},
+		);
+		return;
+	}
+	await execFile("npm", ["install", "--include=dev", "--ignore-scripts"], {
 		...options,
 		cwd: process.cwd(),
 		maxBuffer: 20 * 1024 * 1024,
@@ -63,8 +72,12 @@ async function main() {
 }
 
 main().catch((error) => {
-	if (error?.stdout) process.stdout.write(error.stdout);
-	if (error?.stderr) process.stderr.write(error.stderr);
+	if (error?.stdout) {
+		process.stdout.write(error.stdout);
+	}
+	if (error?.stderr) {
+		process.stderr.write(error.stderr);
+	}
 	console.error(error instanceof Error ? error.message : String(error));
 	process.exitCode = 1;
 });

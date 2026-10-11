@@ -1,31 +1,48 @@
 import { isRecord } from "../parsing.js";
 
 export type AgentBrowserInputNormalization = {
-	code: "role-value-as-name" | "text-as-target";
-	path: "semanticAction" | `job.steps[${number}]`;
+	readonly code: "role-value-as-name" | "text-as-target";
+	readonly path: "semanticAction";
 };
 
-function normalizeAction(input: unknown, path: AgentBrowserInputNormalization["path"]): { input: unknown; normalizations: AgentBrowserInputNormalization[] } {
-	if (!isRecord(input)) return { input, normalizations: [] };
+function hasRoleValueName(normalized: Readonly<Record<string, unknown>>): boolean {
+	return (
+		normalized.locator === "role" &&
+		typeof normalized.role === "string" &&
+		typeof normalized.value === "string" &&
+		normalized.value !== normalized.role &&
+		normalized.name === undefined
+	);
+}
+
+function hasTextTarget(normalized: Readonly<Record<string, unknown>>): boolean {
+	return (
+		(normalized.action === "click" || normalized.action === "check") &&
+		typeof normalized.text === "string" &&
+		normalized.value === undefined
+	);
+}
+
+function normalizeAction(
+	input: unknown,
+	path: AgentBrowserInputNormalization["path"],
+): { input: unknown; normalizations: AgentBrowserInputNormalization[] } {
+	if (!isRecord(input)) {
+		return { input, normalizations: [] };
+	}
 	const normalized = { ...input };
 	const normalizations: AgentBrowserInputNormalization[] = [];
-	if (
-		normalized.locator === "role"
-		&& typeof normalized.role === "string"
-		&& typeof normalized.value === "string"
-		&& normalized.value !== normalized.role
-		&& normalized.name === undefined
-	) {
+	if (hasRoleValueName(normalized)) {
 		normalized.name = normalized.value;
 		normalized.value = normalized.role;
 		normalizations.push({ code: "role-value-as-name", path });
 	}
-	if (
-		(normalized.action === "click" || normalized.action === "check")
-		&& typeof normalized.text === "string"
-		&& normalized.value === undefined
-	) {
-		if (normalized.locator === "role" && typeof normalized.role === "string" && normalized.name === undefined) {
+	if (hasTextTarget(normalized)) {
+		if (
+			normalized.locator === "role" &&
+			typeof normalized.role === "string" &&
+			normalized.name === undefined
+		) {
 			normalized.name = normalized.text;
 		} else {
 			normalized.locator ??= "text";
@@ -37,21 +54,12 @@ function normalizeAction(input: unknown, path: AgentBrowserInputNormalization["p
 	return { input: normalized, normalizations };
 }
 
-export function normalizeAgentBrowserStructuredInputs(params: { job?: unknown; semanticAction?: unknown }): {
-	job?: unknown;
-	normalizations: AgentBrowserInputNormalization[];
-	semanticAction?: unknown;
+export function normalizeAgentBrowserStructuredInputs(params: {
+	readonly semanticAction?: unknown;
+}): {
+	readonly normalizations: readonly AgentBrowserInputNormalization[];
+	readonly semanticAction: unknown;
 } {
 	const semantic = normalizeAction(params.semanticAction, "semanticAction");
-	const normalizations = [...semantic.normalizations];
-	let job = params.job;
-	if (isRecord(job) && Array.isArray(job.steps)) {
-		const steps = job.steps.map((step, index) => {
-			const normalized = normalizeAction(step, `job.steps[${index}]`);
-			normalizations.push(...normalized.normalizations);
-			return normalized.input;
-		});
-		job = { ...job, steps };
-	}
-	return { job, normalizations, semanticAction: semantic.input };
+	return { normalizations: semantic.normalizations, semanticAction: semantic.input };
 }

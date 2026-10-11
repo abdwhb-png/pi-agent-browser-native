@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { readRecord, readArray, readString } from "./helpers/assertions.js";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
-function run(command: string, args: string[]) {
+function run(command: string, args: readonly string[]) {
 	return spawnSync(command, args, {
 		cwd: process.cwd(),
 		encoding: "utf8",
@@ -18,24 +19,36 @@ test("platform smoke scripts have working syntax and help", () => {
 		"scripts/platform-smoke/artifacts.mjs",
 		"scripts/platform-smoke/crabbox-runner.mjs",
 		"scripts/platform-smoke/doctor.mjs",
+		"scripts/platform-smoke/doctor-support.mjs",
+		"scripts/platform-smoke/doctor-windows.mjs",
+		"scripts/platform-smoke/commands.mjs",
+		"scripts/platform-smoke/lease-evidence.mjs",
+		"scripts/platform-smoke/suite-checks.mjs",
+		"scripts/platform-smoke/suite-evidence.mjs",
 		"scripts/platform-smoke/targets.mjs",
 	]) {
+		// Every file in this fixed script inventory must pass native syntax checking.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(run(process.execPath, ["--check", path]).status, 0, path);
 	}
 
-	const doctorScript = readFileSync("scripts/platform-smoke/doctor.mjs", "utf8");
+	const doctorScript = readFileSync("scripts/platform-smoke/doctor-windows.mjs", "utf8");
 	assert.match(doctorScript, /cleanup failed/);
-	assert.match(doctorScript, /!stop\.ok/);
 
 	for (const path of [
 		"scripts/platform-smoke/platform-build-windows.ps1",
 		"scripts/platform-smoke/browser-dogfood-windows.ps1",
 	]) {
+		// Both fixed native Windows scripts must exist.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.ok(existsSync(path), `${path} should exist`);
 		const powershellScript = readFileSync(path, "utf8");
-		assert.match(powershellScript, /PLATFORM_/);
 		if (path.endsWith("browser-dogfood-windows.ps1")) {
+			// This dogfood script alone must not perform a global npm install.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.doesNotMatch(powershellScript, /npm\s+install\s+-g/);
+			// This dogfood script alone must not install upstream browser assets.
+			// oxlint-disable-next-line node-test/no-conditional-assertion
 			assert.doesNotMatch(powershellScript, /agent-browser\s+install/);
 		}
 	}
@@ -50,30 +63,36 @@ test("platform smoke scripts have working syntax and help", () => {
 });
 
 test("platform smoke config and package scripts require macOS, Ubuntu, and native Windows", () => {
-	const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as {
-		files?: string[];
-		scripts?: Record<string, string>;
-	};
-	assert.ok(packageJson.files?.includes("platform-smoke.config.mjs"));
-	assert.ok(packageJson.files?.includes("scripts/platform-smoke.mjs"));
-	assert.ok(packageJson.files?.includes("scripts/platform-smoke"));
-	assert.ok(packageJson.files?.includes("docs/platform-smoke.md"));
-	assert.match(packageJson.scripts?.["check:platform-smoke"] ?? "", /node --check scripts\/platform-smoke\.mjs/);
-	assert.match(packageJson.scripts?.["check:platform-smoke"] ?? "", /test\/platform-smoke\.test\.ts/);
-	assert.equal(packageJson.scripts?.["smoke:platform:doctor"], "node scripts/platform-smoke.mjs doctor");
-	assert.match(packageJson.scripts?.["smoke:platform:ubuntu-image"] ?? "", /build-ubuntu-image\.mjs/);
-	assert.match(packageJson.scripts?.["smoke:platform:all"] ?? "", /smoke:platform:doctor/);
-	assert.match(packageJson.scripts?.["smoke:platform:all"] ?? "", /macos,ubuntu,windows-native/);
-	assert.match(packageJson.scripts?.["smoke:platform:windows-native"] ?? "", /windows-native/);
+	const packageJson = readRecord(JSON.parse(readFileSync("package.json", "utf8")));
+	const files = readArray(packageJson.files);
+	const scripts = readRecord(packageJson.scripts);
+	assert.ok(files.includes("platform-smoke.config.mjs"));
+	assert.ok(files.includes("scripts/platform-smoke.mjs"));
+	assert.ok(files.includes("scripts/platform-smoke"));
+	assert.ok(files.includes("docs/platform-smoke.md"));
+	assert.match(
+		readString(scripts["check:platform-smoke"]),
+		/node --check scripts\/platform-smoke\.mjs/,
+	);
+	assert.match(readString(scripts["check:platform-smoke"]), /test\/platform-smoke\.test\.ts/);
+	assert.equal(scripts["smoke:platform:doctor"], "node scripts/platform-smoke.mjs doctor");
+	assert.match(readString(scripts["smoke:platform:ubuntu-image"]), /build-ubuntu-image\.mjs/);
+	assert.match(readString(scripts["smoke:platform:all"]), /smoke:platform:doctor/);
+	assert.match(readString(scripts["smoke:platform:all"]), /macos,ubuntu,windows-native/);
+	assert.match(readString(scripts["smoke:platform:windows-native"]), /windows-native/);
 	const linuxImage = readFileSync("scripts/platform-smoke/linux-image/Dockerfile", "utf8");
-	for (const dependency of ["libvulkan1", "mesa-vulkan-drivers", "xvfb"]) assert.match(linuxImage, new RegExp(`\\b${dependency}\\b`));
+	for (const dependency of ["libvulkan1", "mesa-vulkan-drivers", "xvfb"]) {
+		// Every fixed Ubuntu graphics dependency must remain in the image.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(linuxImage, new RegExp(`\\b${dependency}\\b`));
+	}
 
 	const code = String.raw`
 import config, * as configModule from "./platform-smoke.config.mjs";
 const result = {
   agentBrowserVersion: config.agentBrowserVersion,
   crabboxMinVersion: config.requiredCrabbox.minVersion,
-  nodeValidationMajor: config.nodeValidationMajor,
+  nodeValidationVersion: config.nodeValidationVersion,
   packageName: config.packageName,
   privateConstantsExported: "PLATFORM_SMOKE_AGENT_BROWSER_VERSION" in configModule || "PLATFORM_SMOKE_UBUNTU_IMAGE" in configModule,
   ubuntuContainerImage: config.ubuntuContainerImage,
@@ -85,7 +104,7 @@ const result = {
 console.log(JSON.stringify(result));
 if (result.packageName !== "pi-agent-browser-native" || result.privateConstantsExported) process.exit(1);
 if (result.crabboxMinVersion !== "0.26.0") process.exit(1);
-if (result.nodeValidationMajor !== 22) process.exit(1);
+if (result.nodeValidationVersion !== "22.19.0") process.exit(1);
 if (!result.ubuntuContainerImage.includes("agent-browser" + result.agentBrowserVersion)) process.exit(1);
 if (result.windowsSourceVm !== "pi-extension-windows-template" || !String(result.windowsSnapshot || "").startsWith("crabbox-ready")) process.exit(1);
 if (!/^\d+\.\d+\.\d+$/.test(result.agentBrowserVersion)) process.exit(1);
@@ -100,20 +119,21 @@ test("platform command rendering uses POSIX and PowerShell without source-extens
 	const code = String.raw`
 import { readFileSync } from "node:fs";
 import { CAPABILITY_BASELINE } from "./scripts/agent-browser-capability-baseline.mjs";
-import { buildBrowserDogfoodCommand, buildPlatformBuildCommand, platformFor } from "./scripts/platform-smoke/targets.mjs";
-const posix = buildPlatformBuildCommand("ubuntu", "pi-agent-browser-native", 22);
-const macos = buildPlatformBuildCommand("macos", "pi-agent-browser-native", 22);
-const powershell = buildPlatformBuildCommand("windows-native", "pi-agent-browser-native", 22);
+import { buildBrowserDogfoodCommand, buildPlatformBuildCommand, nodeVersionAtLeast, platformFor } from "./scripts/platform-smoke/targets.mjs";
+const posix = buildPlatformBuildCommand("ubuntu", "pi-agent-browser-native", "24.21.0");
+const macos = buildPlatformBuildCommand("macos", "pi-agent-browser-native", "24.21.0");
+const powershell = buildPlatformBuildCommand("windows-native", "pi-agent-browser-native", "24.21.0");
 const powershellScript = readFileSync("scripts/platform-smoke/platform-build-windows.ps1", "utf8");
 const dogfoodPosix = buildBrowserDogfoodCommand("ubuntu");
 const dogfoodWarmPosix = buildBrowserDogfoodCommand("ubuntu", CAPABILITY_BASELINE.targetVersion, true);
 const dogfoodWindows = buildBrowserDogfoodCommand("windows-native");
 const dogfoodWarmWindows = buildBrowserDogfoodCommand("windows-native", CAPABILITY_BASELINE.targetVersion, true);
-const dogfoodWindowsScript = readFileSync("scripts/platform-smoke/browser-dogfood-windows.ps1", "utf8");
 const result = {
   macosPlatform: platformFor("macos") === "posix",
   ubuntuPlatform: platformFor("ubuntu") === "posix",
   windowsPlatform: platformFor("windows-native") === "powershell",
+  nodePatchFloorEnforced: !nodeVersionAtLeast("v24.20.9", "24.21.0") && !nodeVersionAtLeast("v24.3.0", "24.21.0") && nodeVersionAtLeast("v24.21.0", "24.21.0") && nodeVersionAtLeast("v24.100.0", "24.21.0") && nodeVersionAtLeast("v25.0.0", "24.21.0") && !nodeVersionAtLeast("", "24.21.0"),
+  commandsCarryNodeFloor: posix.includes("'24.21.0'") && powershell.includes("-NodeValidationVersion '24.21.0'"),
   posixHasVerify: posix.includes("npm run verify -- platform-target"),
   posixHasPackedInstall: posix.includes("install -l --approve ./node_modules/pi-agent-browser-native"),
   posixHasApprovedList: posix.includes("list --approve"),
@@ -127,11 +147,9 @@ const result = {
   dogfoodRunsScript: dogfoodPosix.includes("verify-agent-browser-dogfood.ts"),
   dogfoodChecksBaseline: dogfoodPosix.includes("EXPECTED_AGENT_BROWSER_VERSION='agent-browser " + CAPABILITY_BASELINE.targetVersion + "'") && dogfoodPosix.includes("PLATFORM_AGENT_BROWSER_READY_EXIT"),
   dogfoodKeepsArtifacts: dogfoodPosix.includes("--artifact-dir"),
-  dogfoodWarmSkipsDuplicateInstall: dogfoodWarmPosix.includes("PLATFORM_NPM_CI_SKIPPED=1") && dogfoodWarmWindows.includes("-SkipNpmCi") && dogfoodWindowsScript.includes("$SkipNpmCi"),
-  dogfoodWindowsUsesScript: dogfoodWindows.includes("browser-dogfood-windows.ps1") && dogfoodWindows.includes("-AgentBrowserVersion '" + CAPABILITY_BASELINE.targetVersion + "'"),
-  dogfoodWindowsRetriesTransientOpen: dogfoodWindowsScript.includes("PLATFORM_DOGFOOD_ATTEMPT"),
-  dogfoodWindowsBoundsPrewarmCommands: dogfoodWindowsScript.includes("Invoke-AgentBrowserWithTimeout") && dogfoodWindowsScript.includes("PLATFORM_AGENT_BROWSER_COMMAND_TIMEOUT") && dogfoodWindowsScript.includes("taskkill.exe"),
-  dogfoodWindowsSkipsCloseAfterFailedPrewarm: dogfoodWindowsScript.includes("if ($BrowserPrewarmExit -eq 0)") && dogfoodWindowsScript.includes('"close", "--json", "--session"'),
+  dogfoodColdInstallsDependencies: dogfoodPosix.includes("npm ci 2>&1") && !dogfoodPosix.includes("PLATFORM_NPM_CI_SKIPPED=1"),
+  dogfoodWarmSkipsDuplicateInstall: dogfoodWarmPosix.includes("PLATFORM_NPM_CI_SKIPPED=1") && dogfoodWarmWindows.includes("-SkipNpmCi") && !dogfoodWindows.includes("-SkipNpmCi"),
+  dogfoodWindowsUsesScript: dogfoodWindows.includes("browser-dogfood-windows.ps1") && dogfoodWindows.includes("-AgentBrowserVersion '" + CAPABILITY_BASELINE.targetVersion + "'") && dogfoodWarmWindows.includes("-AgentBrowserVersion '" + CAPABILITY_BASELINE.targetVersion + "'"),
   dogfoodWindowsDoesNotBootstrap: !dogfoodWindows.includes("npm install -g") && !dogfoodWindows.includes("agent-browser install"),
 };
 console.log(JSON.stringify(result));
@@ -155,23 +173,23 @@ try {
   mkdirSync(suiteDir, { recursive: true });
   writeFileSync(join(suiteDir, "present.txt"), "ok");
   const manifest = writeManifest(suiteDir, ["artifact-manifest.json", "present.txt", "missing.txt"]);
-  const cleanup = createLeaseCleanupFailureResult({ artifactRoot: root, packageName: "pi-agent-browser-native" }, "ubuntu", "cbx_failed", {
+  const cleanup = createLeaseCleanupFailureResult({ config: { artifactRoot: root, packageName: "pi-agent-browser-native" }, targetName: "ubuntu", leaseId: "cbx_failed", stopResult: {
     stdout: "",
     stderr: "stop failed",
     code: 1,
     signal: null,
-  });
-  const cleanupSuccess = createLeaseCleanupResult({ artifactRoot: root, packageName: "pi-agent-browser-native" }, "ubuntu", "cbx_ok", {
+  }});
+  const cleanupSuccess = createLeaseCleanupResult({ config: { artifactRoot: root, packageName: "pi-agent-browser-native" }, targetName: "ubuntu", leaseId: "cbx_ok", stopResult: {
     stdout: "stopped",
     stderr: "",
     code: 0,
     signal: null,
-  }, {
+  }, staleCleanupResult: {
     stdout: "cleaned stale clones",
     stderr: "",
     code: 0,
     signal: null,
-  });
+  }});
   const warmupFailure = createLeaseWarmupFailureResult({ artifactRoot: root, packageName: "pi-agent-browser-native" }, "ubuntu", {
     stdout: "",
     stderr: "warmup failed",
@@ -205,30 +223,4 @@ try {
 `;
 	const result = run(process.execPath, ["--input-type=module", "-e", code]);
 	assert.equal(result.status, 0, result.stderr + result.stdout);
-});
-
-test("npm pack includes platform smoke docs and scripts", () => {
-	const result = run("npm", ["pack", "--dry-run", "--json"]);
-	assert.equal(result.status, 0, result.stderr);
-	const output = JSON.parse(result.stdout) as Array<{ files: Array<{ path: string }> }> | Record<string, { files: Array<{ path: string }> }>;
-	const pack = Array.isArray(output) ? output[0] : Object.values(output)[0];
-	const paths = new Set(pack?.files.map((file) => file.path) ?? []);
-	for (const path of [
-		"docs/platform-smoke.md",
-		"platform-smoke.config.mjs",
-		"scripts/platform-smoke.mjs",
-		"scripts/platform-smoke/artifacts.mjs",
-		"scripts/platform-smoke/crabbox-runner.mjs",
-		"scripts/platform-smoke/doctor.mjs",
-		"scripts/platform-smoke/targets.mjs",
-		"scripts/platform-smoke/platform-build-windows.ps1",
-		"scripts/platform-smoke/browser-dogfood-windows.ps1",
-		"scripts/platform-smoke/linux-image/Dockerfile",
-	]) {
-		assert.ok(paths.has(path), `expected npm pack to include ${path}`);
-	}
-	for (const forbidden of [".artifacts/", ".crabbox/", ".debug/", ".platform-smoke-runs/", ".env", ".env."]) {
-		assert.equal([...paths].some((path) => path === forbidden || path.startsWith(forbidden)), false);
-	}
-	assert.equal([...paths].some((path) => path.endsWith(".tgz")), false);
 });

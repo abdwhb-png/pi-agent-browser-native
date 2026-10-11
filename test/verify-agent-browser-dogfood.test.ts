@@ -12,17 +12,23 @@ import test from "node:test";
 import { parseDogfoodArgs } from "../scripts/verify-agent-browser-dogfood.ts";
 
 test("parseDogfoodArgs accepts artifact, retention, json, and help flags", () => {
-	assert.deepEqual(parseDogfoodArgs(["--artifact-dir", "/tmp/pi-dogfood", "--keep-artifacts", "--json"]), {
-		artifactDir: "/tmp/pi-dogfood",
-		help: false,
-		json: true,
-		keepArtifacts: true,
-	});
+	assert.deepEqual(
+		parseDogfoodArgs(["--artifact-dir", "/tmp/pi-dogfood", "--keep-artifacts", "--json"]),
+		{
+			artifactDir: "/tmp/pi-dogfood",
+			help: false,
+			json: true,
+			keepArtifacts: true,
+		},
+	);
 	assert.deepEqual(parseDogfoodArgs(["--help"]), { help: true });
 });
 
 test("parseDogfoodArgs rejects unknown options and missing artifact directory values", () => {
 	assert.throws(() => parseDogfoodArgs(["--artifact-dir"]), /--artifact-dir requires a path/);
-	assert.throws(() => parseDogfoodArgs(["--artifact-dir", "--json"]), /--artifact-dir requires a path/);
+	assert.throws(
+		() => parseDogfoodArgs(["--artifact-dir", "--json"]),
+		/--artifact-dir requires a path/,
+	);
 	assert.throws(() => parseDogfoodArgs(["--bogus"]), /Unknown dogfood argument: --bogus/);
 });

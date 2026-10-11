@@ -1,12 +1,26 @@
 export function stringifyUnknown(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (typeof value === "number" || typeof value === "boolean") return String(value);
-	if (value === null || value === undefined) return "";
-	try {
-		return JSON.stringify(value, null, 2);
-	} catch {
+	if (typeof value === "string") {
+		return value;
+	}
+	if (typeof value === "number" || typeof value === "boolean") {
 		return String(value);
 	}
+	if (value === null || value === undefined) {
+		return "";
+	}
+	try {
+		const serialized: unknown = JSON.stringify(value, null, 2);
+		return typeof serialized === "string" ? serialized : "";
+	} catch {
+		return stringifyFallback(value);
+	}
+}
+
+function stringifyFallback(value: unknown): string {
+	if (typeof value === "bigint" || typeof value === "symbol" || typeof value === "function") {
+		return String(value);
+	}
+	return Object.prototype.toString.call(value);
 }
 
 export function countLines(text: string): number {
@@ -18,7 +32,9 @@ export function normalizeWhitespace(text: string): string {
 }
 
 export function truncateText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
+	if (text.length <= maxChars) {
+		return text;
+	}
 	return `${text.slice(0, Math.max(1, maxChars - 1))}…`;
 }
 

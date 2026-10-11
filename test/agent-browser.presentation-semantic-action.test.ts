@@ -3,11 +3,11 @@
  */
 
 import assert from "node:assert/strict";
+import { readRecord, readString } from "./helpers/assertions.js";
 import test from "node:test";
 
 import { buildToolPresentation } from "../extensions/agent-browser/lib/results/presentation.js";
 import {
-	formatSemanticActionCompactLine,
 	formatSemanticActionPresentationText,
 	shouldCaptureSemanticActionNavigationSummary,
 } from "../extensions/agent-browser/lib/results/presentation/semantic-action.js";
@@ -17,12 +17,6 @@ const semanticClick = {
 	locator: "text" as const,
 	args: ["find", "text", "Close", "click"],
 };
-
-test("formatSemanticActionCompactLine avoids raw located-selector clicked tokens", () => {
-	const line = formatSemanticActionCompactLine(semanticClick);
-	assert.match(line, /Clicked: text "Close"/);
-	assert.doesNotMatch(line, /data-agent-browser-located/);
-});
 
 test("formatSemanticActionPresentationText prefers compact action line over located selector", () => {
 	const text = formatSemanticActionPresentationText(semanticClick, {
@@ -34,7 +28,9 @@ test("formatSemanticActionPresentationText prefers compact action line over loca
 
 test("shouldCaptureSemanticActionNavigationSummary probes find click without title or url", () => {
 	assert.equal(
-		shouldCaptureSemanticActionNavigationSummary(semanticClick, { clicked: "[data-agent-browser-located='true']" }),
+		shouldCaptureSemanticActionNavigationSummary(semanticClick, {
+			clicked: "[data-agent-browser-located='true']",
+		}),
 		true,
 	);
 	assert.equal(
@@ -45,7 +41,13 @@ test("shouldCaptureSemanticActionNavigationSummary probes find click without tit
 		}),
 		false,
 	);
-	assert.equal(shouldCaptureSemanticActionNavigationSummary({ ...semanticClick, action: "fill" }, { filled: true }), false);
+	assert.equal(
+		shouldCaptureSemanticActionNavigationSummary(
+			{ ...semanticClick, action: "fill" },
+			{ filled: true },
+		),
+		false,
+	);
 });
 
 test("buildToolPresentation enriches semanticAction find click like direct click", async () => {
@@ -67,54 +69,13 @@ test("buildToolPresentation enriches semanticAction find click like direct click
 	});
 
 	assert.equal(presentation.content[0]?.type, "text");
-	const text = (presentation.content[0] as { text: string }).text;
-	assert.match(text, /Clicked: text "Close"/);
-	assert.match(text, /Current page:/);
-	assert.match(text, /Destination Docs/);
-	assert.match(text, /https:\/\/example.com\/docs/);
+	const text = readRecord(presentation.content[0]).text;
+	assert.match(readString(text), /Clicked: text "Close"/);
+	assert.match(readString(text), /Current page:/);
+	assert.match(readString(text), /Destination Docs/);
+	assert.match(readString(text), /https:\/\/example.com\/docs/);
 	assert.match(presentation.summary, /click → Destination Docs/);
 	assert.equal(presentation.pageChangeSummary?.changeType, "navigation");
-	assert.equal(presentation.pageChangeSummary?.command, "click");
+	assert.equal(presentation.pageChangeSummary.command, "click");
 	assert.deepEqual(presentation.nextActions?.[0]?.params?.args, ["snapshot", "-i"]);
-});
-
-test("buildToolPresentation adds overlay recovery for direct semanticAction click errors", async () => {
-	const presentation = await buildToolPresentation({
-		commandInfo: { command: "find", subcommand: "text" },
-		compiledSemanticAction: semanticClick,
-		cwd: process.cwd(),
-		errorText: "Element 'Close' is covered by <div role=dialog> at its click point, so the input would land on that element instead. Dismiss or interact with the covering element first (it is often a dialog, banner, or sticky header).",
-		sessionName: "work",
-	});
-
-	assert.equal(presentation.resultCategory, "failure");
-	assert.equal(presentation.failureCategory, "upstream-error");
-	assert.deepEqual(presentation.nextActions?.map((action) => action.id), ["inspect-overlay-state"]);
-	assert.deepEqual(presentation.nextActions?.[0]?.params?.args, ["--session", "work", "snapshot", "-i"]);
-	assert.equal(presentation.nextActions?.some((action) => action.params?.args?.includes("click")), false);
-});
-
-test("buildToolPresentation preserves direct click presentation", async () => {
-	const presentation = await buildToolPresentation({
-		commandInfo: { command: "click" },
-		cwd: process.cwd(),
-		envelope: {
-			success: true,
-			data: {
-				clicked: true,
-				href: "https://example.com/docs",
-				navigationSummary: {
-					title: "Destination Docs",
-					url: "https://example.com/docs",
-					urlChanged: true,
-				},
-			},
-		},
-	});
-
-	const text = (presentation.content[0] as { text: string }).text;
-	assert.match(text, /Clicked: true/);
-	assert.match(text, /Href: https:\/\/example.com\/docs/);
-	assert.match(text, /Current page:/);
-	assert.match(presentation.summary, /click → Destination Docs/);
 });

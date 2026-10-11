@@ -7,7 +7,8 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { readArray, readRecord, readString } from "./helpers/assertions.js";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,280 +22,816 @@ import {
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
 
-test("agentBrowserExtension redacts sensitive args in updates and persisted details", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension redacts sensitive args in updates and persisted details",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");
 process.stdout.write(JSON.stringify({ success: true, data: { title: "ok", url: "https://user:pass@example.com/?token=abc", openaiApiKey: "openai-should-not-leak", unrelatedApiKey: "unrelated-should-not-leak", databaseUrl: "postgres://should-not-leak", OPENAI_API_KEY: "uppercase-openai-should-not-leak", AWS_SECRET_ACCESS_KEY: "uppercase-aws-should-not-leak", STRIPE_SECRET_KEY: "uppercase-stripe-should-not-leak", PRIVATE_KEY: "uppercase-private-key-should-not-leak", private_key: "lower-private-key-should-not-leak", privateKey: "camel-private-key-should-not-leak", connectionString: "camel-connection-string-should-not-leak", mongodbUri: "mongodb://user:pass@example/db", MONGODB_URI: "mongodb://user:pass@example/db", "X-Private-Key": "header-private-key-should-not-leak", message: "Error mongodb://bare-user:bare-pass@example/db and mongodb+srv://srv-user:srv-pass@example/db and mongodb://punct-user:pa)ss@example/db?token=punct-token-secret&ok=1 mongodb://bracket-user:p]ss@example/db?private_key=bracket-key-secret&ok=1 mongodb://angle-user:p>ss@example/db#access_token=angle-token-secret&ok=1", envLine: "OPENAI_API_KEY=prose-openai-should-not-leak AWS_SECRET_ACCESS_KEY: prose-aws-should-not-leak PRIVATE_KEY=prose-private-key-should-not-leak X-Private-Key: prose-header-private-key-should-not-leak API-KEY=prose-api-key-should-not-leak apiKey=prose-camel-api-key-should-not-leak privateKey: prose-camel-private-key-should-not-leak connectionString=prose-camel-connection-string-should-not-leak databaseUrl: prose-camel-db-url-should-not-leak mongodbUri=mongodb://prose-user:prose-pass@example/db MONGODB_URI=mongodb://env-user:env-pass@example/db https://example.com/?private_key=url-private-key-should-not-leak&connection_string=url-connection-string-should-not-leak&ok=1 failedChecks=true" } }));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const updates: unknown[] = [];
-			const result = (await harness.tool.execute(
-				"test-tool-call",
-				{ args: ["--headers", '{"Authorization":"Bearer s3cr3t-demo"}', "open", "https://user:pass@example.com/?token=abc"] },
-				new AbortController().signal,
-				(update) => updates.push(update),
-				harness.ctx,
-			)) as { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown>; isError?: boolean };
+				const updates: unknown[] = [];
+				const result = readRecord(
+					await harness.tool.execute(
+						"test-tool-call",
+						{
+							args: [
+								"--headers",
+								'{"Authorization":"Bearer s3cr3t-demo"}',
+								"open",
+								"https://user:pass@example.com/?token=abc",
+							],
+						},
+						new AbortController().signal,
+						(update) => {
+							updates.push(update);
+						},
+						harness.ctx,
+					),
+				);
 
-			assert.equal(result.isError, false);
-			const [invocation] = await readInvocationLog(logPath);
-			assert.deepEqual(invocation?.args, [
-				"--json",
-				"--session",
-				result.details?.sessionName,
-				"--headers",
-				'{"Authorization":"Bearer s3cr3t-demo"}',
-				"open",
-				"https://user:pass@example.com/?token=abc",
-			]);
-			assert.equal(Array.isArray(updates), true);
-			const update = updates[0] as { content?: Array<{ text?: string }>; details?: Record<string, unknown> } | undefined;
-			assert.match(update?.content?.[0]?.text ?? "", /\[REDACTED\]/);
-			assert.doesNotMatch(update?.content?.[0]?.text ?? "", /s3cr3t-demo/);
-			assert.doesNotMatch(update?.content?.[0]?.text ?? "", /user:pass/);
-			assert.deepEqual(result.details?.args, [
-				"--headers",
-				"[REDACTED]",
-				"open",
-				"https://%5BREDACTED%5D:%5BREDACTED%5D@example.com/?token=%5BREDACTED%5D",
-			]);
-			assert.equal(JSON.stringify(result.details?.effectiveArgs).includes("s3cr3t-demo"), false);
-			assert.equal(JSON.stringify(result.details?.effectiveArgs).includes("user:pass"), false);
-			assert.equal(JSON.stringify(result.details?.data).includes("user:pass"), false);
-			assert.equal(JSON.stringify(result.content).includes("user:pass"), false);
-			assert.equal(JSON.stringify(result).includes("openai-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("unrelated-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("postgres://should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("uppercase-openai-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("uppercase-aws-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("uppercase-stripe-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("uppercase-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("lower-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("header-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("camel-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("camel-connection-string-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://user:pass@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://bare-user:bare-pass@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb+srv://srv-user:srv-pass@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://punct-user:pa)ss@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://bracket-user:p]ss@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://angle-user:p>ss@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("punct-token-secret"), false);
-			assert.equal(JSON.stringify(result).includes("bracket-key-secret"), false);
-			assert.equal(JSON.stringify(result).includes("angle-token-secret"), false);
-			assert.equal(JSON.stringify(result).includes("prose-openai-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-aws-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-header-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-api-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-camel-api-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-camel-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-camel-connection-string-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("prose-camel-db-url-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://prose-user:prose-pass@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("mongodb://env-user:env-pass@example/db"), false);
-			assert.equal(JSON.stringify(result).includes("url-private-key-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("url-connection-string-should-not-leak"), false);
-			assert.equal(JSON.stringify(result).includes("failedChecks"), true);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				assert.equal(result.isError, false);
+				const [invocation] = await readInvocationLog(logPath);
+				assert.deepEqual(invocation.args, [
+					"--json",
+					"--session",
+					readRecord(result.details).sessionName,
+					"--headers",
+					'{"Authorization":"Bearer s3cr3t-demo"}',
+					"open",
+					"https://user:pass@example.com/?token=abc",
+				]);
+				assert.equal(Array.isArray(updates), true);
+				const update = readRecord(updates[0]);
+				assert.match(
+					readString(readArray(update.content).map(readRecord)[0].text ?? ""),
+					/\[REDACTED\]/,
+				);
+				assert.doesNotMatch(
+					readString(readArray(update.content).map(readRecord)[0].text ?? ""),
+					/s3cr3t-demo/,
+				);
+				assert.doesNotMatch(
+					readString(readArray(update.content).map(readRecord)[0].text ?? ""),
+					/user:pass/,
+				);
+				assert.deepEqual(readRecord(result.details).args, [
+					"--headers",
+					"[REDACTED]",
+					"open",
+					"https://%5BREDACTED%5D:%5BREDACTED%5D@example.com/?token=%5BREDACTED%5D",
+				]);
+				assert.equal(
+					JSON.stringify(readRecord(result.details).effectiveArgs).includes("s3cr3t-demo"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(readRecord(result.details).effectiveArgs).includes("user:pass"),
+					false,
+				);
+				assert.equal(JSON.stringify(readRecord(result.details).data).includes("user:pass"), false);
+				assert.equal(JSON.stringify(result.content).includes("user:pass"), false);
+				assert.equal(JSON.stringify(result).includes("openai-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("unrelated-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("postgres://should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("uppercase-openai-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("uppercase-aws-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("uppercase-stripe-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("uppercase-private-key-should-not-leak"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("lower-private-key-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("header-private-key-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("camel-private-key-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("camel-connection-string-should-not-leak"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("mongodb://user:pass@example/db"), false);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://bare-user:bare-pass@example/db"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb+srv://srv-user:srv-pass@example/db"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://punct-user:pa)ss@example/db"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://bracket-user:p]ss@example/db"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://angle-user:p>ss@example/db"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("punct-token-secret"), false);
+				assert.equal(JSON.stringify(result).includes("bracket-key-secret"), false);
+				assert.equal(JSON.stringify(result).includes("angle-token-secret"), false);
+				assert.equal(JSON.stringify(result).includes("prose-openai-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("prose-aws-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("prose-private-key-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("prose-header-private-key-should-not-leak"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("prose-api-key-should-not-leak"), false);
+				assert.equal(JSON.stringify(result).includes("prose-camel-api-key-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("prose-camel-private-key-should-not-leak"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("prose-camel-connection-string-should-not-leak"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("prose-camel-db-url-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://prose-user:prose-pass@example/db"),
+					false,
+				);
+				assert.equal(
+					JSON.stringify(result).includes("mongodb://env-user:env-pass@example/db"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("url-private-key-should-not-leak"), false);
+				assert.equal(
+					JSON.stringify(result).includes("url-connection-string-should-not-leak"),
+					false,
+				);
+				assert.equal(JSON.stringify(result).includes("failedChecks"), true);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension allows auth password stdin without echoing the secret in tool details", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-stdin-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension preserves bearer prose while marking credentials in content, details, and exports",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-bearer-prose-"));
+		const basePath = process.env.PATH ?? "";
+		const prose =
+			"The endpoint requires a bearer token.\nBearer authentication uses an access token.\nDo not log bearer tokens or bearer credentials.\nA bearer token(s) discussion is not a credential.\nThe phrase “bearer token.” is public.\nAuthorization bearer tokens are credentials.\nBearer <code>token</code>\nBearer https://docs.example/guide";
+		const data = {
+			content: `${prose}\nAuthorization: Bearer secrettoken\ncurl -H 'Bearer token.'\nObserved Bearer abc123_.456\nRedirect: https://example.invalid/?code=C123`,
+			source: "raw",
+			url: "https://example.invalid/docs",
+		};
+		const expectedData = {
+			...data,
+			content: `${prose}\nAuthorization: Bearer [REDACTED]\ncurl -H 'Bearer [REDACTED].'\nObserved Bearer [REDACTED]\nRedirect: https://example.invalid/?code=%5BREDACTED%5D`,
+		};
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write(JSON.stringify({ success: true, data: ${JSON.stringify(data)} }));`,
+		);
+
+		try {
+			await withPatchedEnv({ HOME: tempDir, PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				for (const args of [
+					["read", data.url],
+					["--json", "read", data.url],
+				]) {
+					// Fixture transitions and their assertions run in order against this test's shared state.
+					// oxlint-disable-next-line no-await-in-loop
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args,
+						outputPath: "read.json",
+					});
+					// Both literal prose/JSON read variants run these shared redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(result.isError, false);
+					// Both literal prose/JSON read variants run these shared redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(result.details?.data, expectedData);
+					// Both literal prose/JSON read variants run these shared redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(
+						// Fixture transitions and their assertions run in order against this test's shared state.
+						// oxlint-disable-next-line no-await-in-loop
+						JSON.parse(await readFile(join(tempDir, "read.json"), "utf8")),
+						expectedData,
+					);
+					if (args.includes("--json")) {
+						// The two fixed read variants exercise both JSON and prose; each branch asserts its format.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.deepEqual(
+							readRecord(JSON.parse(result.content[0]?.text ?? "")).data,
+							expectedData,
+						);
+					} else {
+						// The two fixed read variants exercise both JSON and prose; each branch asserts its format.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(result.content[0]?.text?.includes(expectedData.content) === true);
+					}
+					// Both literal prose/JSON read variants run these shared redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.doesNotMatch(JSON.stringify(result), /secrettoken|abc123_\.456|C123/);
+				}
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+test(
+	"agentBrowserExtension redacts sign-in authorization sessions in content, details, and exports",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-url-"));
+		const basePath = process.env.PATH ?? "";
+		const origin =
+			"https://signin.example.invalid/?client_id=EXAMPLE_CLIENT&redirect_uri=EXAMPLE_REDIRECT&state=EXAMPLE_STATE&nonce=EXAMPLE_NONCE&authorization_session_id=EXAMPLE_ID";
+		const redactedOrigin =
+			"https://signin.example.invalid/?client_id=EXAMPLE_CLIENT&redirect_uri=EXAMPLE_REDIRECT&state=%5BREDACTED%5D&nonce=%5BREDACTED%5D&authorization_session_id=%5BREDACTED%5D";
+		const data = {
+			origin,
+			snapshot: '- button "Continue" [ref=e1]',
+			refs: { e1: { role: "button", name: "Continue" } },
+		};
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write(JSON.stringify({ success: true, data: ${JSON.stringify(data)} }));`,
+		);
+
+		try {
+			await withPatchedEnv(
+				{ HOME: tempDir, PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_PAGE_URL: origin },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["snapshot", "-i"],
+						outputPath: "snapshot.json",
+					});
+
+					assert.equal(result.isError, false);
+					assert.deepEqual(
+						{
+							contentOrigin: result.content[0]?.text?.split("\n")[0],
+							data: result.details?.data,
+							exported: readRecord(
+								JSON.parse(await readFile(join(tempDir, "snapshot.json"), "utf8")),
+							),
+						},
+						{
+							contentOrigin: `Origin: ${redactedOrigin}`,
+							data: { ...data, origin: redactedOrigin },
+							exported: { ...data, origin: redactedOrigin },
+						},
+					);
+					assert.doesNotMatch(JSON.stringify(result), /EXAMPLE_STATE|EXAMPLE_NONCE|EXAMPLE_ID/);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+test(
+	"agentBrowserExtension preserves nested serialized JSON in eval presentation and exports",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-nested-json-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		const harmless = JSON.stringify(
+			{ url: "HTTPS://EXAMPLE.test:443/A%2fb?q=a%20b&state=open&nonce=7#part" },
+			null,
+			2,
+		);
+		const payload = {
+			evidence: {
+				prehydration: JSON.stringify({
+					url: "https://example.test/callback?authorization_session_id=private-fixture&state=flow-fixture",
+				}),
+				harmless,
+				apiKey: "adjacent-fixture",
+			},
+			values: [1, false, null],
+		};
+		const stdin = `JSON.stringify(${JSON.stringify(payload)}, null, 2)`;
+		const expectedUrl =
+			"https://example.test/callback?authorization_session_id=%5BREDACTED%5D&state=%5BREDACTED%5D";
+		const expected = {
+			evidence: {
+				prehydration: JSON.stringify({ url: expectedUrl }),
+				harmless,
+				apiKey: "[REDACTED]",
+			},
+			values: [1, false, null],
+		};
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2), stdin: fs.readFileSync(0, "utf8") }) + "\\n");
+process.stdout.write(JSON.stringify({ success: true, data: { result: ${JSON.stringify(JSON.stringify(payload, null, 2))} } }));`,
+		);
+
+		try {
+			await withPatchedEnv({ HOME: tempDir, PATH: `${tempDir}:${basePath}` }, async () => {
+				for (const args of [
+					["eval", "--stdin"],
+					["--json", "eval", "--stdin"],
+				]) {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					// Fixture transitions and their assertions run in order against this test's shared state.
+					// oxlint-disable-next-line no-await-in-loop
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+					// Fixture transitions and their assertions run in order against this test's shared state.
+					// oxlint-disable-next-line no-await-in-loop
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args,
+						stdin,
+						outputPath: "eval.json",
+					});
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(result.isError, false, JSON.stringify(result));
+					// Fixture transitions and their assertions run in order against this test's shared state.
+					// oxlint-disable-next-line no-await-in-loop
+					const exportedText = await readFile(join(tempDir, "eval.json"), "utf8");
+					const exported = readRecord(JSON.parse(exportedText));
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(result.details?.data, exported);
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(typeof exported.result, "string");
+					const parsed = readRecord(JSON.parse(readString(exported.result)));
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(parsed, expected);
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(typeof readRecord(parsed.evidence).prehydration, "string");
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(JSON.parse(readString(readRecord(parsed.evidence).prehydration)), {
+						url: expectedUrl,
+					});
+					const text = result.content[0]?.text ?? "";
+					const visible = args.includes("--json")
+						? readRecord(readRecord(JSON.parse(text)).data).result
+						: text.split("\n\nOutput file:")[0];
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.deepEqual(JSON.parse(readString(visible)), expected);
+					// Both literal eval variants must pass the same export and nested-redaction checks.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.doesNotMatch(
+						JSON.stringify(result) + exportedText,
+						/private-fixture|flow-fixture|adjacent-fixture/,
+					);
+				}
+				const invocations = (await readInvocationLog(logPath)).filter(({ args }) =>
+					args.includes("eval"),
+				);
+				assert.equal(invocations.length, 2);
+				assert.ok(
+					invocations.every((invocation) => invocation.stdin === stdin),
+					"native eval input must remain unchanged",
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+test(
+	"agentBrowserExtension preserves serialized JSON source in eval presentation and exports",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-json-source-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		const sources = [
+			'{"url":"https://example.test/callback?token=synthetic-secret","url":"https://example.test/safe"}',
+			'{"url":"https://example.test/callback?token=synthetic-secret","requestId":9007199254740993}',
+			'{ "https://example.test/callback?token=synthetic-secret" : "ordinary" }',
+		];
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
+const stdin = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2), stdin }) + "\\n");
+process.stdout.write(JSON.stringify({ success: true, data: { result: JSON.parse(stdin) } }));`,
+		);
+		try {
+			await withPatchedEnv(
+				{
+					HOME: tempDir,
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://example.test/",
+				},
+				async () => {
+					for (const source of sources) {
+						const expected = source.replace("synthetic-secret", "%5BREDACTED%5D");
+						const stdin = JSON.stringify(source);
+						for (const args of [
+							["eval", "--stdin"],
+							["--json", "eval", "--stdin"],
+						]) {
+							const harness = createExtensionHarness({ cwd: tempDir });
+							// Fixture transitions and their assertions run in order against this test's shared state.
+							// oxlint-disable-next-line no-await-in-loop
+							await runExtensionEvent(
+								harness.handlers,
+								"session_start",
+								{ reason: "new" },
+								harness.ctx,
+							);
+							// Fixture transitions and their assertions run in order against this test's shared state.
+							// oxlint-disable-next-line no-await-in-loop
+							const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+								args,
+								stdin,
+								outputPath: "eval-source.json",
+							});
+							// All three literal JSON sources run both eval formats and check exact source redaction.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.equal(result.isError, false, JSON.stringify(result));
+							// All three literal JSON sources run both eval formats and check exact source redaction.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.deepEqual(result.details?.data, { result: expected });
+							// Fixture transitions and their assertions run in order against this test's shared state.
+							// oxlint-disable-next-line no-await-in-loop
+							const exportedText = await readFile(join(tempDir, "eval-source.json"), "utf8");
+							// All three literal JSON sources run both eval formats and check exact source redaction.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.deepEqual(JSON.parse(exportedText), { result: expected });
+							const text = result.content[0]?.text ?? "";
+							// All three literal JSON sources run both eval formats and check exact source redaction.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.equal(
+								args.includes("--json")
+									? readRecord(readRecord(JSON.parse(text)).data).result
+									: text.split("\n\nOutput file:")[0],
+								expected,
+							);
+							// All three literal JSON sources run both eval formats and check exact source redaction.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.doesNotMatch(JSON.stringify(result) + exportedText, /synthetic-secret/);
+						}
+					}
+					const invocations = (await readInvocationLog(logPath)).filter(({ args }) =>
+						args.includes("eval"),
+					);
+					assert.deepEqual(
+						invocations.map(({ stdin }) => stdin),
+						sources.flatMap((source) => [JSON.stringify(source), JSON.stringify(source)]),
+					);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+test(
+	"agentBrowserExtension bounds minified JSON summaries while preserving full spills and exports",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-summary-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		const source =
+			'{"url":"https://example.test/callback?token=summary-secret","url":"https://example.test/safe","requestId":9007199254740993,"body":' +
+			JSON.stringify("row ".repeat(22_000)) +
+			',"end":"MINIFIED-SOURCE-END"}';
+		const expected = source.replace("summary-secret", "%5BREDACTED%5D");
+		const stdin = JSON.stringify(source);
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
+const stdin = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2), stdin }) + "\\n");
+process.stdout.write(JSON.stringify({ success: true, data: { result: JSON.parse(stdin) } }));`,
+		);
+		try {
+			await withPatchedEnv(
+				{
+					HOME: tempDir,
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://example.test/",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir, sessionDir: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["eval", "--stdin"],
+						stdin,
+						outputPath: "minified.json",
+					});
+					assert.equal(result.isError, false);
+					assert.equal(readRecord(result.details?.data).compacted, true);
+					const spillPath = result.details?.fullOutputPath;
+					assert.ok(typeof spillPath === "string");
+					assert.deepEqual(JSON.parse(await readFile(spillPath, "utf8")), { result: expected });
+					assert.deepEqual(JSON.parse(await readFile(join(tempDir, "minified.json"), "utf8")), {
+						result: expected,
+					});
+					const invocations = (await readInvocationLog(logPath)).filter(({ args }) =>
+						args.includes("eval"),
+					);
+					assert.equal(invocations.length, 1);
+					assert.equal(invocations[0]?.stdin, stdin);
+					const summary = result.details?.summary;
+					assert.ok(typeof summary === "string");
+					const summaryLimit = "Eval result: ".length + 160 + " (compact)".length;
+					assert.ok(
+						summary.length <= summaryLimit,
+						`firstLine's 160-character bound must hold: got ${summary.length}`,
+					);
+					assert.match(summary, /%5BREDACTED%5D/);
+					const inline = JSON.stringify(result);
+					assert.ok(
+						inline.length < 8_000,
+						`compacted result must stay below the existing inline limit: got ${inline.length}`,
+					);
+					assert.doesNotMatch(inline, /MINIFIED-SOURCE-END|summary-secret/);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+test(
+	"agentBrowserExtension allows auth password stdin without echoing the secret in tool details",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-stdin-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
 process.stderr.write("stderr echo: " + stdin);
 process.stdout.write(JSON.stringify({ success: true, data: { saved: true, echoed: stdin, nested: { arbitrary: stdin } } }));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const updates: unknown[] = [];
-			const result = (await harness.tool.execute(
-				"test-tool-call",
-				{ args: ["auth", "save", "demo", "--password-stdin"], stdin: "pin" },
-				new AbortController().signal,
-				(update) => updates.push(update),
-				harness.ctx,
-			)) as { content: Array<{ type: string; text?: string }>; details?: Record<string, unknown>; isError?: boolean };
+				const updates: unknown[] = [];
+				const result = readRecord(
+					await harness.tool.execute(
+						"test-tool-call",
+						{ args: ["auth", "save", "demo", "--password-stdin"], stdin: "pin" },
+						new AbortController().signal,
+						(update) => {
+							updates.push(update);
+						},
+						harness.ctx,
+					),
+				);
 
-			assert.equal(result.isError, false);
-			const [invocation] = await readInvocationLog(logPath);
-			assert.deepEqual(invocation?.args, ["--json", "auth", "save", "demo", "--password-stdin"]);
-			assert.equal(result.details?.sessionName, undefined);
-			assert.equal(result.details?.usedImplicitSession, undefined);
-			assert.equal(invocation?.stdin, "pin");
-			assert.equal(JSON.stringify(updates).includes("pin"), false);
-			assert.equal(JSON.stringify(result.details).includes("pin"), false);
-			assert.equal(JSON.stringify(result.content).includes("pin"), false);
-			assert.equal(JSON.stringify(result.details).includes("[REDACTED]"), true);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				assert.equal(result.isError, false);
+				const [invocation] = await readInvocationLog(logPath);
+				assert.deepEqual(invocation.args, ["--json", "auth", "save", "demo", "--password-stdin"]);
+				assert.equal(readRecord(result.details).sessionName, undefined);
+				assert.equal(readRecord(result.details).usedImplicitSession, undefined);
+				assert.equal(invocation.stdin, "pin");
+				assert.equal(JSON.stringify(updates).includes("pin"), false);
+				assert.equal(JSON.stringify(result.details).includes("pin"), false);
+				assert.equal(JSON.stringify(result.content).includes("pin"), false);
+				assert.equal(JSON.stringify(result.details).includes("[REDACTED]"), true);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension redacts auth password stdin echoed in upstream failures", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-error-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension redacts auth password stdin echoed in upstream failures",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-error-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const stdin = fs.readFileSync(0, "utf8");
 process.stderr.write("stderr echo: " + stdin);
 process.stdout.write(JSON.stringify({ success: false, error: "error echo: " + stdin, data: { arbitrary: stdin } }));
 process.exit(1);`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["auth", "save", "demo", "--password-stdin"],
-				stdin: "super-secret-password",
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["auth", "save", "demo", "--password-stdin"],
+					stdin: "super-secret-password",
+				});
+
+				assert.equal(result.isError, true);
+				assert.equal(JSON.stringify(result.content).includes("super-secret-password"), false);
+				assert.equal(JSON.stringify(result.details).includes("super-secret-password"), false);
+				assert.match(JSON.stringify(result.content), /\[REDACTED\]/);
+				assert.match(JSON.stringify(result.details), /\[REDACTED\]/);
+				assert.equal(result.details?.resultCategory, "failure");
+				assert.equal(result.details.failureCategory, "upstream-error");
 			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			assert.equal(result.isError, true);
-			assert.equal(JSON.stringify(result.content).includes("super-secret-password"), false);
-			assert.equal(JSON.stringify(result.details).includes("super-secret-password"), false);
-			assert.match(JSON.stringify(result.content), /\[REDACTED\]/);
-			assert.match(JSON.stringify(result.details), /\[REDACTED\]/);
-			assert.equal(result.details?.resultCategory, "failure");
-			assert.equal(result.details?.failureCategory, "upstream-error");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension discards auth password parse-failure output", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-parse-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension discards auth password parse-failure output",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-auth-parse-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const stdin = fs.readFileSync(0, "utf8");
 process.stdout.write("invalid-json " + stdin + " " + "x".repeat(600000));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["auth", "save", "demo", "--password-stdin"],
-				stdin: "super-secret-password",
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["auth", "save", "demo", "--password-stdin"],
+					stdin: "super-secret-password",
+				});
+
+				assert.equal(result.isError, true);
+				assert.equal(JSON.stringify(result.content).includes("super-secret-password"), false);
+				assert.equal(JSON.stringify(result.details).includes("super-secret-password"), false);
+				assert.equal(result.details?.fullOutputPath, undefined);
+				assert.match(
+					readString(result.details?.fullOutputUnavailable ?? ""),
+					/discarded because it may contain sensitive browser data/,
+				);
 			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			assert.equal(result.isError, true);
-			assert.equal(JSON.stringify(result.content).includes("super-secret-password"), false);
-			assert.equal(JSON.stringify(result.details).includes("super-secret-password"), false);
-			assert.equal(result.details?.fullOutputPath, undefined);
-			assert.match(String(result.details?.fullOutputUnavailable ?? ""), /discarded because it may contain sensitive browser data/);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension renders confirmation recovery and redacts sensitive confirmation context", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-confirm-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write(JSON.stringify({ success: false, data: { confirmation_required: true, confirmation_id: "c_sensitive", action: "POST https://user:pass@example.com/delete?token=secret Authorization: Bearer raw-token" } }));
+test(
+	"agentBrowserExtension renders confirmation recovery and redacts sensitive confirmation context",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-confirm-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write(JSON.stringify({ success: false, data: { confirmation_required: true, confirmation_id: "c_sensitive", action: "POST https://user:pass@example.com/delete?token=secret Authorization: Bearer raw-token" } }));
 process.exit(1);`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv(
+				{ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_PAGE_URL: "https://example.com/" },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--confirm-actions", "click", "click", "@danger"],
-			});
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["--confirm-actions", "click", "click", "@danger"],
+					});
 
-			assert.equal(result.isError, true);
-			assert.equal(result.content[0]?.type, "text");
-			const text = (result.content[0] as { text: string }).text;
-			assert.match(text, /Confirmation required\./);
-			assert.match(text, /Pending confirmation id: c_sensitive/);
-			assert.match(text, /\["confirm", "c_sensitive"\]/);
-			assert.match(text, /\["deny", "c_sensitive"\]/);
-			assert.match(String(result.details?.summary ?? ""), /Confirmation required: c_sensitive/);
-			assert.equal(result.details?.resultCategory, "failure");
-			assert.equal(result.details?.failureCategory, "confirmation-required");
-			const nextActions = result.details?.nextActions as Array<{ params?: { args: string[] } }> | undefined;
-			assert.deepEqual(nextActions?.map((action) => action.params?.args), [
-				["--session", result.details?.sessionName, "confirm", "c_sensitive"],
-				["--session", result.details?.sessionName, "deny", "c_sensitive"],
-			]);
-			assert.doesNotMatch(JSON.stringify(result.content), /user:pass|raw-token|token=secret/);
-			assert.doesNotMatch(JSON.stringify(result.details), /user:pass|raw-token|token=secret/);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					assert.equal(result.isError, true);
+					assert.equal(result.content[0]?.type, "text");
+					const text = readRecord(result.content[0]).text;
+					assert.match(readString(text), /Confirmation required\./);
+					assert.match(readString(text), /Pending confirmation id: c_sensitive/);
+					assert.match(readString(text), /\["confirm", "c_sensitive"\]/);
+					assert.match(readString(text), /\["deny", "c_sensitive"\]/);
+					assert.match(
+						readString(result.details?.summary ?? ""),
+						/Confirmation required: c_sensitive/,
+					);
+					assert.equal(result.details?.resultCategory, "failure");
+					assert.equal(result.details.failureCategory, "confirmation-required");
+					const nextActions = readArray(result.details.nextActions).map(readRecord);
+					assert.deepEqual(
+						nextActions.map((action) => readRecord(action.params).args),
+						[
+							["--session", result.details.sessionName, "confirm", "c_sensitive"],
+							["--session", result.details.sessionName, "deny", "c_sensitive"],
+						],
+					);
+					assert.doesNotMatch(JSON.stringify(result.content), /user:pass|raw-token|token=secret/);
+					assert.doesNotMatch(JSON.stringify(result.details), /user:pass|raw-token|token=secret/);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension passes confirm and deny recovery calls through to upstream", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-confirm-deny-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension passes confirm and deny recovery calls through to upstream",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-confirm-deny-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("confirm")) process.stdout.write(JSON.stringify({ success: true, data: "Action confirmed" }));
 else if (args.includes("deny")) process.stdout.write(JSON.stringify({ success: true, data: "Action denied" }));
 else process.stdout.write(JSON.stringify({ success: true, data: "ok" }));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const confirmed = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["confirm", "c_demo"] });
-			assert.equal(confirmed.isError, false);
-			assert.match((confirmed.content[0] as { text: string }).text, /Action confirmed/);
+				const confirmed = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["confirm", "c_demo"],
+				});
+				assert.equal(confirmed.isError, false);
+				assert.match(readString(readRecord(confirmed.content[0]).text), /Action confirmed/);
 
-			const denied = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["deny", "c_demo"] });
-			assert.equal(denied.isError, false);
-			assert.match((denied.content[0] as { text: string }).text, /Action denied/);
+				const denied = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["deny", "c_demo"],
+				});
+				assert.equal(denied.isError, false);
+				assert.match(readString(readRecord(denied.content[0]).text), /Action denied/);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.deepEqual(invocations[0]?.args.slice(-2), ["confirm", "c_demo"]);
-			assert.deepEqual(invocations[1]?.args.slice(-2), ["deny", "c_demo"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const invocations = await readInvocationLog(logPath);
+				assert.deepEqual(
+					invocations
+						.filter((entry) => ["confirm", "deny"].includes(entry.args.at(-2) ?? ""))
+						.map((entry) => entry.args.slice(-2)),
+					[
+						["confirm", "c_demo"],
+						["deny", "c_demo"],
+					],
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

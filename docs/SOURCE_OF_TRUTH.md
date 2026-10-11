@@ -1,10 +1,12 @@
 # Source-of-truth map
 
 Related docs:
+
 - [`../README.md`](../README.md)
 - [`ARCHITECTURE.md`](ARCHITECTURE.md)
 - [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md)
 - [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md)
+- [`CODE_QUALITY.md`](CODE_QUALITY.md)
 - [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md)
 - [`RELEASE.md`](RELEASE.md)
 
@@ -12,16 +14,17 @@ Related docs:
 
 This map keeps the active documentation set navigable. When changing behavior, update the smallest canonical document below instead of copying the same rule into every file.
 
-| Need | Canonical source | Notes |
-| --- | --- | --- |
-| Install, quick start, dependencies, user-facing value, common agent guidance | [`README.md`](../README.md) | Keep outcome-first and link deeper docs instead of embedding full command contracts. |
-| Runtime design, session model, package config policy, and architecture decisions | [`ARCHITECTURE.md`](ARCHITECTURE.md) | Record design rationale here when it changes implementation shape. |
-| Upstream command workflows and examples for agents | [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md) | Generated baseline blocks are bounded by HTML comments; regenerate with `npm run docs -- command-reference write`. |
-| Native tool input schema, `details` fields, result categories, and machine-readable contracts | [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md) | Keep this as the API contract; avoid release-history prose unless it explains an active field. |
-| Electron-specific lifecycle and troubleshooting | [`ELECTRON.md`](ELECTRON.md) | Public desktop app guide; link to contracts instead of duplicating schemas. |
-| Targeted upstream support, release gates, and live verification status | [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md) | Active checklist; closed requirement decisions link to the compact [`support-notes.md`](support-notes.md) index. |
-| Maintainer release process and smoke-test procedures | [`RELEASE.md`](RELEASE.md) and [`../AGENTS.md`](../AGENTS.md) | `AGENTS.md` is agent-specific operational guidance; release evidence belongs in `RELEASE.md` or CueLoop. |
-| Durable design decisions | [`ARCHITECTURE.md`](ARCHITECTURE.md), [`support-notes.md`](support-notes.md) | Keep only current rationale. |
+| Need                                                                                          | Canonical source                                                             | Notes                                                                                                              |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Install, quick start, dependencies, user-facing value, common agent guidance                  | [`README.md`](../README.md)                                                  | Keep outcome-first and link deeper docs instead of embedding full command contracts.                               |
+| Runtime design, session model, package config policy, and architecture decisions              | [`ARCHITECTURE.md`](ARCHITECTURE.md)                                         | Record design rationale here when it changes implementation shape.                                                 |
+| Upstream command workflows and examples for agents                                            | [`COMMAND_REFERENCE.md`](COMMAND_REFERENCE.md)                               | Generated baseline blocks are bounded by HTML comments; regenerate with `npm run docs -- command-reference write`. |
+| Native tool input schema, `details` fields, result categories, and machine-readable contracts | [`TOOL_CONTRACT.md`](TOOL_CONTRACT.md)                                       | Keep this as the API contract; avoid release-history prose unless it explains an active field.                     |
+| Electron-specific lifecycle and troubleshooting                                               | [`ELECTRON.md`](ELECTRON.md)                                                 | Public desktop app guide; link to contracts instead of duplicating schemas.                                        |
+| Strict lint/formatting, maintained-code scope, checker corrections, and semantic exceptions   | [`CODE_QUALITY.md`](CODE_QUALITY.md)                                         | Use the canonical acceptance and origin-isolation probes; CLI, CI, fixes, and editor share one verified checker.   |
+| Targeted upstream support, release gates, and live verification status                        | [`SUPPORT_MATRIX.md`](SUPPORT_MATRIX.md)                                     | Active checklist; closed requirement decisions link to the compact [`support-notes.md`](support-notes.md) index.   |
+| Maintainer release process and smoke-test procedures                                          | [`RELEASE.md`](RELEASE.md) and [`../AGENTS.md`](../AGENTS.md)                | `AGENTS.md` is agent-specific operational guidance; release evidence belongs in `RELEASE.md` or CueLoop.           |
+| Durable design decisions                                                                      | [`ARCHITECTURE.md`](ARCHITECTURE.md), [`support-notes.md`](support-notes.md) | Keep only current rationale.                                                                                       |
 
 ## Update rules
 

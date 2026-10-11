@@ -1,5 +1,6 @@
 import { isRecord } from "../parsing.js";
-import { extractRefSnapshotFromData, type SessionRefSnapshot } from "../session-page-state.js";
+import { extractRefSnapshotFromData } from "../session-page-observation.js";
+import type { SessionRefSnapshot } from "../session-page-types.js";
 import { getEditableRefEvidence } from "./editable-ref-evidence.js";
 import { type AgentBrowserNextAction, withOptionalSessionArgs } from "./next-actions.js";
 import {
@@ -13,259 +14,335 @@ import {
 } from "./snapshot-refs.js";
 import { compareRefIds } from "./text.js";
 
-export type SelectorRecoveryActionName = "check" | "click" | "fill" | "select" | "uncheck";
-
-export interface SelectorRecoveryCompiledAction {
-	action: SelectorRecoveryActionName;
-	args: string[];
-	locator?: string;
-	selector?: string;
-	values?: string[];
-}
+import {
+	getFindVisibleRefFallbackTarget,
+	type SelectorRecoveryActionName,
+	type SelectorRecoveryCompiledAction,
+	type VisibleRefFallbackTarget,
+} from "./selector-recovery-target.js";
+export type {
+	SelectorRecoveryActionName,
+	SelectorRecoveryCompiledAction,
+	VisibleRefFallbackTarget,
+} from "./selector-recovery-target.js";
 
 export interface VisibleRefFallbackCandidate {
-	action: SelectorRecoveryActionName;
-	args?: string[];
-	editableEvidence?: boolean;
-	name: string;
-	reason: string;
-	ref: string;
-	role: string;
+	readonly action: SelectorRecoveryActionName;
+	readonly args?: readonly string[];
+	readonly editableEvidence?: boolean;
+	readonly name: string;
+	readonly reason: string;
+	readonly ref: string;
+	readonly role: string;
 }
 
 export interface VisibleRefFallbackDiagnostic {
-	candidates: VisibleRefFallbackCandidate[];
-	snapshot: SessionRefSnapshot;
-	summary: string;
-	target: {
-		action: SelectorRecoveryActionName;
-		roles: string[];
-		targetName: string;
+	readonly candidates: readonly VisibleRefFallbackCandidate[];
+	readonly snapshot: SessionRefSnapshot;
+	readonly summary: string;
+	readonly target: {
+		readonly action: SelectorRecoveryActionName;
+		readonly roles: readonly string[];
+		readonly targetName: string;
 	};
 }
 
-export type PublicVisibleRefFallbackCandidate = Omit<VisibleRefFallbackCandidate, "editableEvidence">;
+export type PublicVisibleRefFallbackCandidate = Omit<
+	VisibleRefFallbackCandidate,
+	"editableEvidence"
+>;
 
-export type PublicVisibleRefFallbackDiagnostic = Omit<VisibleRefFallbackDiagnostic, "candidates"> & {
-	candidates: PublicVisibleRefFallbackCandidate[];
+export type PublicVisibleRefFallbackDiagnostic = Omit<
+	VisibleRefFallbackDiagnostic,
+	"candidates"
+> & {
+	readonly candidates: readonly PublicVisibleRefFallbackCandidate[];
 };
 
-export interface VisibleRefFallbackTarget {
-	action: SelectorRecoveryActionName;
-	optionValues?: string[];
-	roles: string[];
-	text?: string;
-	targetName: string;
-}
-
 export interface RichInputRecoveryCandidate {
-	clickArgs: string[];
-	focusArgs: string[];
-	name: string;
-	reason: string;
-	ref: string;
-	role: string;
+	readonly clickArgs: readonly string[];
+	readonly focusArgs: readonly string[];
+	readonly name: string;
+	readonly reason: string;
+	readonly ref: string;
+	readonly role: string;
 }
 
 export interface RichInputRecoveryDiagnostic {
-	candidates: RichInputRecoveryCandidate[];
-	inputMethodHint: string;
-	nextActionIds: string[];
-	summary: string;
-	target: {
-		roles: string[];
-		targetName: string;
+	readonly candidates: readonly RichInputRecoveryCandidate[];
+	readonly inputMethodHint: string;
+	readonly nextActionIds: readonly string[];
+	readonly summary: string;
+	readonly target: {
+		readonly roles: readonly string[];
+		readonly targetName: string;
 	};
 }
 
-const SELECTOR_RECOVERY_ACTION_NAMES = new Set<SelectorRecoveryActionName>(["check", "click", "fill", "select", "uncheck"]);
 const VISIBLE_REF_FALLBACK_CANDIDATE_LIMIT = 3;
 const EDITABLE_CONTROL_ROLES = new Set(["combobox", "searchbox", "textbox"]);
 const RICH_INPUT_RECOVERY_EDITABLE_ROLES = new Set(["searchbox", "textbox"]);
-const RICH_INPUT_RECOVERY_HINT = "After the editable ref is focused, use keyboard type when a framework-controlled editor requires real key events. keyboard inserttext is paste-like and needs separate application-state verification. Do not press Enter or otherwise submit unless the user flow explicitly calls for it.";
-
-function isSelectorRecoveryActionName(action: string): action is SelectorRecoveryActionName {
-	return SELECTOR_RECOVERY_ACTION_NAMES.has(action as SelectorRecoveryActionName);
-}
-
-function getFindNameFlagValue(args: string[], startIndex: number): string | undefined {
-	const nameFlagIndex = args.indexOf("--name", startIndex);
-	const name = nameFlagIndex >= 0 ? args[nameFlagIndex + 1] : undefined;
-	return typeof name === "string" && name.length > 0 ? name : undefined;
-}
-
-function collectFindTrailingValues(args: string[], startIndex: number): string[] {
-	const values: string[] = [];
-	for (let index = startIndex; index < args.length; index += 1) {
-		const token = args[index];
-		if (!token || token.startsWith("-")) break;
-		values.push(token);
-	}
-	return values;
-}
-
-function getFindVisibleRefFallbackTarget(args: string[], options: { allowLeadingDashFillText?: boolean } = {}): VisibleRefFallbackTarget | undefined {
-	const findIndex = args[0] === "--session" ? 2 : 0;
-	if (args[findIndex] !== "find") return undefined;
-	const locator = args[findIndex + 1];
-	const value = args[findIndex + 2];
-	const action = args[findIndex + 3];
-	if (!locator || !value || !isSelectorRecoveryActionName(action)) return undefined;
-	if (action === "select") {
-		const optionValues = collectFindTrailingValues(args, findIndex + 4);
-		if (locator === "role") {
-			if (!/^(?:combobox|listbox)$/i.test(value)) return undefined;
-			const targetName = getFindNameFlagValue(args, findIndex + 4);
-			return targetName ? { action, optionValues, roles: [value.toLowerCase()], targetName } : undefined;
-		}
-		if (locator === "label") {
-			return { action, optionValues, roles: ["combobox", "listbox"], targetName: value };
-		}
-		return undefined;
-	}
-	const text = action === "fill" ? args[findIndex + 4] : undefined;
-	if (action === "fill" && (!text || (!options.allowLeadingDashFillText && text.startsWith("-")))) return undefined;
-	if (locator === "role") {
-		const targetName = getFindNameFlagValue(args, findIndex + 4);
-		return targetName ? { action, roles: [value], targetName, text } : undefined;
-	}
-	if (locator === "text" && action === "click") {
-		return { action, roles: ["button", "link"], targetName: value };
-	}
-	if (locator === "text" && action === "fill") {
-		return { action, roles: ["searchbox", "textbox"], targetName: value, text };
-	}
-	if (locator === "label" && action === "fill") {
-		return { action, roles: ["textbox"], targetName: value, text };
-	}
-	if (locator === "placeholder" && action === "fill") {
-		return { action, roles: ["searchbox", "textbox"], targetName: value, text };
-	}
-	return undefined;
-}
+const RICH_INPUT_RECOVERY_HINT =
+	"After the editable ref is focused, use keyboard type when a framework-controlled editor requires real key events. keyboard inserttext is paste-like and needs separate application-state verification. Do not press Enter or otherwise submit unless the user flow explicitly calls for it.";
 
 export function getVisibleRefFallbackTarget(options: {
-	commandTokens: string[];
-	compiledSemanticAction?: SelectorRecoveryCompiledAction;
+	readonly commandTokens: readonly string[];
+	readonly compiledSemanticAction?: SelectorRecoveryCompiledAction;
 }): VisibleRefFallbackTarget | undefined {
-	return getFindVisibleRefFallbackTarget(options.commandTokens, { allowLeadingDashFillText: true }) ?? (options.compiledSemanticAction ? getFindVisibleRefFallbackTarget(options.compiledSemanticAction.args, { allowLeadingDashFillText: true }) : undefined);
+	return (
+		getFindVisibleRefFallbackTarget(options.commandTokens) ??
+		(options.compiledSemanticAction
+			? getFindVisibleRefFallbackTarget(options.compiledSemanticAction.args)
+			: undefined)
+	);
 }
 
-function getVisibleRefFallbackCandidates(target: VisibleRefFallbackTarget, snapshotData: unknown): VisibleRefFallbackCandidate[] {
-	const refs = getSnapshotRefRecord(snapshotData);
-	if (!refs) return [];
+function getDirectRefFallbackArgs(
+	target: VisibleRefFallbackTarget,
+	ref: string,
+): readonly string[] | undefined {
+	if (target.action === "fill") {
+		return undefined;
+	}
+	if (target.action === "select") {
+		return target.optionValues && target.optionValues.length > 0
+			? ["select", `@${ref}`, ...target.optionValues]
+			: undefined;
+	}
+	return [target.action, `@${ref}`];
+}
+
+function getCandidateEditableEvidence(
+	snapshot: SessionRefSnapshot | undefined,
+	ref: string,
+	entry: Readonly<Record<string, unknown>>,
+	line: string | undefined,
+): boolean | undefined {
+	return snapshot
+		? snapshot.refs?.[ref]?.isEditable
+		: getEditableRefEvidence({ ref: entry, text: line });
+}
+
+function matchesFallbackName(name: string | undefined, targetName: string): name is string {
+	return (
+		name !== undefined &&
+		name.length > 0 &&
+		normalizeSemanticActionAccessibleName(name) === targetName
+	);
+}
+
+function isDisallowedEditableFill(
+	action: SelectorRecoveryActionName,
+	evidence: boolean | undefined,
+	role: string,
+): boolean {
+	return action === "fill" && evidence === false && EDITABLE_CONTROL_ROLES.has(role.toLowerCase());
+}
+
+function getVisibleRefFallbackCandidates(
+	target: VisibleRefFallbackTarget,
+	snapshotData: unknown,
+	refSnapshot?: SessionRefSnapshot,
+): VisibleRefFallbackCandidate[] {
+	const refs = refSnapshot?.refs ?? getSnapshotRefRecord(snapshotData);
+	if (!refs) {
+		return [];
+	}
 	const snapshotLineByRef = getSnapshotLineTextByRef(snapshotData);
 	const roleOrder = target.roles.map((role) => role.toLowerCase());
 	const targetName = normalizeSemanticActionAccessibleName(target.targetName);
 	const candidates = Object.entries(refs).flatMap(([ref, entry]): VisibleRefFallbackCandidate[] => {
-		if (!/^e\d+$/.test(ref) || !isRecord(entry)) return [];
+		if (!/^e\d+$/.test(ref) || !isRecord(entry)) {
+			return [];
+		}
 		const snapshotLine = snapshotLineByRef.get(ref);
-		const editableEvidence = getEditableRefEvidence({ ref: entry, text: snapshotLine });
+		const editableEvidence = getCandidateEditableEvidence(refSnapshot, ref, entry, snapshotLine);
 		const role = getSnapshotRefRole(entry, editableEvidence);
 		const name = typeof entry.name === "string" ? entry.name : undefined;
-		if (!role || !name || !roleOrder.includes(role.toLowerCase()) || normalizeSemanticActionAccessibleName(name) !== targetName) return [];
-		if (target.action === "fill" && editableEvidence === false && EDITABLE_CONTROL_ROLES.has(role.toLowerCase())) return [];
-		const directRefArgs = target.action === "fill"
-			? undefined
-			: target.action === "select" && target.optionValues && target.optionValues.length > 0
-				? ["select", `@${ref}`, ...target.optionValues]
-				: target.action === "select"
-					? undefined
-					: [target.action, `@${ref}`];
-		return [{
-			action: target.action,
-			...(directRefArgs ? { args: directRefArgs } : {}),
-			name,
-			reason: `Current snapshot shows ${role} ${JSON.stringify(name)} at @${ref}, matching the failed ${target.action} locator exactly.`,
-			ref: `@${ref}`,
-			role,
-			...(editableEvidence !== undefined ? { editableEvidence } : {}),
-		}];
+		if (!matchesFallbackName(name, targetName) || !roleOrder.includes(role.toLowerCase())) {
+			return [];
+		}
+		if (isDisallowedEditableFill(target.action, editableEvidence, role)) {
+			return [];
+		}
+		const directRefArgs = getDirectRefFallbackArgs(target, ref);
+		return [
+			{
+				action: target.action,
+				...(directRefArgs ? { args: directRefArgs } : {}),
+				name,
+				reason: `Current snapshot shows ${role} ${JSON.stringify(name)} at @${ref}, matching the failed ${target.action} locator exactly.`,
+				ref: `@${ref}`,
+				role,
+				...(editableEvidence !== undefined ? { editableEvidence } : {}),
+			},
+		];
 	});
-	candidates.sort((left, right) => roleOrder.indexOf(left.role.toLowerCase()) - roleOrder.indexOf(right.role.toLowerCase()) || compareRefIds(left.ref.slice(1), right.ref.slice(1)));
+	candidates.sort((left, right) => {
+		const difference =
+			roleOrder.indexOf(left.role.toLowerCase()) - roleOrder.indexOf(right.role.toLowerCase());
+		return difference !== 0 ? difference : compareRefIds(left.ref.slice(1), right.ref.slice(1));
+	});
 	return candidates.slice(0, VISIBLE_REF_FALLBACK_CANDIDATE_LIMIT);
 }
 
 export function buildVisibleRefFallbackDiagnosticFromSnapshot(options: {
-	snapshotData: unknown;
-	target: VisibleRefFallbackTarget;
+	readonly snapshotData: unknown;
+	readonly target: VisibleRefFallbackTarget;
 }): VisibleRefFallbackDiagnostic | undefined {
 	const snapshot = extractRefSnapshotFromData(options.snapshotData);
-	if (!snapshot) return undefined;
+	if (!snapshot) {
+		return undefined;
+	}
 	const candidates = getVisibleRefFallbackCandidates(options.target, options.snapshotData);
-	if (candidates.length === 0) return undefined;
+	if (candidates.length === 0) {
+		return undefined;
+	}
 	return {
 		candidates,
 		snapshot,
-		summary: candidates.length === 1
-			? `Current snapshot has one exact visible ref match for ${options.target.action} ${JSON.stringify(options.target.targetName)}.`
-			: `Current snapshot has ${candidates.length} exact visible ref matches for ${options.target.action} ${JSON.stringify(options.target.targetName)}; choose only if the intended control is unambiguous.`,
-		target: { action: options.target.action, roles: options.target.roles, targetName: options.target.targetName },
+		summary:
+			candidates.length === 1
+				? `Current snapshot has one exact visible ref match for ${options.target.action} ${JSON.stringify(options.target.targetName)}.`
+				: `Current snapshot has ${candidates.length} exact visible ref matches for ${options.target.action} ${JSON.stringify(options.target.targetName)}; choose only if the intended control is unambiguous.`,
+		target: {
+			action: options.target.action,
+			roles: options.target.roles,
+			targetName: options.target.targetName,
+		},
 	};
 }
 
 export interface VisibleRefActionResolution {
-	args: string[];
-	snapshot: SessionRefSnapshot;
+	readonly args: readonly string[];
+	readonly snapshot: SessionRefSnapshot;
+}
+
+function resolveFillCandidateArgs(
+	candidates: readonly VisibleRefFallbackCandidate[],
+	text: string | undefined,
+	allowFill: boolean | undefined,
+): readonly string[] | undefined {
+	if (allowFill !== true || candidates.length !== 1 || text === undefined) {
+		return undefined;
+	}
+	const candidate = candidates.at(0);
+	if (
+		!candidate ||
+		candidate.editableEvidence === false ||
+		!EDITABLE_CONTROL_ROLES.has(candidate.role.toLowerCase())
+	) {
+		return undefined;
+	}
+	return ["fill", candidate.ref, text];
+}
+
+function resolveSelectCandidateArgs(
+	candidates: readonly VisibleRefFallbackCandidate[],
+	values: readonly string[] | undefined,
+): readonly string[] | undefined {
+	if (candidates.length !== 1 || !values || values.length === 0) {
+		return undefined;
+	}
+	const candidate = candidates.at(0);
+	return candidate ? ["select", candidate.ref, ...values] : undefined;
+}
+
+function resolveCandidateArgs(
+	target: VisibleRefFallbackTarget,
+	candidates: readonly VisibleRefFallbackCandidate[],
+	allowFill: boolean | undefined,
+	selectValues: readonly string[] | undefined,
+): readonly string[] | undefined {
+	if (target.action === "fill") {
+		return resolveFillCandidateArgs(candidates, target.text, allowFill);
+	}
+	if (target.action === "select") {
+		return resolveSelectCandidateArgs(candidates, selectValues);
+	}
+	return candidates.find((candidate) => candidate.args !== undefined)?.args;
 }
 
 export function resolveVisibleRefActionFromSnapshot(options: {
-	allowFill?: boolean;
-	compiledAction: SelectorRecoveryCompiledAction;
-	snapshotData: unknown;
+	readonly allowFill?: boolean;
+	readonly compiledAction: SelectorRecoveryCompiledAction;
+	readonly refSnapshot?: SessionRefSnapshot;
+	readonly snapshotData?: unknown;
 }): VisibleRefActionResolution | undefined {
-	const target = getFindVisibleRefFallbackTarget(options.compiledAction.args, { allowLeadingDashFillText: true });
-	if (!target) return undefined;
-	const snapshot = extractRefSnapshotFromData(options.snapshotData);
-	if (!snapshot) return undefined;
-	const selectOptionValues = options.compiledAction.values && options.compiledAction.values.length > 0
-		? options.compiledAction.values
-		: target.optionValues;
-	const effectiveTarget = target.action === "select" && selectOptionValues
-		? { ...target, optionValues: selectOptionValues }
-		: target;
-	const candidates = getVisibleRefFallbackCandidates(effectiveTarget, options.snapshotData);
-	if (effectiveTarget.action === "fill") {
-		if (!options.allowFill || candidates.length !== 1 || effectiveTarget.text === undefined) return undefined;
-		const [candidate] = candidates;
-		if (!candidate || candidate.editableEvidence === false || !EDITABLE_CONTROL_ROLES.has(candidate.role.toLowerCase())) return undefined;
-		return { args: ["fill", candidate.ref, effectiveTarget.text], snapshot };
+	const target = getFindVisibleRefFallbackTarget(options.compiledAction.args);
+	if (!target) {
+		return undefined;
 	}
-	if (effectiveTarget.action === "select") {
-		if (candidates.length !== 1 || !selectOptionValues || selectOptionValues.length === 0) return undefined;
-		const [candidate] = candidates;
-		if (!candidate) return undefined;
-		return { args: ["select", candidate.ref, ...selectOptionValues], snapshot };
+	const snapshot = options.refSnapshot ?? extractRefSnapshotFromData(options.snapshotData);
+	if (!snapshot) {
+		return undefined;
 	}
-	const candidate = candidates.find((item) => item.args !== undefined);
-	if (!candidate?.args) return undefined;
-	return { args: candidate.args, snapshot };
+	const selectOptionValues =
+		options.compiledAction.values && options.compiledAction.values.length > 0
+			? options.compiledAction.values
+			: target.optionValues;
+	const effectiveTarget =
+		target.action === "select" && selectOptionValues
+			? { ...target, optionValues: selectOptionValues }
+			: target;
+	const candidates = getVisibleRefFallbackCandidates(
+		effectiveTarget,
+		options.snapshotData,
+		options.refSnapshot,
+	);
+	const args = resolveCandidateArgs(
+		effectiveTarget,
+		candidates,
+		options.allowFill,
+		selectOptionValues,
+	);
+	return args ? { args, snapshot } : undefined;
 }
 
-export function buildVisibleRefFallbackNextActions(options: { diagnostic: VisibleRefFallbackDiagnostic; sessionName?: string }): AgentBrowserNextAction[] {
+export function buildVisibleRefFallbackNextActions(options: {
+	readonly diagnostic: VisibleRefFallbackDiagnostic;
+	readonly sessionName?: string;
+}): AgentBrowserNextAction[] {
 	const ambiguous = options.diagnostic.candidates.length > 1;
-	return options.diagnostic.candidates.flatMap((candidate, index) => candidate.args ? [{
-		id: ambiguous ? `try-current-visible-ref-${index + 1}` : "try-current-visible-ref",
-		params: { args: withOptionalSessionArgs(options.sessionName, candidate.args) },
-		reason: candidate.reason,
-		safety: ambiguous
-			? "Several current refs share the same exact role/name. Inspect the snapshot and use only the ref that clearly matches the intended target."
-			: "Use only while this current snapshot still represents the page; refresh refs first if the page changed.",
-		tool: "agent_browser" as const,
-	}] : []);
+	return options.diagnostic.candidates.flatMap((candidate, index) =>
+		candidate.args
+			? [
+					{
+						id: ambiguous ? `try-current-visible-ref-${index + 1}` : "try-current-visible-ref",
+						params: { args: withOptionalSessionArgs(options.sessionName, candidate.args) },
+						reason: candidate.reason,
+						safety: ambiguous
+							? "Several current refs share the same exact role/name. Inspect the snapshot and use only the ref that clearly matches the intended target."
+							: "Use only while this current snapshot still represents the page; refresh refs first if the page changed.",
+						tool: "agent_browser" as const,
+					},
+				]
+			: [],
+	);
 }
 
-export function formatVisibleRefFallbackText(diagnostic: VisibleRefFallbackDiagnostic | undefined): string | undefined {
-	if (!diagnostic) return undefined;
+export function formatVisibleRefFallbackText(
+	diagnostic: VisibleRefFallbackDiagnostic | undefined,
+): string | undefined {
+	if (!diagnostic) {
+		return undefined;
+	}
 	return [
 		"Current snapshot ref fallback:",
-		...diagnostic.candidates.map((candidate) => `- ${candidate.ref}${candidate.role ? ` ${candidate.role}` : ""} ${JSON.stringify(candidate.name)}: ${candidate.reason}`),
+		...diagnostic.candidates.map(
+			(candidate) =>
+				`- ${candidate.ref}${candidate.role.length > 0 ? ` ${candidate.role}` : ""} ${JSON.stringify(candidate.name)}: ${candidate.reason}`,
+		),
 	].join("\n");
 }
 
-export function sanitizeVisibleRefFallbackDiagnostic(diagnostic: VisibleRefFallbackDiagnostic): PublicVisibleRefFallbackDiagnostic {
+export function sanitizeVisibleRefFallbackDiagnostic(
+	diagnostic: VisibleRefFallbackDiagnostic,
+): PublicVisibleRefFallbackDiagnostic {
 	return {
-		candidates: diagnostic.candidates.map(({ editableEvidence: _editableEvidence, ...candidate }) => candidate),
+		candidates: diagnostic.candidates.map(
+			({ editableEvidence: _editableEvidence, ...candidate }) => candidate,
+		),
 		snapshot: diagnostic.snapshot,
 		summary: diagnostic.summary,
 		target: diagnostic.target,
@@ -273,32 +350,48 @@ export function sanitizeVisibleRefFallbackDiagnostic(diagnostic: VisibleRefFallb
 }
 
 function isRichInputRecoveryCandidate(candidate: VisibleRefFallbackCandidate): boolean {
-	return candidate.action === "fill" && candidate.editableEvidence !== false && RICH_INPUT_RECOVERY_EDITABLE_ROLES.has(candidate.role.toLowerCase());
+	return (
+		candidate.action === "fill" &&
+		candidate.editableEvidence !== false &&
+		RICH_INPUT_RECOVERY_EDITABLE_ROLES.has(candidate.role.toLowerCase())
+	);
 }
 
-export function buildRichInputRecoveryDiagnostic(diagnostic: VisibleRefFallbackDiagnostic | undefined): RichInputRecoveryDiagnostic | undefined {
-	if (!diagnostic || diagnostic.target.action !== "fill") return undefined;
-	const candidates = diagnostic.candidates.filter(isRichInputRecoveryCandidate).map((candidate): RichInputRecoveryCandidate => ({
-		clickArgs: ["click", candidate.ref],
-		focusArgs: ["focus", candidate.ref],
-		name: candidate.name,
-		reason: `Current snapshot shows editable ${candidate.role} ${JSON.stringify(candidate.name)} at ${candidate.ref}; focus or click it before keyboard insertion instead of retrying fill with copied text.`,
-		ref: candidate.ref,
-		role: candidate.role,
-	}));
-	if (candidates.length === 0) return undefined;
+export function buildRichInputRecoveryDiagnostic(
+	diagnostic: VisibleRefFallbackDiagnostic | undefined,
+): RichInputRecoveryDiagnostic | undefined {
+	if (!diagnostic || diagnostic.target.action !== "fill") {
+		return undefined;
+	}
+	const candidates = diagnostic.candidates
+		.filter(isRichInputRecoveryCandidate)
+		.map((candidate): RichInputRecoveryCandidate => ({
+			clickArgs: ["click", candidate.ref],
+			focusArgs: ["focus", candidate.ref],
+			name: candidate.name,
+			reason: `Current snapshot shows editable ${candidate.role} ${JSON.stringify(candidate.name)} at ${candidate.ref}; focus or click it before keyboard insertion instead of retrying fill with copied text.`,
+			ref: candidate.ref,
+			role: candidate.role,
+		}));
+	if (candidates.length === 0) {
+		return undefined;
+	}
 	return {
 		candidates,
 		inputMethodHint: RICH_INPUT_RECOVERY_HINT,
 		nextActionIds: getAgentBrowserRichInputRecoveryNextActionIds(candidates.length),
-		summary: candidates.length === 1
-			? "Fill locator missed, but the current snapshot has one exact editable ref candidate for safe keyboard-based recovery."
-			: `Fill locator missed, but the current snapshot has ${candidates.length} exact editable ref candidates; choose only if the intended input is unambiguous.`,
+		summary:
+			candidates.length === 1
+				? "Fill locator missed, but the current snapshot has one exact editable ref candidate for safe keyboard-based recovery."
+				: `Fill locator missed, but the current snapshot has ${candidates.length} exact editable ref candidates; choose only if the intended input is unambiguous.`,
 		target: { roles: diagnostic.target.roles, targetName: diagnostic.target.targetName },
 	};
 }
 
-export function buildRichInputRecoveryNextActions(options: { diagnostic: RichInputRecoveryDiagnostic; sessionName?: string }): AgentBrowserNextAction[] {
+export function buildRichInputRecoveryNextActions(options: {
+	readonly diagnostic: RichInputRecoveryDiagnostic;
+	readonly sessionName?: string;
+}): AgentBrowserNextAction[] {
 	const candidateCount = options.diagnostic.candidates.length;
 	const ambiguous = candidateCount > 1;
 	return options.diagnostic.candidates.flatMap((candidate, index): AgentBrowserNextAction[] => {
@@ -326,18 +419,23 @@ export function buildRichInputRecoveryNextActions(options: { diagnostic: RichInp
 	});
 }
 
-export function formatRichInputRecoveryText(diagnostic: RichInputRecoveryDiagnostic | undefined): string | undefined {
-	if (!diagnostic) return undefined;
+export function formatRichInputRecoveryText(
+	diagnostic: RichInputRecoveryDiagnostic | undefined,
+): string | undefined {
+	if (!diagnostic) {
+		return undefined;
+	}
 	return [
 		"Rich input recovery:",
 		...diagnostic.candidates.map((candidate, index) => {
-			const [focusId, clickId] = diagnostic.nextActionIds.slice(index * 2, index * 2 + 2);
-			return `- ${candidate.ref} ${candidate.role} ${JSON.stringify(candidate.name)}: use ${focusId} or ${clickId}; then use keyboard type for framework-controlled editors, or paste-like keyboard inserttext only with separate application-state verification.`;
+			const focusId = diagnostic.nextActionIds.at(index * 2);
+			const clickId = diagnostic.nextActionIds.at(index * 2 + 1);
+			return `- ${candidate.ref} ${candidate.role} ${JSON.stringify(candidate.name)}: use ${focusId ?? "undefined"} or ${clickId ?? "undefined"}; then use keyboard type for framework-controlled editors, or paste-like keyboard inserttext only with separate application-state verification.`;
 		}),
 		`- ${diagnostic.inputMethodHint}`,
 	].join("\n");
 }
 
-export function normalizeSemanticActionAccessibleName(name: string): string {
+function normalizeSemanticActionAccessibleName(name: string): string {
 	return name.replace(/\s+/g, " ").trim().toLowerCase();
 }

@@ -7,6 +7,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readArray, readRecord, readString } from "./helpers/assertions.js";
 
 import {
 	createExtensionHarness,
@@ -17,13 +18,16 @@ import {
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
 
-test("agentBrowserExtension enriches semanticAction click success with page state probe and prose parity", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-semantic-success-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension enriches semanticAction click success with page state probe and prose parity",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-semantic-success-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 const valueFlags = new Set(["--session"]);
@@ -50,57 +54,74 @@ if (command === "find") {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: { ok: true } }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const semanticClick = await executeRegisteredTool(harness.tool, harness.ctx, {
-				semanticAction: { action: "click", locator: "text", value: "Close" },
+				const semanticClick = await executeRegisteredTool(harness.tool, harness.ctx, {
+					semanticAction: { action: "click", locator: "text", value: "Close" },
+				});
+				assert.equal(semanticClick.isError, false);
+				const semanticText = readString(readRecord(semanticClick.content[0]).text);
+				assert.match(semanticText, /Clicked: text "Close"/);
+				assert.doesNotMatch(semanticText, /data-agent-browser-located/);
+				assert.match(semanticText, /Current page:/);
+				assert.match(semanticText, /Example Domain/);
+				assert.match(semanticText, /https:\/\/example.test\//);
+				assert.match(
+					readString(readRecord(semanticClick.details).summary),
+					/click → Example Domain/,
+				);
+				assert.deepEqual(readRecord(semanticClick.details).navigationSummary, {
+					title: "Example Domain",
+					url: "https://example.test/",
+					urlChanged: false,
+				});
+				assert.equal(
+					readRecord(readRecord(semanticClick.details).pageChangeSummary).command,
+					"click",
+				);
+				assert.equal(
+					readRecord(readRecord(semanticClick.details).pageChangeSummary).changeType,
+					"mutation",
+				);
+				assert.equal(
+					readRecord(readRecord(semanticClick.details).pageChangeSummary).observed,
+					false,
+				);
+				assert.match(semanticText, /Action dispatched; application change unverified/);
+				const nextActionIds = readArray(readRecord(semanticClick.details).nextActions).map(
+					(action) => readRecord(action).id,
+				);
+				assert.ok(nextActionIds.includes("inspect-after-mutation"));
+
+				const directClick = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["click", "#direct"],
+				});
+				assert.equal(directClick.isError, false);
+				const directText = readString(readRecord(directClick.content[0]).text);
+				assert.match(directText, /Clicked: true/);
+				assert.match(directText, /Href: https:\/\/example.test\/docs/);
+				assert.match(directText, /Current page:/);
+
+				const invocations = await readInvocationLog(logPath);
+				const urlProbeIndex = invocations.findIndex(
+					(entry) => entry.args.includes("get") && entry.args.includes("url"),
+				);
+				const titleProbeIndex = invocations.findIndex(
+					(entry) => entry.args.includes("get") && entry.args.includes("title"),
+				);
+				assert.ok(urlProbeIndex >= 0, "expected URL verification after semantic click");
+				assert.ok(
+					titleProbeIndex > urlProbeIndex,
+					"expected title lookup only after URL verification",
+				);
 			});
-			assert.equal(semanticClick.isError, false);
-			const semanticText = (semanticClick.content[0] as { text: string }).text;
-			assert.match(semanticText, /Clicked: text "Close"/);
-			assert.doesNotMatch(semanticText, /data-agent-browser-located/);
-			assert.match(semanticText, /Current page:/);
-			assert.match(semanticText, /Example Domain/);
-			assert.match(semanticText, /https:\/\/example.test\//);
-			assert.match(semanticClick.details?.summary as string, /click → Example Domain/);
-			assert.deepEqual(
-				(semanticClick.details?.navigationSummary as { title?: string; url?: string; urlChanged?: boolean } | undefined),
-				{ title: "Example Domain", url: "https://example.test/" },
-			);
-			assert.equal(
-				(semanticClick.details?.pageChangeSummary as { command?: string; changeType?: string } | undefined)?.command,
-				"click",
-			);
-			assert.equal(
-				(semanticClick.details?.pageChangeSummary as { command?: string; changeType?: string; observed?: boolean } | undefined)?.changeType,
-				"mutation",
-			);
-			assert.equal((semanticClick.details?.pageChangeSummary as { observed?: boolean } | undefined)?.observed, false);
-			assert.match(semanticText, /Action dispatched; application change unverified/);
-			const nextActionIds = (semanticClick.details?.nextActions as Array<{ id: string }> | undefined)?.map((action) => action.id);
-			assert.ok(nextActionIds?.includes("inspect-after-mutation"));
-
-			const directClick = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["click", "#direct"],
-			});
-			assert.equal(directClick.isError, false);
-			const directText = (directClick.content[0] as { text: string }).text;
-			assert.match(directText, /Clicked: true/);
-			assert.match(directText, /Href: https:\/\/example.test\/docs/);
-			assert.match(directText, /Current page:/);
-
-			const invocations = await readInvocationLog(logPath);
-			const urlProbeIndex = invocations.findIndex((entry) => entry.args.includes("get") && entry.args.includes("url"));
-			const titleProbeIndex = invocations.findIndex((entry) => entry.args.includes("get") && entry.args.includes("title"));
-			assert.ok(urlProbeIndex >= 0, "expected URL verification after semantic click");
-			assert.ok(titleProbeIndex > urlProbeIndex, "expected title lookup only after URL verification");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

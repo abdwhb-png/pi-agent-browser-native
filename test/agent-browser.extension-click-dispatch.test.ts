@@ -9,6 +9,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { readRecord, readArray, readString } from "./helpers/assertions.js";
+import { runInNewContext } from "node:vm";
+
+import {
+	cleanupClickDispatchProbe,
+	collectClickDispatchDiagnostic,
+	prepareClickDispatchProbe,
+} from "../extensions/agent-browser/lib/orchestration/browser-run/click-dispatch.js";
 
 import {
 	createExtensionHarness,
@@ -19,16 +27,275 @@ import {
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
 
-test("agentBrowserExtension cleans up click dispatch probes after failed clicks", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-failure-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+// Native get attr resolves the real ref, not the probe's guessed name.
+const fakeClickIdentityCommands = `
+if (args.includes("get") && args.includes("attr")) {
+  const installed = fs.readFileSync(LOG_PATH, "utf8").trim().split("\\n").map(JSON.parse).find((row) => (row.stdin || "").includes("window[marker] = state"));
+  const marker = JSON.parse(installed.stdin.match(/const marker = ("[^"]+");/)[1]);
+  process.stdout.write(JSON.stringify({ success: true, data: { value: marker } }));
+  process.exit(0);
+}
+if (stdin.includes('status: "identity-marker-removed"')) {
+  process.stdout.write(JSON.stringify({ success: true, data: { result: { status: "identity-marker-removed" } } }));
+  process.exit(0);
+}
+`;
+
+function fakeIdentityCommands(logPath: string): string {
+	return fakeClickIdentityCommands.replace("LOG_PATH", JSON.stringify(logPath));
+}
+
+for (const mode of [
+	"match",
+	"mismatch",
+	"lookup-failure",
+	"install-failure",
+	"removal-failure",
+	"abort",
+	"expiry",
+] as const) {
+	const probeExpected = mode === "match" || mode === "expiry";
+	test(
+		`click dispatch identity ${mode} cleans up the exact candidate`,
+		{ concurrency: false },
+		async () => {
+			const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-identity-"));
+			const logPath = join(tempDir, "invocations.log");
+			const controller = new AbortController();
+			await writeFakeAgentBrowserBinary(
+				tempDir,
+				`
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const stdin = fs.readFileSync(0, "utf8");
+const mode = ${JSON.stringify(mode)};
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+const reply = (data) => process.stdout.write(JSON.stringify({ success: true, data }));
+if (args.includes("attr") && mode === "abort") {
+  setTimeout(() => {}, 30000);
+} else if (args.includes("attr") && mode === "mismatch") {
+  reply({ value: null });
+} else if ((args.includes("attr") && mode === "lookup-failure") ||
+           (stdin.includes("window[marker] = state") && mode === "install-failure") ||
+           (stdin.includes('status: "identity-marker-removed"') && mode === "removal-failure")) {
+  process.stdout.write(JSON.stringify({ success: false, error: "lost probe response" }));
+} else {
+  ${fakeIdentityCommands(logPath)}
+  if (stdin.includes("window[marker] = state")) reply({ result: { status: "installed" } });
+  else if (stdin.includes("no-native-event-observed")) reply({ result: { status: "no-native-event-observed", nativeEventCount: 0 } });
+  else reply({ result: { status: "cleaned-up" } });
+}
+`,
+			);
+			try {
+				await withPatchedEnv({ PATH: `${tempDir}:${process.env.PATH ?? ""}` }, async () => {
+					const options = {
+						commandTokens: ["click", "ref=e1"],
+						cwd: tempDir,
+						namespace: "identity-fixture",
+						sessionName: "click-fixture",
+						signal: controller.signal,
+						timeoutMs: 3000,
+						refSnapshot: { refIds: ["e1"], refs: { e1: { role: "button", name: "Save" } } },
+					};
+					const pending = prepareClickDispatchProbe(options);
+					if (mode === "abort") {
+						try {
+							const deadline = Date.now() + 5000;
+							while (
+								// Poll the observed dispatch/exit state before waiting again; parallel polls would race cancellation.
+								// oxlint-disable-next-line no-await-in-loop
+								!(await readInvocationLog(logPath)).some((entry) => entry.args.includes("attr"))
+							) {
+								// This deadline assertion fails closed during polling; dispatch and cleanup are checked after the loop.
+								// oxlint-disable-next-line node-test/no-conditional-assertion
+								assert.ok(Date.now() < deadline, "identity lookup must start before abort");
+								// Poll the observed dispatch/exit state before waiting again; parallel polls would race cancellation.
+								// oxlint-disable-next-line no-await-in-loop
+								await new Promise<void>((resolve) => {
+									setTimeout(resolve, 10);
+								});
+							}
+						} finally {
+							controller.abort();
+						}
+					}
+					const probe = await pending;
+					if (probeExpected) {
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(probe);
+					}
+					if (mode === "match") {
+						const diagnostic = await collectClickDispatchDiagnostic({ ...options, probe });
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.equal(
+							diagnostic?.status,
+							"no-native-event-observed",
+							"confirmed refs retain true no-dispatch detection",
+						);
+						await cleanupClickDispatchProbe({ ...options, probe });
+					} else if (mode !== "expiry") {
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.equal(
+							probe,
+							undefined,
+							"unconfirmed candidates cannot diagnose a click failure",
+						);
+					}
+					const invocations = await readInvocationLog(logPath);
+					const identityCall = invocations.find((entry) => entry.args.includes("attr"));
+					if (mode !== "install-failure") {
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(identityCall);
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.deepEqual(identityCall.args.slice(-4, -1), ["get", "attr", "@e1"]);
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(identityCall.args.includes("identity-fixture"));
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(identityCall.args.includes("click-fixture"));
+					}
+					const scripts = invocations
+						.filter((entry) => entry.args.includes("eval"))
+						.map((entry) => entry.stdin ?? "");
+					assert.equal(
+						scripts.some((script) => script.includes("cleaned-up")),
+						mode !== "match" && mode !== "expiry",
+					);
+					assert.equal(
+						scripts.some((script) => script.includes("no-native-event-observed")),
+						mode === "match",
+					);
+
+					// Execute the emitted scripts, not just their fake receipts. The collision
+					// intentionally picks Copy; cleanup must retain that exact node even detached.
+					class FixtureElement {
+						tagName = "BUTTON";
+						textContent = "Save";
+						parentElement = null;
+						attributes = new Map<string, string>();
+						getAttribute(name: string) {
+							return this.attributes.get(name) ?? null;
+						}
+						hasAttribute(name: string) {
+							return this.attributes.has(name);
+						}
+						setAttribute(name: string, value: string) {
+							this.attributes.set(name, value);
+						}
+						removeAttribute(name: string) {
+							this.attributes.delete(name);
+						}
+						getClientRects() {
+							return [this.getBoundingClientRect()];
+						}
+						getBoundingClientRect() {
+							return { bottom: 20, left: 0, right: 80, top: 0 };
+						}
+					}
+					const save = new FixtureElement();
+					save.setAttribute("title", "Save changes");
+					const copy = new FixtureElement();
+					copy.setAttribute("aria-labelledby", "copy-label");
+					let candidates = mode === "mismatch" ? [save, copy] : [copy];
+					const listeners = new Map<string, unknown>();
+					const window: Record<string, unknown> = {
+						innerHeight: 100,
+						innerWidth: 100,
+						getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+					};
+					let expire: (() => void) | undefined;
+					const timers = new Set<unknown>();
+					const context = {
+						window,
+						Element: FixtureElement,
+						Node: FixtureElement,
+						setTimeout: (callback: () => void, ms: number) => {
+							assert.equal(ms, 5000);
+							expire = callback;
+							timers.add(callback);
+							return callback;
+						},
+						clearTimeout: (timer: unknown) => timers.delete(timer),
+						document: {
+							querySelectorAll: () => candidates,
+							addEventListener: (type: string, listener: unknown) => listeners.set(type, listener),
+							removeEventListener: (type: string) => listeners.delete(type),
+						},
+					};
+					const installed = readRecord(runInNewContext(scripts[0], context));
+					assert.equal(installed.status, "installed");
+					const attribute = [...copy.attributes.keys()].find((key) =>
+						key.startsWith("data-pi-click-dispatch-"),
+					);
+					assert.ok(typeof attribute === "string" && attribute.length > 0);
+					assert.equal(copy.getAttribute(attribute), installed.marker);
+					if (identityCall) {
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.equal(identityCall.args.at(-1), attribute);
+					}
+					assert.equal(save.getAttribute(attribute), null);
+					assert.equal(listeners.size, 5);
+					candidates = []; // Detached nodes still need their marker removed.
+					for (const script of scripts.slice(1)) {
+						runInNewContext(script, context);
+						if (script.includes('status: "identity-marker-removed"')) {
+							// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.equal(
+								copy.getAttribute(attribute),
+								null,
+								"marker is removed before the click",
+							);
+							// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.equal(listeners.size, 5, "identity confirmation retains event monitoring");
+						}
+					}
+					if (mode === "expiry") {
+						// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+						// oxlint-disable-next-line node-test/no-conditional-assertion
+						assert.ok(
+							expire,
+							"lost or confirmation-blocked cleanup must not leave permanent listeners",
+						);
+						expire();
+					}
+					assert.equal(timers.size, 0, "normal cleanup cancels the expiry timer too");
+					assert.equal(copy.getAttribute(attribute), null);
+					assert.equal(copy.getAttribute("aria-labelledby"), "copy-label");
+					assert.equal(window[readString(installed.marker)], undefined);
+					assert.equal(listeners.size, 0);
+				});
+			} finally {
+				controller.abort();
+				await rm(tempDir, { force: true, recursive: true });
+			}
+		},
+	);
+}
+
+test(
+	"agentBrowserExtension cleans up click dispatch probes after failed clicks",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-failure-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+${fakeIdentityCommands(logPath)}
 if (args.includes("eval")) {
   if (stdin.includes("window[marker] = state")) {
     process.stdout.write(JSON.stringify({ success: true, data: { result: { status: "installed" } } }));
@@ -45,40 +312,65 @@ if (args.includes("eval")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv(
+				{
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.invalid/",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-			await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "@e1"] });
-			assert.equal(click.isError, true);
-			assert.equal(click.details?.clickDispatch, undefined);
+					await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
+					const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["click", "@e1"],
+					});
+					assert.equal(click.isError, true);
+					assert.equal(readRecord(click.details).clickDispatch, undefined);
 
-			const invocations = await readInvocationLog(logPath);
-			const evalInvocations = invocations.filter((entry) => entry.args.includes("eval"));
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-			assert.ok(evalInvocations.some((entry) => (entry.stdin ?? "").includes("window[marker] = state")));
-			assert.ok(evalInvocations.some((entry) => (entry.stdin ?? "").includes("cleaned-up")));
-			assert.equal(evalInvocations.some((entry) => (entry.stdin ?? "").includes("no-native-event-observed")), false);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					const invocations = await readInvocationLog(logPath);
+					const evalInvocations = invocations.filter((entry) => entry.args.includes("eval"));
+					assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+					assert.ok(
+						evalInvocations.some((entry) => (entry.stdin ?? "").includes("window[marker] = state")),
+					);
+					assert.ok(evalInvocations.some((entry) => (entry.stdin ?? "").includes("cleaned-up")));
+					assert.equal(
+						evalInvocations.some((entry) =>
+							(entry.stdin ?? "").includes("no-native-event-observed"),
+						),
+						false,
+					);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension cleans up click dispatch probes during successful dispatch checks", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-success-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension cleans up click dispatch probes during successful dispatch checks",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-success-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+${fakeIdentityCommands(logPath)}
 if (args.includes("eval")) {
   if (stdin.includes("window[marker] = state")) {
     process.stdout.write(JSON.stringify({ success: true, data: { result: { status: "installed" } } }));
@@ -96,42 +388,69 @@ if (args.includes("eval")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv(
+				{
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.invalid/",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-			await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "@e1"] });
-			assert.equal(click.isError, false);
-			assert.equal(click.details?.clickDispatch, undefined);
+					await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
+					const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["click", "@e1"],
+					});
+					assert.equal(click.isError, false);
+					assert.equal(readRecord(click.details).clickDispatch, undefined);
 
-			const invocations = await readInvocationLog(logPath);
-			const evalInvocations = invocations.filter((entry) => entry.args.includes("eval"));
-			const checkInvocation = evalInvocations.find((entry) => (entry.stdin ?? "").includes("native-event-observed"));
-			assert.equal(evalInvocations.length, 2, "successful dispatch should not run a redundant cleanup eval");
-			assert.equal(evalInvocations.some((entry) => (entry.stdin ?? "").includes("cleaned-up")), false);
-			assert.ok(checkInvocation, "expected a click dispatch check eval");
-			assert.ok((checkInvocation.stdin ?? "").includes("state.cleanup"));
-			assert.ok((checkInvocation.stdin ?? "").includes("delete window[marker]"));
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					const invocations = await readInvocationLog(logPath);
+					const evalInvocations = invocations.filter((entry) => entry.args.includes("eval"));
+					const checkInvocation = evalInvocations.find((entry) =>
+						(entry.stdin ?? "").includes("native-event-observed"),
+					);
+					assert.equal(
+						evalInvocations.length,
+						3,
+						"install, identity-marker removal, and check need no redundant cleanup eval",
+					);
+					assert.equal(
+						evalInvocations.some((entry) => (entry.stdin ?? "").includes("cleaned-up")),
+						false,
+					);
+					assert.ok(checkInvocation, "expected a click dispatch check eval");
+					assert.ok((checkInvocation.stdin ?? "").includes("state.cleanup"));
+					assert.ok((checkInvocation.stdin ?? "").includes("delete window[marker]"));
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension probes ref clicks with current snapshot accessibility metadata", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-ref-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension probes ref clicks with current snapshot accessibility metadata",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-ref-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+${fakeIdentityCommands(logPath)}
 if (args.includes("snapshot")) {
   process.stdout.write(JSON.stringify({ success: true, data: {
     origin: "https://fixture.invalid/",
@@ -151,41 +470,189 @@ if (args.includes("snapshot")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
+		);
+
+		try {
+			await withPatchedEnv(
+				{
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.invalid/",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+
+					const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["snapshot", "-i"],
+					});
+					assert.equal(snapshot.isError, false);
+
+					const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["click", "@e4"],
+					});
+					assert.equal(click.isError, true);
+					assert.match(readString(readRecord(click.content[0]).text), /Click dispatch diagnostic:/);
+					assert.deepEqual(readRecord(readRecord(click.details).clickDispatch).target, {
+						kind: "accessible",
+						name: "RPS (3)",
+						refId: "e4",
+						role: "button",
+					});
+
+					const invocations = await readInvocationLog(logPath);
+					assert.ok(
+						invocations.some(
+							(entry) =>
+								entry.args.includes("eval") &&
+								(entry.stdin ?? "").includes("expectedRole") &&
+								(entry.stdin ?? "").includes("RPS (3)"),
+						),
+					);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
+
+for (const guardedClick of [false, true]) {
+	test(
+		`evaluate-gated optional probes do not prevent native ref or XPath clicks (click guarded=${guardedClick})`,
+		{ concurrency: false },
+		async () => {
+			const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-policy-"));
+			const logPath = join(tempDir, "calls.jsonl");
+			await writeFakeAgentBrowserBinary(
+				tempDir,
+				`
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const stdin = fs.readFileSync(0, "utf8");
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+let data;
+if (args.includes("eval")) data = { confirmation_required: true, confirmation_id: "eval-id", action: "evaluate" };
+else if (args.includes("click")) data = ${guardedClick} ? { confirmation_required: true, confirmation_id: "click-id", action: "click" } : { clicked: args.at(-1) };
+else if (args.includes("confirm")) data = { confirmed: true, action: "click", result: { success: true, data: { clicked: "Save" } } };
+else if (args.includes("snapshot")) data = { origin: "https://fixture.invalid/", snapshot: '- button "Save" [ref=e1]', refs: { e1: { role: "button", name: "Save" } } };
+else if (args.includes("session")) data = { active: false };
+else data = { url: "https://fixture.invalid/", title: "Fixture" };
+process.stdout.write(JSON.stringify({ success: true, data }));
+`,
+			);
+			try {
+				await withPatchedEnv(
+					{
+						PATH: `${tempDir}:${process.env.PATH ?? ""}`,
+						AGENT_BROWSER_CONFIRM_ACTIONS: undefined,
+					},
+					async () => {
+						const harness = createExtensionHarness({ cwd: tempDir });
+						await runExtensionEvent(
+							harness.handlers,
+							"session_start",
+							{ reason: "new" },
+							harness.ctx,
+						);
+						const prefix = ["--session", "click-policy"];
+						await executeRegisteredTool(harness.tool, harness.ctx, {
+							args: [
+								...prefix,
+								"--confirm-actions",
+								guardedClick ? " evaluate , click " : " EvAlUaTe ",
+								"open",
+								"https://fixture.invalid/",
+							],
+						});
+						for (const selector of ["@e1", "xpath=//button"]) {
+							// Complete snapshot, click, and confirmation in order on the same guarded session.
+							// oxlint-disable-next-line no-await-in-loop
+							await executeRegisteredTool(harness.tool, harness.ctx, {
+								args: [...prefix, "snapshot", "-i"],
+							});
+							// Complete snapshot, click, and confirmation in order on the same guarded session.
+							// oxlint-disable-next-line no-await-in-loop
+							const clicked = await executeRegisteredTool(harness.tool, harness.ctx, {
+								args: [...prefix, "click", selector],
+							});
+							// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.equal(
+								clicked.isError,
+								guardedClick,
+								readString(readRecord(clicked.content[0]).text),
+							);
+							if (guardedClick) {
+								// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+								// oxlint-disable-next-line node-test/no-conditional-assertion
+								assert.equal(
+									readRecord(readRecord(clicked.details).readConfirmation).action,
+									"click",
+									"native click policy remains enforced, rather than approving the diagnostic",
+								);
+								const action = readArray(readRecord(clicked.details).nextActions).find(
+									(row) => readRecord(row).id === "approve-confirmation",
+								);
+								// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+								// oxlint-disable-next-line node-test/no-conditional-assertion
+								assert.ok(action !== undefined);
+								// Complete snapshot, click, and confirmation in order on the same guarded session.
+								// oxlint-disable-next-line no-await-in-loop
+								const completed = await executeRegisteredTool(
+									harness.tool,
+									harness.ctx,
+									readRecord(action).params,
+								);
+								// Fixed probe/guard variants validate their applicable receipts; final marker, timer, and listener cleanup is unconditional.
+								// oxlint-disable-next-line node-test/no-conditional-assertion
+								assert.equal(
+									completed.isError,
+									false,
+									readString(readRecord(completed.content[0]).text),
+								);
+							}
+						}
+						const invocations = await readInvocationLog(logPath);
+						assert.equal(
+							invocations.filter((row) => row.args.includes("click")).length,
+							2,
+							"both native targets must dispatch",
+						);
+						assert.equal(
+							invocations.some((row) => row.stdin?.includes("window[marker] = state") === true),
+							false,
+							"retained evaluate policy must not cause a retry loop in optional probe installation",
+						);
+						await runExtensionEvent(
+							harness.handlers,
+							"session_shutdown",
+							{ reason: "quit" },
+							harness.ctx,
+						);
+					},
+				);
+			} finally {
+				await rm(tempDir, { recursive: true, force: true });
+			}
+		},
 	);
+}
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-
-			const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
-			assert.equal(snapshot.isError, false);
-
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "@e4"] });
-			assert.equal(click.isError, true);
-			assert.match((click.content[0] as { text: string }).text, /Click dispatch diagnostic:/);
-			assert.deepEqual((click.details?.clickDispatch as { target?: unknown } | undefined)?.target, {
-				kind: "accessible",
-				name: "RPS (3)",
-				refId: "e4",
-				role: "button",
-			});
-
-			const invocations = await readInvocationLog(logPath);
-			assert.ok(invocations.some((entry) => entry.args.includes("eval") && (entry.stdin ?? "").includes("expectedRole") && (entry.stdin ?? "").includes("RPS (3)")));
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension leaves duplicate-name ref clicks upstream-owned", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-duplicate-ref-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension leaves duplicate-name ref clicks upstream-owned",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-duplicate-ref-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -211,36 +678,62 @@ if (args.includes("snapshot")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv(
+				{
+					PATH: `${tempDir}:${basePath}`,
+					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://shop.example/inventory",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-			const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
-			assert.equal(snapshot.isError, false);
+					const snapshot = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["snapshot", "-i"],
+					});
+					assert.equal(snapshot.isError, false);
 
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "@e2"] });
-			assert.equal(click.isError, false);
-			assert.equal(click.details?.clickDispatch, undefined);
+					const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["click", "@e2"],
+					});
+					assert.equal(click.isError, false);
+					assert.equal(readRecord(click.details).clickDispatch, undefined);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("eval") && (entry.stdin ?? "").includes("window[marker] = state")), false);
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					const invocations = await readInvocationLog(logPath);
+					assert.equal(
+						invocations.some(
+							(entry) =>
+								entry.args.includes("eval") &&
+								(entry.stdin ?? "").includes("window[marker] = state"),
+						),
+						false,
+					);
+					assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension does not run click-dispatch probes for unresolved find locators", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-find-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension does not run click-dispatch probes for unresolved find locators",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-find-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
@@ -251,34 +744,47 @@ if (args.includes("eval")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["find", "text", "Add to cart", "click"] });
-			assert.equal(click.isError, false);
-			assert.equal(click.details?.clickDispatch, undefined);
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("eval") && (entry.stdin ?? "").includes("window[marker] = state")), false);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["find", "text", "Add to cart", "click"],
+				});
+				assert.equal(click.isError, false);
+				assert.equal(readRecord(click.details).clickDispatch, undefined);
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(
+					invocations.some(
+						(entry) =>
+							entry.args.includes("eval") && (entry.stdin ?? "").includes("window[marker] = state"),
+					),
+					false,
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension reports click dispatch diagnostic when upstream reports success without dispatching DOM events", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension reports click dispatch diagnostic when upstream reports success without dispatching DOM events",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-click-dispatch-"));
+		const logPath = join(tempDir, "invocations.log");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 const stdin = fs.readFileSync(0, "utf8");
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
+${fakeIdentityCommands(logPath)}
 if (args.includes("snapshot")) {
   process.stdout.write(JSON.stringify({ success: true, data: {
     origin: "https://shop.example/inventory",
@@ -301,87 +807,147 @@ if (args.includes("snapshot")) {
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "xpath=//*[@id='add-to-cart']"] });
-			assert.equal(click.isError, true);
-			assert.match((click.content[0] as { text: string }).text, /Click dispatch diagnostic:/);
-			assert.equal((click.details?.clickDispatch as { status?: string } | undefined)?.status, "no-native-event-observed");
-			assert.deepEqual((click.details?.clickDispatch as { target?: unknown } | undefined)?.target, { kind: "xpath", selector: "//*[@id='add-to-cart']" });
-			assert.deepEqual((click.details?.clickDispatch as { scrollContainer?: unknown } | undefined)?.scrollContainer, {
-				selector: "#todos",
-				summary: "Target appears outside nested scroll container #todos; use scrollintoview on the target or scroll that container before retrying.",
-				targetOutsideContainer: true,
-				targetOutsideViewport: true,
+				await executeRegisteredTool(harness.tool, harness.ctx, { args: ["snapshot", "-i"] });
+				const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["click", "xpath=//*[@id='add-to-cart']"],
+				});
+				assert.equal(click.isError, true);
+				assert.match(readString(readRecord(click.content[0]).text), /Click dispatch diagnostic:/);
+				assert.equal(
+					readRecord(readRecord(click.details).clickDispatch).status,
+					"no-native-event-observed",
+				);
+				assert.deepEqual(readRecord(readRecord(click.details).clickDispatch).target, {
+					kind: "xpath",
+					selector: "//*[@id='add-to-cart']",
+				});
+				assert.deepEqual(readRecord(readRecord(click.details).clickDispatch).scrollContainer, {
+					selector: "#todos",
+					summary:
+						"Target appears outside nested scroll container #todos; use scrollintoview on the target or scroll that container before retrying.",
+					targetOutsideContainer: true,
+					targetOutsideViewport: true,
+				});
+				assert.match(
+					readString(readRecord(click.content[0]).text),
+					/nested scroll container #todos/,
+				);
+				const nextActionIds = new Set(
+					readArray(readRecord(click.details).nextActions ?? []).map(
+						(action) => readRecord(action).id,
+					),
+				);
+				assert.ok(nextActionIds.has("scroll-target-into-view-after-dispatch-miss"));
+				assert.ok(nextActionIds.has("retry-click-after-dispatch-miss"));
+
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+				assert.ok(
+					invocations.some(
+						(entry) =>
+							entry.args.includes("attr") && entry.args.includes("xpath=//*[@id='add-to-cart']"),
+					),
+					"native XPath must confirm the same frame-scoped candidate",
+				);
+				assert.ok(
+					invocations.some(
+						(entry) =>
+							entry.args.includes("eval") && (entry.stdin ?? "").includes("window[marker] = state"),
+					),
+				);
+				const checkInvocation = invocations.find(
+					(entry) =>
+						entry.args.includes("eval") && (entry.stdin ?? "").includes("no-native-event-observed"),
+				);
+				assert.ok(checkInvocation, "expected a click dispatch check eval");
+				assert.ok((checkInvocation.stdin ?? "").includes("state.cleanup"));
+				assert.ok((checkInvocation.stdin ?? "").includes("delete window[marker]"));
 			});
-			assert.match(click.content[0]?.text ?? "", /nested scroll container #todos/);
-			const nextActionIds = ((click.details?.nextActions as Array<{ id?: string }> | undefined) ?? []).map((action) => action.id);
-			assert.ok(nextActionIds.includes("scroll-target-into-view-after-dispatch-miss"));
-			assert.ok(nextActionIds.includes("retry-click-after-dispatch-miss"));
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-			assert.ok(invocations.some((entry) => entry.args.includes("eval") && (entry.stdin ?? "").includes("window[marker] = state")));
-			const checkInvocation = invocations.find((entry) => entry.args.includes("eval") && (entry.stdin ?? "").includes("no-native-event-observed"));
-			assert.ok(checkInvocation, "expected a click dispatch check eval");
-			assert.ok((checkInvocation.stdin ?? "").includes("state.cleanup"));
-			assert.ok((checkInvocation.stdin ?? "").includes("delete window[marker]"));
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension observes live URL after href-less CSS clicks", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-css-click-url-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension observes live URL after href-less CSS clicks",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-css-click-url-"));
+		const logPath = join(tempDir, "invocations.log");
+		const urlPath = join(tempDir, "url.txt");
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("open")) {
+  fs.writeFileSync(${JSON.stringify(urlPath)}, "https://shop.example/login");
   process.stdout.write(JSON.stringify({ success: true, data: { title: "Login", url: "https://shop.example/login" } }));
 } else if (args.includes("click")) {
+  fs.writeFileSync(${JSON.stringify(urlPath)}, "https://shop.example/inventory");
   process.stdout.write(JSON.stringify({ success: true, data: { clicked: args[args.length - 1] } }));
 } else if (args.includes("get") && args.includes("url")) {
-  process.stdout.write(JSON.stringify({ success: true, data: { url: "https://shop.example/inventory" } }));
+  process.stdout.write(JSON.stringify({ success: true, data: { url: fs.readFileSync(${JSON.stringify(urlPath)}, "utf8") } }));
 } else if (args.includes("get") && args.includes("title")) {
   process.stdout.write(JSON.stringify({ success: true, data: { title: "Inventory" } }));
 } else {
   process.stdout.write(JSON.stringify({ success: true, data: "ok" }));
 }`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const opened = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["open", "https://shop.example/login"] });
-			assert.equal(opened.isError, false);
-			assert.equal((opened.details?.sessionTabTarget as { url?: string } | undefined)?.url, "https://shop.example/login");
+				const opened = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["open", "https://shop.example/login"],
+				});
+				assert.equal(opened.isError, false);
+				assert.equal(
+					readRecord(readRecord(opened.details).sessionTabTarget).url,
+					"https://shop.example/login",
+				);
 
-			const click = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["click", "#login-button"] });
-			assert.equal(click.isError, false);
-			assert.equal(click.details?.clickDispatch, undefined);
-			assert.deepEqual(click.details?.sessionTabTarget, { title: "Inventory", url: "https://shop.example/inventory" });
-			assert.equal((click.details?.pageChangeSummary as { changeType?: string; url?: string } | undefined)?.changeType, "navigation");
-			assert.equal((click.details?.pageChangeSummary as { url?: string } | undefined)?.url, "https://shop.example/inventory");
+				const click = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["click", "#login-button"],
+				});
+				assert.equal(click.isError, false);
+				assert.equal(readRecord(click.details).clickDispatch, undefined);
+				assert.deepEqual(readRecord(click.details).sessionTabTarget, {
+					title: "Inventory",
+					url: "https://shop.example/inventory",
+				});
+				assert.equal(
+					readRecord(readRecord(click.details).pageChangeSummary).changeType,
+					"navigation",
+				);
+				assert.equal(
+					readRecord(readRecord(click.details).pageChangeSummary).url,
+					"https://shop.example/inventory",
+				);
 
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
-			assert.ok(invocations.some((entry) => entry.args.includes("get") && entry.args.includes("url")));
-			assert.equal(invocations.some((entry) => entry.args.includes("eval")), false);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+				const invocations = await readInvocationLog(logPath);
+				assert.equal(invocations.filter((entry) => entry.args.includes("click")).length, 1);
+				assert.ok(
+					invocations.some((entry) => entry.args.includes("get") && entry.args.includes("url")),
+				);
+				assert.equal(
+					invocations.some((entry) => entry.args.includes("eval")),
+					false,
+				);
+			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

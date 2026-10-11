@@ -2,18 +2,20 @@ import { findCommandStartIndex } from "./argv-descriptor.js";
 import { isBooleanFlagEnabled } from "./argv-grammar.js";
 
 export interface LaunchScopedFlagDefinition {
-	flag: string;
-	reason: string;
+	readonly flag: string;
+	readonly reason: string;
 }
 
 export const LAUNCH_SCOPED_FLAG_DEFINITIONS = [
 	{
 		flag: "--auto-connect",
-		reason: "attaches to an already-running browser at launch time instead of reusing an existing named session",
+		reason:
+			"attaches to an already-running browser at launch time instead of reusing an existing named session",
 	},
 	{
 		flag: "--allowed-domains",
-		reason: "installs upstream network and WebRTC containment on a fresh controllable browser context",
+		reason:
+			"installs upstream network and WebRTC containment on a fresh controllable browser context",
 	},
 	{
 		flag: "--namespace",
@@ -34,6 +36,10 @@ export const LAUNCH_SCOPED_FLAG_DEFINITIONS = [
 	{
 		flag: "--enable",
 		reason: "selects built-in page init scripts before the upstream browser session is launched",
+	},
+	{
+		flag: "--engine",
+		reason: "selects the browser engine used for the upstream launch",
 	},
 	{
 		flag: "--executable-path",
@@ -113,10 +119,17 @@ export const LAUNCH_SCOPED_FLAG_DEFINITIONS = [
 	},
 ] as const satisfies readonly LaunchScopedFlagDefinition[];
 
-export const LAUNCH_SCOPED_FLAGS = LAUNCH_SCOPED_FLAG_DEFINITIONS.map((definition) => definition.flag);
+export const LAUNCH_SCOPED_FLAGS = LAUNCH_SCOPED_FLAG_DEFINITIONS.map(
+	(definition) => definition.flag,
+);
 export const LAUNCH_SCOPED_FLAG_LABEL = LAUNCH_SCOPED_FLAGS.join(", ");
 
-export const OPEN_RESULT_TAB_CORRECTION_FLAGS = new Set<string>(["--profile", "--restore", "--session-name", "--state"]);
+export const OPEN_RESULT_TAB_CORRECTION_FLAGS = new Set<string>([
+	"--profile",
+	"--restore",
+	"--session-name",
+	"--state",
+]);
 
 /** Launch modes that must never be combined with wrapper-managed restore state. */
 export const MANAGED_RESTORE_INCOMPATIBLE_FLAGS = [
@@ -191,14 +204,27 @@ export const MANAGED_RESTORE_INCOMPATIBLE_BOOLEAN_ENVS = [
 	"AGENT_BROWSER_WEBGPU",
 ] as const;
 
-export function hasLaunchScopedFlagToken(args: string[], flag: string): boolean {
+export function hasLaunchScopedFlagToken(args: readonly string[], flag: string): boolean {
 	const commandStartIndex = findCommandStartIndex(args);
 	const command = commandStartIndex === undefined ? undefined : args[commandStartIndex];
 	return args.some((token, index) => {
-		if (token.startsWith(`${flag}=`)) return flag === "--restore";
-		if (token !== flag) return false;
-		if (flag === "--auto-connect") return isBooleanFlagEnabled(args, flag);
-		if (flag === "--state" && command === "wait" && commandStartIndex !== undefined && index > commandStartIndex) return false;
+		if (token.startsWith(`${flag}=`)) {
+			return flag === "--restore";
+		}
+		if (token !== flag) {
+			return false;
+		}
+		if (flag === "--auto-connect") {
+			return isBooleanFlagEnabled(args, flag);
+		}
+		if (
+			flag === "--state" &&
+			command === "wait" &&
+			commandStartIndex !== undefined &&
+			index > commandStartIndex
+		) {
+			return false;
+		}
 		return true;
 	});
 }

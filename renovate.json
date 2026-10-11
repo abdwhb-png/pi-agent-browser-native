@@ -1,0 +1,26 @@
+{
+	"$schema": "https://docs.renovatebot.com/renovate-schema.json",
+	"extends": ["github>fitchmultz/.github:pi-extensions"],
+	"packageRules": [
+		{
+			"description": "The patched checker protocol and allowance probes qualify this exact frontend/backend pair; requalify both before upgrading.",
+			"matchPackageNames": ["oxlint", "oxlint-tsgolint"],
+			"enabled": false
+		},
+		{
+			"description": "Node types must not authorize APIs above the supported Node 24 runtime.",
+			"matchPackageNames": ["@types/node"],
+			"allowedVersions": "<25"
+		},
+		{
+			"description": "Windows launcher resolution must match cross-spawn 7's public which/path-key dependency line.",
+			"matchPackageNames": ["which", "path-key", "@types/which"],
+			"enabled": false
+		},
+		{
+			"description": "typebox devDependency mirrors the TypeBox nested by the pinned official Pi graph; bump it only together with that graph pin.",
+			"matchPackageNames": ["typebox"],
+			"allowedVersions": "1.3.27"
+		}
+	]
+}

@@ -1,29 +1,79 @@
-export const DEFAULT_SESSION_MODE = "auto" as const;
+export const DEFAULT_SESSION_MODE = "auto";
+
+export const AGENT_BROWSER_CODE_MAX_TIMEOUT_MS = 300_000;
 
 export const AGENT_BROWSER_SEMANTIC_ACTIONS = ["check", "click", "fill", "select"] as const;
 
-export const AGENT_BROWSER_SEMANTIC_LOCATORS = ["alt", "label", "placeholder", "role", "testid", "text", "title"] as const;
+export const AGENT_BROWSER_SEMANTIC_LOCATORS = [
+	"alt",
+	"label",
+	"placeholder",
+	"role",
+	"testid",
+	"text",
+	"title",
+] as const;
 
-export const AGENT_BROWSER_JOB_TYPE_DELAYED_TEXT_MAX_CHARACTERS = 200;
-export const AGENT_BROWSER_JOB_STEP_ACTIONS = ["open", "click", "fill", "type", "select", "wait", "assertText", "assertUrl", "waitForDownload", "screenshot", "snapshot"] as const;
+const AGENT_BROWSER_JOB_STEP_ACTIONS = [
+	"open",
+	"click",
+	"fill",
+	"type",
+	"select",
+	"wait",
+	"assertText",
+	"assertUrl",
+	"waitForDownload",
+	"screenshot",
+	"snapshot",
+] as const;
 
 export const AGENT_BROWSER_QA_LOAD_STATES = ["domcontentloaded", "load", "networkidle"] as const;
 
-export const AGENT_BROWSER_ELECTRON_ACTIONS = ["list", "launch", "status", "cleanup", "probe"] as const;
+export const AGENT_BROWSER_ELECTRON_ACTIONS = [
+	"list",
+	"launch",
+	"status",
+	"cleanup",
+	"probe",
+] as const;
 
 export const AGENT_BROWSER_ELECTRON_HANDOFFS = ["connect", "tabs", "snapshot"] as const;
 
 export const AGENT_BROWSER_ELECTRON_TARGET_TYPES = ["page", "webview", "any"] as const;
 
-export const AGENT_BROWSER_ELECTRON_LIST_FIELDS = new Set(["action", "query", "maxResults"]);
+export const AGENT_BROWSER_ELECTRON_LIST_FIELDS: readonly string[] = [
+	"action",
+	"query",
+	"maxResults",
+];
 
-export const AGENT_BROWSER_ELECTRON_PROBE_FIELDS = new Set(["action", "launchId", "timeoutMs"]);
+export const AGENT_BROWSER_ELECTRON_PROBE_FIELDS: readonly string[] = [
+	"action",
+	"launchId",
+	"timeoutMs",
+];
 
-export const AGENT_BROWSER_ELECTRON_RESERVED_APP_ARGS = ["--user-data-dir", "--remote-debugging-port", "--remote-debugging-address", "--remote-debugging-pipe"] as const;
+export const AGENT_BROWSER_ELECTRON_RESERVED_APP_ARGS = [
+	"--user-data-dir",
+	"--remote-debugging-port",
+	"--remote-debugging-address",
+	"--remote-debugging-pipe",
+] as const;
 
 export const SOURCE_LOOKUP_WORKSPACE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
 
-export const SOURCE_LOOKUP_IGNORED_DIRECTORIES = new Set([".git", "node_modules", "dist", "build", "coverage", ".next", "out", "tmp", "temp"]);
+export const SOURCE_LOOKUP_IGNORED_DIRECTORIES = new Set([
+	".git",
+	"node_modules",
+	"dist",
+	"build",
+	"coverage",
+	".next",
+	"out",
+	"tmp",
+	"temp",
+]);
 
 export const SOURCE_LOOKUP_DEFAULT_MAX_WORKSPACE_FILES = 2_000;
 
@@ -41,169 +91,172 @@ export type AgentBrowserElectronAction = (typeof AGENT_BROWSER_ELECTRON_ACTIONS)
 
 export type AgentBrowserSourceLookupStatus = "candidates-found" | "no-candidates" | "unsupported";
 
-export type AgentBrowserNetworkSourceLookupStatus = "failed-requests-found" | "no-failed-requests" | "no-candidates";
+export type AgentBrowserNetworkSourceLookupStatus =
+	| "failed-requests-found"
+	| "no-failed-requests"
+	| "no-candidates";
 
 export type CompiledAgentBrowserElectron =
 	| {
-		action: "list";
-		maxResults?: number;
-		query?: string;
-	}
+			readonly action: "list";
+			readonly maxResults?: number;
+			readonly query?: string;
+	  }
 	| {
-		action: "launch";
-		allow?: string[];
-		appArgs?: string[];
-		deny?: string[];
-		appName?: string;
-		appPath?: string;
-		bundleId?: string;
-		executablePath?: string;
-		handoff: "connect" | "snapshot" | "tabs";
-		targetType: "any" | "page" | "webview";
-		timeoutMs?: number;
-	}
+			readonly action: "launch";
+			readonly allow?: readonly string[];
+			readonly appArgs?: readonly string[];
+			readonly deny?: readonly string[];
+			readonly appName?: string;
+			readonly appPath?: string;
+			readonly bundleId?: string;
+			readonly executablePath?: string;
+			readonly handoff: "connect" | "snapshot" | "tabs";
+			readonly targetType: "any" | "page" | "webview";
+			readonly timeoutMs?: number;
+	  }
 	| {
-		action: "cleanup" | "status";
-		all?: boolean;
-		launchId?: string;
-		timeoutMs?: number;
-	}
+			readonly action: "cleanup" | "status";
+			readonly all?: boolean;
+			readonly launchId?: string;
+			readonly timeoutMs?: number;
+	  }
 	| {
-		action: "probe";
-		launchId?: string;
-		timeoutMs?: number;
-	};
+			readonly action: "probe";
+			readonly launchId?: string;
+			readonly timeoutMs?: number;
+	  };
 
 export interface CompiledAgentBrowserSemanticAction {
-	action: AgentBrowserSemanticActionName;
-	locator?: AgentBrowserSemanticLocator;
-	selector?: string;
-	values?: string[];
-	args: string[];
+	readonly action: AgentBrowserSemanticActionName;
+	readonly locator?: AgentBrowserSemanticLocator;
+	readonly selector?: string;
+	readonly values?: readonly string[];
+	readonly args: readonly string[];
 }
 
 export interface CompiledAgentBrowserJobStep {
-	action: AgentBrowserJobStepAction;
-	args: string[];
-	generatedFrom?: string;
+	readonly action: AgentBrowserJobStepAction;
+	readonly args: readonly string[];
+	readonly generatedFrom?: string;
 }
 
 export interface CompiledAgentBrowserJob {
-	args: string[];
-	failFast: boolean;
-	stdin: string;
-	steps: CompiledAgentBrowserJobStep[];
+	readonly args: readonly string[];
+	readonly failFast: boolean;
+	readonly stdin: string;
+	readonly steps: readonly CompiledAgentBrowserJobStep[];
 }
 
 export interface CompiledAgentBrowserQaPreset extends CompiledAgentBrowserJob {
-	checks: {
-		checkConsole: boolean;
-		checkErrors: boolean;
-		checkNetwork: boolean;
-		diagnosticsResetAtStart: boolean;
-		loadState: AgentBrowserQaLoadState;
-		expectedText: string[];
-		expectedSelector?: string;
-		screenshotPath?: string;
-		attached: boolean;
-		url?: string;
+	readonly checks: {
+		readonly checkConsole: boolean;
+		readonly checkErrors: boolean;
+		readonly checkNetwork: boolean;
+		readonly diagnosticsResetAtStart: boolean;
+		readonly loadState: AgentBrowserQaLoadState;
+		readonly expectedText: readonly string[];
+		readonly expectedSelector?: string;
+		readonly screenshotPath?: string;
+		readonly attached: boolean;
+		readonly url?: string;
 	};
 }
 
 export interface CompiledAgentBrowserSourceLookupStep {
-	action: "dom" | "react";
-	args: string[];
+	readonly action: "dom" | "react";
+	readonly args: readonly string[];
 }
 
 export interface CompiledAgentBrowserSourceLookup {
-	args: string[];
-	stdin: string;
-	steps: CompiledAgentBrowserSourceLookupStep[];
-	query: {
-		componentName?: string;
-		includeDomHints: boolean;
-		maxWorkspaceFiles: number;
-		reactFiberId?: string;
-		selector?: string;
+	readonly args: readonly string[];
+	readonly stdin: string;
+	readonly steps: readonly CompiledAgentBrowserSourceLookupStep[];
+	readonly query: {
+		readonly componentName?: string;
+		readonly includeDomHints: boolean;
+		readonly maxWorkspaceFiles: number;
+		readonly reactFiberId?: string;
+		readonly selector?: string;
 	};
 }
 
 export interface AgentBrowserSourceLookupCandidate {
-	column?: number;
-	componentName?: string;
-	confidence: "high" | "medium" | "low";
-	evidence: string[];
-	file?: string;
-	line?: number;
-	source: "react-inspect" | "dom-attribute" | "workspace-search";
+	readonly column?: number;
+	readonly componentName?: string;
+	readonly confidence: "high" | "medium" | "low";
+	readonly evidence: readonly string[];
+	readonly file?: string;
+	readonly line?: number;
+	readonly source: "react-inspect" | "dom-attribute" | "workspace-search";
 }
 
 export interface AgentBrowserSourceLookupElectronContext {
-	appName?: string;
-	appPath?: string;
-	executablePath?: string;
-	launchId?: string;
-	sessionName?: string;
-	url?: string;
+	readonly appName?: string;
+	readonly appPath?: string;
+	readonly executablePath?: string;
+	readonly launchId?: string;
+	readonly sessionName?: string;
+	readonly url?: string;
 }
 
 export interface AgentBrowserSourceLookupAnalysis {
-	candidates: AgentBrowserSourceLookupCandidate[];
-	electronContext?: AgentBrowserSourceLookupElectronContext;
-	limitations: string[];
-	status: AgentBrowserSourceLookupStatus;
-	summary: string;
-	workspaceRoot?: string;
+	readonly candidates: readonly AgentBrowserSourceLookupCandidate[];
+	readonly electronContext?: AgentBrowserSourceLookupElectronContext;
+	readonly limitations: readonly string[];
+	readonly status: AgentBrowserSourceLookupStatus;
+	readonly summary: string;
+	readonly workspaceRoot?: string;
 }
 
 export interface AgentBrowserSourceLookupAnalysisContext {
-	electronContext?: AgentBrowserSourceLookupElectronContext;
-	workspaceRoot: string;
+	readonly electronContext?: AgentBrowserSourceLookupElectronContext;
+	readonly workspaceRoot: string;
 }
 
 export interface CompiledAgentBrowserNetworkSourceLookup {
-	args: string[];
-	stdin: string;
-	steps: Array<{ action: "network"; args: string[] }>;
-	query: {
-		filter?: string;
-		maxWorkspaceFiles: number;
-		namespace?: string;
-		requestId?: string;
-		session?: string;
-		url?: string;
+	readonly args: readonly string[];
+	readonly stdin: string;
+	readonly steps: ReadonlyArray<{ readonly action: "network"; readonly args: readonly string[] }>;
+	readonly query: {
+		readonly filter?: string;
+		readonly maxWorkspaceFiles: number;
+		readonly namespace?: string;
+		readonly requestId?: string;
+		readonly session?: string;
+		readonly url?: string;
 	};
 }
 
 export interface AgentBrowserNetworkSourceLookupRequest {
-	error?: string;
-	method?: string;
-	requestId?: string;
-	status?: number;
-	url?: string;
+	readonly error?: string;
+	readonly method?: string;
+	readonly requestId?: string;
+	readonly status?: number;
+	readonly url?: string;
 }
 
 export interface AgentBrowserNetworkSourceLookupCandidate {
-	confidence: "high" | "medium" | "low";
-	evidence: string[];
-	file?: string;
-	line?: number;
-	requestUrl?: string;
-	source: "initiator" | "workspace-search";
+	readonly confidence: "high" | "medium" | "low";
+	readonly evidence: readonly string[];
+	readonly file?: string;
+	readonly line?: number;
+	readonly requestUrl?: string;
+	readonly source: "initiator" | "workspace-search";
 }
 
 export interface AgentBrowserNetworkSourceLookupAnalysis {
-	candidates: AgentBrowserNetworkSourceLookupCandidate[];
-	failedRequests: AgentBrowserNetworkSourceLookupRequest[];
-	limitations: string[];
-	status: AgentBrowserNetworkSourceLookupStatus;
-	summary: string;
+	readonly candidates: readonly AgentBrowserNetworkSourceLookupCandidate[];
+	readonly failedRequests: readonly AgentBrowserNetworkSourceLookupRequest[];
+	readonly limitations: readonly string[];
+	readonly status: AgentBrowserNetworkSourceLookupStatus;
+	readonly summary: string;
 }
 
 export interface AgentBrowserQaPresetAnalysis {
-	failedChecks: string[];
-	notRunChecks: string[];
-	passed: boolean;
-	summary: string;
-	warnings: string[];
+	readonly failedChecks: readonly string[];
+	readonly notRunChecks: readonly string[];
+	readonly passed: boolean;
+	readonly summary: string;
+	readonly warnings: readonly string[];
 }

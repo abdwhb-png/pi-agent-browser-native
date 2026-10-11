@@ -2,7 +2,9 @@
 
 `pi-agent-browser-native` uses a Crabbox-backed local platform smoke gate to prove the package on macOS, Ubuntu Linux, and native Windows before release.
 
-This is a release-blocking gate. Missing Crabbox setup, Docker, macOS SSH, the native Windows template, upstream `agent-browser`, or browser runtime dependencies is a blocked release setup, not a skipped pass.
+**Current 0.6.16 rollout exception:** the owner explicitly waived Windows qualification on 2026-09-21, including available runners. Windows failures remain visible but nonblocking, not passed; no further Windows repair experiments are part of this rollout. Linux/macOS and all other required checks remain required. See [release waiver and artifact requirements](RELEASE.md#current-0616-rollout-waiver) and [follow-up #191](https://github.com/fitchmultz/pi-agent-browser-native/issues/191). The commands below are unchanged and a waived Windows result does not make the full composition a passing matrix.
+
+Outside that rollout exception, this is a release-blocking gate. Missing setup is not a skipped pass. When a maintainer approves an [alternate native transport](#alternate-native-transports), it must prove the same target-local suites; missing upstream `agent-browser` or browser dependencies still blocks that target.
 
 ## Required release gate
 
@@ -30,11 +32,19 @@ npm run verify -- platform-smoke run --target ubuntu --suite platform-build
 
 ## Targets
 
-| Target | Crabbox provider | Shell contract | Release status |
-| --- | --- | --- | --- |
-| `macos` | `ssh` static localhost | POSIX shell on macOS | Required |
-| `ubuntu` | `local-container` | POSIX shell in a Docker-compatible local container | Required |
-| `windows-native` | `parallels` | native Windows PowerShell over OpenSSH | Required |
+| Target           | Crabbox provider       | Shell contract                                     | Release status                                                      |
+| ---------------- | ---------------------- | -------------------------------------------------- | ------------------------------------------------------------------- |
+| `macos`          | `ssh` static localhost | POSIX shell on macOS                               | Required                                                            |
+| `ubuntu`         | `local-container`      | POSIX shell in a Docker-compatible local container | Required                                                            |
+| `windows-native` | `parallels`            | native Windows PowerShell over OpenSSH             | Nonblocking for the owner-waived 0.6.16 rollout; otherwise required |
+
+## Alternate native transports
+
+With maintainer approval, local macOS execution can replace localhost SSH. Routine GitHub Actions has no Windows job; the separate Crabbox/Parallels release target remains as documented above. Record alternate native checks separately from Crabbox SSH or Parallels results. The default `release` and `prepublishOnly` commands still select the Crabbox matrix; record alternate suite evidence separately rather than reporting those commands as passed.
+
+On macOS, run the unchanged commands returned by `buildPlatformBuildCommand('macos', 'pi-agent-browser-native', '24.21.0')` and `buildBrowserDogfoodCommand('macos', '0.38.1', true)` in [`scripts/platform-smoke/targets.mjs`](../scripts/platform-smoke/targets.mjs), serially in a clean private source copy. Use private HOME, npm and Pi settings, and headless browser profiles. No Remote Login or host security change is required.
+
+Retain the exact source head/tree, package and tool versions, native OS/architecture, generated commands, stdout/stderr, every `PLATFORM_*` exit marker, actual Pi registration output, dogfood JSON and verified screenshot. Check the suite assertions below and clean up only the run's processes and temporary files. These alternatives do not waive Ubuntu or any non-platform release check.
 
 ## Required environment
 
@@ -78,7 +88,7 @@ The configured upstream `agent-browser` baseline is imported from [`scripts/agen
 
 Crabbox does not install project runtime tools. The macOS host, Ubuntu image, and Windows template must already provide:
 
-- Node/npm at or above the configured Node major baseline in [`platform-smoke.config.mjs`](../platform-smoke.config.mjs).
+- Node/npm at or above the full Node version declared by `package.json` `engines.node` and used by [`platform-smoke.config.mjs`](../platform-smoke.config.mjs).
 - Git and `tar`.
 - Upstream `agent-browser` matching this wrapper’s capability baseline. The Ubuntu target gets it from [`scripts/platform-smoke/linux-image/Dockerfile`](../scripts/platform-smoke/linux-image/Dockerfile); the Windows template gets it from the shared `pi-extension-windows-template` snapshot named in [`platform-smoke.config.mjs`](../platform-smoke.config.mjs) (currently `crabbox-ready-ab-0.33.0`, a child of the shared `crabbox-ready` base used by other projects' linked clones).
 - Browser/runtime dependencies needed by upstream `agent-browser`.
@@ -92,7 +102,7 @@ Each required target runs `platform-build` and `browser-dogfood-smoke` on one Cr
 
 ### `platform-build`
 
-1. Verify the target Node major version.
+1. Verify the target's full Node version.
 2. Run `npm ci` in the synced checkout.
 3. Run `npm run verify -- platform-target`, a fast target-local gate covering generated docs, TypeScript, package/platform harness tests, and runtime planning. The full unit/fake suite still runs once in the host default gate before the release matrix starts; target-local smoke must not duplicate that full suite on every OS. Browser subprocess behavior is then exercised by the target-local `browser-dogfood-smoke` suite against the real upstream binary.
 4. Run `npm pack`.
@@ -105,7 +115,7 @@ Each required target runs `platform-build` and `browser-dogfood-smoke` on one Cr
 ### `browser-dogfood-smoke`
 
 1. Run `npm ci` in the synced checkout if needed.
-2. Run the deterministic model-free browser smoke through `scripts/verify-agent-browser-dogfood.ts`.
+2. Run the deterministic model-free browser smoke through `scripts/verify-agent-browser-dogfood.ts`, starting with `sessionMode: "fresh"` so every browser stays in the test-owned managed lifecycle.
 3. Exercise native wrapper surfaces against the deterministic loopback HTTP fixture from `scripts/verify-agent-browser-dogfood.ts`: top-level `qa`, `semanticAction`, constrained `job`, screenshot artifact verification, and session close.
 4. Persist the dogfood JSON report and stdout/stderr evidence.
 5. Fail on missing browser artifacts, failed tool calls, leaked secrets, or unclosed sessions.

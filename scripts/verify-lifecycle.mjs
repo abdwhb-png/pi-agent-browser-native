@@ -1,31 +1,32 @@
 /**
  * Purpose: Exercise the configured-source pi-agent-browser lifecycle path through a real tmux-driven Pi process.
- * Responsibilities: Create isolated Pi settings and a temporary package source, inject deterministic lifecycle sentinels, drive `/reload` plus restart with exact `--session-id`, assert managed browser-session continuity and persisted artifact survival, capture transcripts, and clean up side effects.
- * Scope: Maintainer regression harness invoked through `npm run verify -- lifecycle` and embedded in `npm run verify -- release`; normal unit/package verification remains in the standard npm scripts.
- * Usage: Run with `node scripts/verify-lifecycle.mjs`, `npm run verify -- lifecycle`, or `node scripts/verify-lifecycle.mjs --keep-artifacts --verbose`.
- * Invariants/Assumptions: `pi` and `tmux` are available on PATH, Pi supports `--session-id`, the configured model (default `zai/glm-5.2`, overridable via `--model`) can follow explicit tool-use prompts, and the temporary configured package path is the only active Pi package source. `/reload` may fail if sent while the TUI still shows a working indicator even after JSONL records a final assistant message; see `docs/RELEASE.md` lifecycle triage.
- * Related: `docs/SUPPORT_MATRIX.md` tracks configured-source lifecycle expectations, passthrough flags, and triage notes for this harness.
+ * Responsibilities: Dispatch the isolated reload/relaunch harness, preserve its exit code, and print retained transcript evidence.
+ * Scope: Maintainer verification through `npm run verify -- lifecycle` and the release gate; fixture, transcript, transport, and ordered runtime responsibilities live in adjacent lifecycle modules.
+ * Usage: `node scripts/verify-lifecycle.mjs [--model <id>] [--timeout-ms <ms>] [--keep-artifacts] [--verbose]`.
+ * Invariants/Assumptions: Pi and tmux are on PATH. The harness preserves transcripts and uses exactly one temporary configured package source with an exact Pi session id.
  */
-
-import { execFile as execFileCallback } from "node:child_process";
-import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
-import process from "node:process";
 import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { verifyLifecycle } from "./lifecycle-run.mjs";
+export { buildSettingsPayload, injectLifecycleSentinelSource } from "./lifecycle-fixture.mjs";
+export { fakeAgentBrowserScript } from "./lifecycle-fake-browser.mjs";
+export {
+	agentBrowserResults,
+	collectFullOutputPaths,
+	matchesSuccessfulPageResult,
+	parseJsonl,
+	sentinelTokens,
+	sessionHeaderId,
+	waitForAgentBrowserResult,
+} from "./lifecycle-transcript.mjs";
+export {
+	buildPiLaunchArgs,
+	createLifecycleSessionId,
+	paneLooksReady,
+	tmuxActiveTarget,
+} from "./lifecycle-tmux.mjs";
 
-import { TARGET_AGENT_BROWSER_VERSION_LABEL } from "./agent-browser-target.mjs";
-
-const execFile = promisify(execFileCallback);
 const DEFAULT_TIMEOUT_MS = 180_000;
 const DEFAULT_LIFECYCLE_MODEL = "zai/glm-5.2";
-const EXPECTED_URL = "https://react.dev/";
-const SENTINEL_CUSTOM_TYPE = "piab-lifecycle-sentinel";
-const SENTINEL_COMMAND_PREFIX = "piab-lifecycle-sentinel";
-const SENTINEL_MARKER_START = "// PIAB_LIFECYCLE_SENTINEL_START";
-const SENTINEL_MARKER_END = "// PIAB_LIFECYCLE_SENTINEL_END";
-const PROMPT_SUBMIT_PAUSE_MS = 250;
 
 class UsageError extends Error {
 	constructor(message) {
@@ -60,12 +61,24 @@ Exit codes:
 `);
 }
 
-export function createLifecycleSessionId(pid = process.pid) {
-	return `piab-lifecycle-${pid}`;
+function parseModel(value) {
+	if (!value || value.startsWith("-")) {
+		throw new UsageError("--model requires a provider/model id value.");
+	}
+	return value;
 }
 
-export function buildPiLaunchArgs({ model, sessionId }) {
-	return ["--approve", "--model", model, "--session-id", sessionId];
+function parseTimeout(value) {
+	if (!value) {
+		throw new UsageError("--timeout-ms requires a positive integer value.");
+	}
+	const timeoutMs = Number(value);
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+		throw new UsageError(
+			`--timeout-ms must be a positive integer; received ${JSON.stringify(value)}.`,
+		);
+	}
+	return timeoutMs;
 }
 
 export function parseCliArgs(argv = process.argv.slice(2)) {
@@ -76,669 +89,28 @@ export function parseCliArgs(argv = process.argv.slice(2)) {
 		timeoutMs: DEFAULT_TIMEOUT_MS,
 		verbose: false,
 	};
-
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
-		if (arg === "-h" || arg === "--help") {
+		if (["-h", "--help"].includes(arg)) {
 			return { ...options, showHelp: true };
 		}
-		if (arg === "--keep-artifacts") {
-			options.keepArtifacts = true;
+		if (arg === "--keep-artifacts" || arg === "--verbose") {
+			options[arg === "--verbose" ? "verbose" : "keepArtifacts"] = true;
 			continue;
 		}
-		if (arg === "--verbose") {
-			options.verbose = true;
-			continue;
-		}
-		if (arg === "--model") {
+		if (arg === "--model" || arg === "--timeout-ms") {
 			const value = argv[index + 1];
-			if (!value || value.startsWith("-")) throw new UsageError("--model requires a provider/model id value.");
-			index += 1;
-			options.model = value;
-			continue;
-		}
-		if (arg === "--timeout-ms") {
-			const value = argv[index + 1];
-			if (!value) throw new UsageError("--timeout-ms requires a positive integer value.");
-			index += 1;
-			const timeoutMs = Number(value);
-			if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
-				throw new UsageError(`--timeout-ms must be a positive integer; received ${JSON.stringify(value)}.`);
+			if (arg === "--model") {
+				options.model = parseModel(value);
+			} else {
+				options.timeoutMs = parseTimeout(value);
 			}
-			options.timeoutMs = timeoutMs;
+			index += 1;
 			continue;
 		}
 		throw new UsageError(`Unknown option: ${arg}`);
 	}
-
 	return options;
-}
-
-function sleep(ms) {
-	return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
-}
-
-async function run(command, args, options = {}) {
-	return await execFile(command, args, {
-		maxBuffer: 20 * 1024 * 1024,
-		...options,
-	});
-}
-
-async function pathExists(path) {
-	try {
-		await access(path);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-function normalizeComparableUrl(url) {
-	if (typeof url !== "string" || url.trim().length === 0) return undefined;
-	try {
-		const parsed = new URL(url.trim());
-		parsed.hash = "";
-		return parsed.toString();
-	} catch {
-		return url.trim();
-	}
-}
-
-export function parseJsonl(text) {
-	const entries = [];
-	for (const [index, line] of text.split("\n").entries()) {
-		if (line.trim().length === 0) continue;
-		try {
-			entries.push(JSON.parse(line));
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			throw new Error(`Invalid JSONL at line ${index + 1}: ${message}`);
-		}
-	}
-	return entries;
-}
-
-async function readJsonlFile(filePath) {
-	return parseJsonl(await readFile(filePath, "utf8"));
-}
-
-function isRecord(value) {
-	return typeof value === "object" && value !== null;
-}
-
-export function agentBrowserResults(entries) {
-	return entries
-		.filter((entry) => entry?.type === "message" && entry.message?.role === "toolResult" && entry.message?.toolName === "agent_browser")
-		.map((entry) => entry.message);
-}
-
-export function sentinelTokens(entries) {
-	return entries
-		.filter((entry) => entry?.type === "custom" && entry.customType === SENTINEL_CUSTOM_TYPE)
-		.map((entry) => entry.data?.token)
-		.filter((token) => typeof token === "string");
-}
-
-export function sessionHeaderId(entries) {
-	const header = entries.find((entry) => entry?.type === "session");
-	return typeof header?.id === "string" ? header.id : undefined;
-}
-
-export function collectFullOutputPaths(results) {
-	const paths = [];
-	for (const result of results) {
-		const details = isRecord(result?.details) ? result.details : undefined;
-		if (typeof details?.fullOutputPath === "string") paths.push(details.fullOutputPath);
-		if (Array.isArray(details?.fullOutputPaths)) {
-			paths.push(...details.fullOutputPaths.filter((path) => typeof path === "string"));
-		}
-	}
-	return [...new Set(paths)];
-}
-
-export function buildSettingsPayload({ packageDir, sessionDir }) {
-	return {
-		quietStartup: false,
-		sessionDir,
-		packages: [packageDir],
-		extensions: [],
-		skills: [],
-		prompts: [],
-		themes: [],
-		enableInstallTelemetry: false,
-	};
-}
-
-async function writeSettings({ agentDir, packageDir, sessionDir }) {
-	await mkdir(agentDir, { recursive: true });
-	const settings = buildSettingsPayload({ packageDir, sessionDir });
-	await writeFile(join(agentDir, "settings.json"), `${JSON.stringify(settings, null, "\t")}\n`, "utf8");
-	return settings;
-}
-
-async function buildPackageRuntime(repoRoot) {
-	await execFile(process.execPath, ["./scripts/build.mjs"], {
-		cwd: repoRoot,
-		maxBuffer: 10 * 1024 * 1024,
-	});
-}
-
-async function copyPackageSource({ packageDir, repoRoot }) {
-	await buildPackageRuntime(repoRoot);
-	await mkdir(packageDir, { recursive: true });
-	await cp(resolve(repoRoot, "extensions"), resolve(packageDir, "extensions"), { recursive: true });
-	await cp(resolve(repoRoot, "dist"), resolve(packageDir, "dist"), { recursive: true });
-	await cp(resolve(repoRoot, "package.json"), resolve(packageDir, "package.json"));
-	const repoNodeModules = resolve(repoRoot, "node_modules");
-	const tempNodeModules = resolve(packageDir, "node_modules");
-	if (await pathExists(repoNodeModules)) {
-		await symlink(repoNodeModules, tempNodeModules, "dir").catch(() => undefined);
-	}
-}
-
-function lifecycleSentinelCommand(token) {
-	return `${SENTINEL_COMMAND_PREFIX}-${token}`;
-}
-
-export function injectLifecycleSentinelSource(source, token) {
-	const withoutOldSentinel = source.replace(
-		new RegExp(`\\n\\t${SENTINEL_MARKER_START.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[\\s\\S]*?\\n\\t${SENTINEL_MARKER_END.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\n`),
-		"\n",
-	);
-	const marker = withoutOldSentinel.includes("export default function agentBrowserExtension(pi: ExtensionAPI) {")
-		? "export default function agentBrowserExtension(pi: ExtensionAPI) {"
-		: "export default function agentBrowserExtension(pi) {";
-	const snippet = `
-	${SENTINEL_MARKER_START}
-	pi.registerCommand(${JSON.stringify(lifecycleSentinelCommand(token))}, {
-		description: "Append the pi-agent-browser lifecycle sentinel token.",
-		handler: async () => {
-			pi.appendEntry("${SENTINEL_CUSTOM_TYPE}", { token: ${JSON.stringify(token)} });
-		},
-	});
-	${SENTINEL_MARKER_END}
-`;
-	if (!withoutOldSentinel.includes(marker)) {
-		throw new Error("Could not locate extension factory marker for lifecycle sentinel injection.");
-	}
-	return withoutOldSentinel.replace(marker, `${marker}${snippet}`);
-}
-
-async function writeLifecycleSentinel({ packageDir, token }) {
-	const indexPath = resolve(packageDir, "dist/extensions/agent-browser/index.js");
-	const source = await readFile(indexPath, "utf8");
-	await writeFile(indexPath, injectLifecycleSentinelSource(source, token), "utf8");
-}
-
-export function fakeAgentBrowserScript() {
-	return `#!/usr/bin/env node
-const fs = require("node:fs");
-const path = require("node:path");
-const args = process.argv.slice(2);
-const versionArgs = args[0] === "--allow-file-access" && args[1] === "false" ? args.slice(2) : args;
-if (versionArgs.length === 1 && versionArgs[0] === "--version") {
-  process.stdout.write(${JSON.stringify(TARGET_AGENT_BROWSER_VERSION_LABEL)});
-  process.exit(0);
-}
-const stateDir = process.env.AGENT_BROWSER_PIAB_LIFECYCLE_FAKE_STATE_DIR;
-if (!stateDir) {
-  console.error("AGENT_BROWSER_PIAB_LIFECYCLE_FAKE_STATE_DIR is required");
-  process.exit(64);
-}
-const stdin = fs.readFileSync(0, "utf8");
-fs.mkdirSync(stateDir, { recursive: true });
-function valueAfter(flag) { const index = args.indexOf(flag); return index >= 0 ? args[index + 1] : undefined; }
-function commandTokens() {
-  const tokens = [];
-  for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (arg === "--json") continue;
-    if (["--allow-file-access", "--args", "--namespace", "--session"].includes(arg)) { index += 1; continue; }
-    tokens.push(arg);
-  }
-  return tokens;
-}
-const sessionName = valueAfter("--session") || "default";
-const statePath = path.join(stateDir, encodeURIComponent(sessionName) + ".json");
-function load() { try { return JSON.parse(fs.readFileSync(statePath, "utf8")); } catch { return { title: "Blank", url: "about:blank", activeTab: "t1" }; } }
-function save(state) { fs.writeFileSync(statePath, JSON.stringify(state, null, 2)); }
-function tabList(state) { return { tabs: [{ tabId: "t1", label: "t1", index: 0, title: state.title, url: state.url, active: true }] }; }
-function execute(tokens) {
-  let state = load();
-  const [command, ...rest] = tokens;
-  if (command === "session" && rest[0] === "info") {
-    const active = fs.existsSync(statePath);
-    return { result: { active, runtime: active ? { restoreKey: state.restoreKey ?? null } : null } };
-  }
-  if (command === "open") {
-    const url = rest[rest.length - 1] || "about:blank";
-    state = { ...state, title: url.includes("react.dev") ? "React" : "Lifecycle Page", url, activeTab: "t1", restoreKey: process.env.AGENT_BROWSER_RESTORE ?? null };
-    save(state);
-    return { result: { title: state.title, url: state.url } };
-  }
-  if (command === "snapshot") {
-    return { result: { origin: state.url, refs: { e1: { role: "heading", name: state.title } }, snapshot: '- heading "' + state.title + '" [ref=e1]' } };
-  }
-  if (command === "get" && rest.includes("url")) return { result: state.url };
-  if (command === "get" && rest.includes("title")) return { result: state.title };
-  if (command === "eval") return { result: "PIAB-LIFECYCLE-LARGE-OUTPUT\\n" + "x".repeat(700 * 1024) };
-  if (command === "tab" && rest.includes("list")) return { result: tabList(state) };
-  if (command === "tab") return { result: { selectedTab: rest[0] || "t1", ...state } };
-  if (command === "close") {
-    try { fs.unlinkSync(statePath); } catch {}
-    return { result: { closed: true, sessionName } };
-  }
-  return { result: { ok: true, command, args: rest, stdin, state } };
-}
-function executeBatch(steps) {
-  let mode = "clean";
-  let staleNetwork = true;
-  let staleConsole = true;
-  let staleErrors = true;
-  return steps.map((step) => {
-    const name = step[0];
-    if (name === "open") {
-      const url = String(step[1] || "about:blank");
-      const title = url.includes("react.dev") ? "React" : "Lifecycle QA Page";
-      save({ title, url, activeTab: "t1", restoreKey: process.env.AGENT_BROWSER_RESTORE ?? null });
-      mode = url.includes("fail") ? "fail" : "clean";
-      return { command: step, success: true, result: { title, url } };
-    }
-    if (name === "network") {
-      if (step.includes("--clear")) { staleNetwork = false; return { command: step, success: true, result: { requests: [] } }; }
-      if (staleNetwork || mode === "fail") return { command: step, success: true, result: { requests: [{ method: "GET", resourceType: "fetch", status: 500, url: "https://fail.example.test/api" }] } };
-      return { command: step, success: true, result: { requests: [] } };
-    }
-    if (name === "console") {
-      if (step.includes("--clear")) { staleConsole = false; return { command: step, success: true, result: { messages: [] } }; }
-      return { command: step, success: true, result: staleConsole || mode === "fail" ? { messages: [{ type: "error", text: "lifecycle console boom" }] } : { messages: [] } };
-    }
-    if (name === "errors") {
-      if (step.includes("--clear")) { staleErrors = false; return { command: step, success: true, result: { errors: [] } }; }
-      return { command: step, success: true, result: staleErrors || mode === "fail" ? { errors: [{ text: "lifecycle page boom" }] } : { errors: [] } };
-    }
-    return { command: step, success: true, result: { ok: true } };
-  });
-}
-const tokens = commandTokens();
-let data;
-if (tokens[0] === "batch") {
-  let steps;
-  try { steps = JSON.parse(stdin || "[]"); } catch (error) { throw new Error("Invalid batch stdin: " + error.message); }
-  data = executeBatch(steps);
-} else {
-  data = execute(tokens).result;
-}
-process.stdout.write(JSON.stringify({ success: true, data }));
-`;
-}
-
-async function createFakeAgentBrowserBinary(binDir) {
-	await mkdir(binDir, { recursive: true });
-	const scriptPath = join(binDir, "agent-browser");
-	await writeFile(scriptPath, fakeAgentBrowserScript(), "utf8");
-	await chmod(scriptPath, 0o755);
-	await writeFile(join(binDir, "agent-browser.cmd"), `@echo off\n${JSON.stringify(process.execPath)} "%~dp0agent-browser" %*\n`, "utf8");
-}
-
-export function tmuxActiveTarget(tmuxSession) {
-	return `${tmuxSession}:`;
-}
-
-async function capturePaneText(tmuxSession) {
-	const { stdout } = await run("tmux", ["capture-pane", "-p", "-S", "-2000", "-t", tmuxActiveTarget(tmuxSession)]);
-	return stdout;
-}
-
-export function paneLooksReady(pane) {
-	return /\d+(?:\.\d+)?%\/\d+(?:\.\d+)?[kKmMgG]/.test(pane) && !/Working[.…]*/i.test(pane);
-}
-
-async function capturePane(tmuxSession, artifactPath) {
-	try {
-		const stdout = await capturePaneText(tmuxSession);
-		await mkdir(dirname(artifactPath), { recursive: true });
-		await writeFile(artifactPath, stdout, "utf8");
-		return stdout;
-	} catch (error) {
-		await writeFile(artifactPath, `Could not capture pane: ${error instanceof Error ? error.message : String(error)}\n`, "utf8").catch(() => undefined);
-		return "";
-	}
-}
-
-async function killTmuxSession(tmuxSession) {
-	await run("tmux", ["kill-session", "-t", tmuxSession]).catch(() => undefined);
-}
-
-function shellQuote(value) {
-	return `'${String(value).replaceAll("'", `'\\''`)}'`;
-}
-
-async function launchPiInTmux(options) {
-	const { agentDir, cwd, fakeBinDir, fakeStateDir, model, paneLogPath, sessionId, tmuxSession } = options;
-	await killTmuxSession(tmuxSession);
-	await run("tmux", [
-		"new-session",
-		"-d",
-		"-s",
-		tmuxSession,
-		"-c",
-		cwd,
-		"env",
-		`PI_CODING_AGENT_DIR=${agentDir}`,
-		`AGENT_BROWSER_PIAB_LIFECYCLE_FAKE_STATE_DIR=${fakeStateDir}`,
-		`PATH=${fakeBinDir}${delimiter}${process.env.PATH ?? ""}`,
-		"pi",
-		...buildPiLaunchArgs({ model, sessionId }),
-	]);
-	if (paneLogPath) {
-		await mkdir(dirname(paneLogPath), { recursive: true });
-		await run("tmux", ["pipe-pane", "-o", "-t", tmuxActiveTarget(tmuxSession), `cat >> ${shellQuote(paneLogPath)}`]);
-	}
-}
-
-async function sendLine(tmuxSession, text) {
-	const target = tmuxActiveTarget(tmuxSession);
-	await run("tmux", ["send-keys", "-t", target, "-l", text]);
-	await sleep(PROMPT_SUBMIT_PAUSE_MS);
-	await run("tmux", ["send-keys", "-t", target, "Enter"]);
-}
-
-async function listSessionFiles(sessionDir) {
-	const { stdout } = await run("find", [sessionDir, "-type", "f", "-name", "*.jsonl"]);
-	return stdout
-		.split("\n")
-		.map((line) => line.trim())
-		.filter(Boolean)
-		.sort();
-}
-
-async function newestSessionFile(sessionDir) {
-	const files = await listSessionFiles(sessionDir);
-	if (files.length === 0) return undefined;
-	let newest;
-	let newestMtime = -1;
-	for (const file of files) {
-		const { stdout } = await run("stat", ["-f", "%m", file]).catch(async () => run("stat", ["-c", "%Y", file]));
-		const mtime = Number(stdout.trim());
-		if (mtime >= newestMtime) {
-			newest = file;
-			newestMtime = mtime;
-		}
-	}
-	return newest;
-}
-
-async function waitFor({ describe, predicate, timeoutMs, intervalMs = 1000, onPoll }) {
-	const start = Date.now();
-	let lastError;
-	while (Date.now() - start <= timeoutMs) {
-		try {
-			const result = await predicate();
-			if (result) return result;
-		} catch (error) {
-			lastError = error;
-		}
-		if (onPoll) await onPoll();
-		await sleep(intervalMs);
-	}
-	const suffix = lastError ? ` Last error: ${lastError instanceof Error ? lastError.message : String(lastError)}` : "";
-	throw new Error(`Timed out waiting for ${describe} after ${timeoutMs}ms.${suffix}`);
-}
-
-function resultText(result) {
-	return Array.isArray(result?.content)
-		? result.content.filter((item) => item?.type === "text" && typeof item.text === "string").map((item) => item.text).join("\n")
-		: "";
-}
-
-export function matchesSuccessfulPageResult(result, command, expectedUrl) {
-	const details = result?.details;
-	const observedUrl = command === "open" ? details?.data?.url : command === "snapshot" ? details?.data?.origin : undefined;
-	return result?.isError === false
-		&& details?.resultCategory === "success"
-		&& details?.command === command
-		&& typeof observedUrl === "string"
-		&& normalizeComparableUrl(observedUrl) === normalizeComparableUrl(expectedUrl);
-}
-
-function assert(condition, message) {
-	if (!condition) throw new Error(message);
-}
-
-async function assertFileExists(filePath, label) {
-	assert(await pathExists(filePath), `${label} does not exist: ${filePath}`);
-}
-
-async function readEntries(sessionFile) {
-	return await readJsonlFile(sessionFile);
-}
-
-async function waitForSentinel({ sessionFile, timeoutMs, token }) {
-	return await waitFor({
-		describe: `sentinel token ${token}`,
-		timeoutMs,
-		predicate: async () => {
-			const entries = await readEntries(sessionFile);
-			return sentinelTokens(entries).includes(token) ? entries : undefined;
-		},
-	});
-}
-
-export async function waitForAgentBrowserResult({ describe, sessionFile, sessionDir, timeoutMs, sinceCount, predicate }) {
-	const report = await waitFor({
-		describe,
-		timeoutMs,
-		predicate: async () => {
-			sessionFile ??= await newestSessionFile(sessionDir);
-			if (!sessionFile) return undefined;
-			const entries = await readEntries(sessionFile);
-			const results = agentBrowserResults(entries);
-			const result = results[sinceCount];
-			return result ? { entries, result, results, sessionFile } : undefined;
-		},
-	});
-	const { result } = report;
-	assert(predicate(result), `Unexpected agent_browser result for ${describe}: call ${result.toolCallId ?? "unknown"}; command ${result.details?.command ?? "missing"}; isError ${result.isError}; category ${result.details?.resultCategory ?? "missing"}/${result.details?.failureCategory ?? result.details?.successCategory ?? "missing"}.`);
-	return report;
-}
-
-async function waitForAssistantFinal({ describe, sessionFile, sinceEntryCount, timeoutMs }) {
-	return await waitFor({
-		describe: `${describe} final assistant response`,
-		timeoutMs,
-		predicate: async () => {
-			const entries = await readEntries(sessionFile);
-			const finalMessage = entries.slice(sinceEntryCount).find((entry) => {
-				const message = entry?.message;
-				return (
-					entry?.type === "message" &&
-					message?.role === "assistant" &&
-					Array.isArray(message.content) &&
-					message.content.some((item) => item?.type === "text" && typeof item.text === "string")
-				);
-			});
-			return finalMessage ? entries : undefined;
-		},
-	});
-}
-
-async function runPromptAndWaitForResult({ describe, prompt, sessionFile, timeoutMs, tmuxSession, predicate, verbose }) {
-	const beforeEntries = await readEntries(sessionFile);
-	const beforeResults = agentBrowserResults(beforeEntries).length;
-	if (verbose) console.log(`→ ${describe}`);
-	await sendLine(tmuxSession, prompt);
-	const report = await waitForAgentBrowserResult({ describe, sessionFile, timeoutMs, sinceCount: beforeResults, predicate });
-	await waitForAssistantFinal({ describe, sessionFile, sinceEntryCount: beforeEntries.length, timeoutMs });
-	return report;
-}
-
-function buildToolInputPrompt(params, extra = "") {
-	return `Use exactly one agent_browser tool call with input ${JSON.stringify(params)}${extra} Do not use bash. After the tool result, briefly report the result.`;
-}
-
-function buildPrompt(args, extra = "") {
-	return buildToolInputPrompt({ args }, extra);
-}
-
-async function verifyLifecycle(options = {}) {
-	const repoRoot = options.repoRoot ?? process.cwd();
-	const model = options.model ?? DEFAULT_LIFECYCLE_MODEL;
-	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-	const keepArtifacts = options.keepArtifacts ?? false;
-	const verbose = options.verbose ?? false;
-	const tempRoot = await mkdtemp(join(tmpdir(), "piab-lifecycle-"));
-	const artifactsDir = join(tempRoot, "artifacts");
-	const agentDir = join(tempRoot, "agent");
-	const sessionDir = join(tempRoot, "sessions");
-	const packageDir = join(tempRoot, "package-under-test");
-	const fakeBinDir = join(tempRoot, "fake-bin");
-	const fakeStateDir = join(tempRoot, "fake-browser-state");
-	const piSessionId = createLifecycleSessionId(process.pid);
-	const tmuxSession = piSessionId;
-	let sessionFile;
-	let firstFullOutputPath;
-	let failure;
-
-	const log = (message) => {
-		if (verbose) console.log(message);
-	};
-
-	try {
-		await mkdir(artifactsDir, { recursive: true });
-		await mkdir(sessionDir, { recursive: true });
-		await copyPackageSource({ packageDir, repoRoot });
-		await writeLifecycleSentinel({ packageDir, token: "v1" });
-		await createFakeAgentBrowserBinary(fakeBinDir);
-		const settings = await writeSettings({ agentDir, packageDir, sessionDir });
-		assert(settings.packages.length === 1 && settings.packages[0] === packageDir, "Isolated settings must use exactly one configured package source.");
-		assert(settings.extensions.length === 0 && settings.skills.length === 0 && settings.prompts.length === 0 && settings.themes.length === 0, "Isolated settings must clear local resource arrays.");
-
-		log(`Temp root: ${tempRoot}`);
-		log(`Launching Pi in tmux with model ${model} and session id ${piSessionId}...`);
-		await launchPiInTmux({ agentDir, cwd: repoRoot, fakeBinDir, fakeStateDir, model, paneLogPath: join(artifactsDir, "initial-pane-stream.txt"), sessionId: piSessionId, tmuxSession });
-		await waitFor({
-			describe: "Pi prompt readiness",
-			timeoutMs,
-			predicate: async () => {
-				const pane = await capturePaneText(tmuxSession);
-				return paneLooksReady(pane) ? pane : undefined;
-			},
-		});
-		await sleep(1000);
-		if (verbose) console.log("→ initial managed open");
-		await sendLine(tmuxSession, buildPrompt(["open", EXPECTED_URL]));
-		const openReport = await waitForAgentBrowserResult({
-			describe: "initial managed open result",
-			sessionDir,
-			timeoutMs,
-			sinceCount: 0,
-			predicate: (result) => matchesSuccessfulPageResult(result, "open", EXPECTED_URL),
-		});
-		sessionFile = openReport.sessionFile;
-		assert(sessionFile, "Pi did not create a session file.");
-		assert(sessionHeaderId(openReport.entries) === piSessionId, `Pi session header id ${JSON.stringify(sessionHeaderId(openReport.entries))} did not match requested lifecycle session id ${JSON.stringify(piSessionId)}.`);
-		await waitForAssistantFinal({ describe: "initial managed open", sessionFile, sinceEntryCount: 0, timeoutMs });
-		const firstSessionName = openReport.result.details?.sessionName;
-		assert(typeof firstSessionName === "string" && firstSessionName.length > 0, "Initial open did not report details.sessionName.");
-		assert(openReport.result.details?.usedImplicitSession === true, "Initial open did not use the implicit managed session.");
-
-		await sendLine(tmuxSession, `/${lifecycleSentinelCommand("v1")}`);
-		await waitForSentinel({ sessionFile, timeoutMs, token: "v1" });
-
-		await writeLifecycleSentinel({ packageDir, token: "v2" });
-		await sendLine(tmuxSession, "/reload");
-		await sleep(3000);
-
-		const reloadSnapshot = await runPromptAndWaitForResult({
-			describe: "post-reload same-page snapshot",
-			prompt: buildPrompt(["snapshot", "-i"]),
-			sessionFile,
-			timeoutMs,
-			tmuxSession,
-			verbose,
-			predicate: (result) => matchesSuccessfulPageResult(result, "snapshot", EXPECTED_URL),
-		});
-		assert(reloadSnapshot.result.details?.sessionName === firstSessionName, "Post-reload snapshot used a different managed session name.");
-
-		const largeReport = await runPromptAndWaitForResult({
-			describe: "large eval output spill",
-			prompt: buildPrompt(["eval", "--stdin"], " and stdin set to document.body.innerText."),
-			sessionFile,
-			timeoutMs,
-			tmuxSession,
-			verbose,
-			predicate: (result) => collectFullOutputPaths([result]).length > 0,
-		});
-		[firstFullOutputPath] = collectFullOutputPaths([largeReport.result]);
-		assert(typeof firstFullOutputPath === "string", "Large eval did not expose details.fullOutputPath.");
-		await assertFileExists(firstFullOutputPath, "Large-output fullOutputPath");
-
-		await capturePane(tmuxSession, join(artifactsDir, "before-restart-pane.txt"));
-		await killTmuxSession(tmuxSession);
-		log("Relaunching Pi with exact prior session id...");
-		await launchPiInTmux({ agentDir, cwd: repoRoot, fakeBinDir, fakeStateDir, model, paneLogPath: join(artifactsDir, "relaunch-pane-stream.txt"), sessionId: piSessionId, tmuxSession });
-		await waitFor({
-			describe: "relaunched Pi prompt readiness",
-			timeoutMs,
-			predicate: async () => {
-				const pane = await capturePaneText(tmuxSession);
-				return paneLooksReady(pane) ? pane : undefined;
-			},
-		});
-		await sendLine(tmuxSession, `/${lifecycleSentinelCommand("v2")}`);
-		await waitForSentinel({ sessionFile, timeoutMs, token: "v2" });
-
-		const resumeSnapshot = await runPromptAndWaitForResult({
-			describe: "post-relaunch exact-session snapshot",
-			prompt: buildPrompt(["snapshot", "-i"]),
-			sessionFile,
-			timeoutMs,
-			tmuxSession,
-			verbose,
-			predicate: (result) => matchesSuccessfulPageResult(result, "snapshot", EXPECTED_URL),
-		});
-		assert(resumeSnapshot.result.details?.sessionName === firstSessionName, "Post-relaunch snapshot used a different managed session name.");
-		await assertFileExists(firstFullOutputPath, "Previously persisted fullOutputPath after relaunch");
-
-		const qaFailureReport = await runPromptAndWaitForResult({
-			describe: "qa reclassification failure patch",
-			prompt: buildToolInputPrompt({ qa: { url: "https://fail.example.test/", expectedText: ["Welcome"], expectedSelector: "main" } }),
-			sessionFile,
-			timeoutMs,
-			tmuxSession,
-			verbose,
-			predicate: (result) => result?.details?.failureCategory === "qa-failure" && result?.details?.resultCategory === "failure" && result?.isError === true,
-		});
-		assert(resultText(qaFailureReport.result).includes("Result category: failure; failureCategory: qa-failure; Pi tool isError: true."), "QA failure transcript row did not include the model-visible Pi isError patch notice.");
-
-		await capturePane(tmuxSession, join(artifactsDir, "success-pane.txt"));
-		return {
-			artifactsDir,
-			fullOutputPath: firstFullOutputPath,
-			sessionFile,
-			sessionId: piSessionId,
-			sessionName: firstSessionName,
-			tempRoot,
-		};
-	} catch (error) {
-		failure = error;
-		await mkdir(artifactsDir, { recursive: true }).catch(() => undefined);
-		await capturePane(tmuxSession, join(artifactsDir, "failure-pane.txt"));
-		if (sessionFile && (await pathExists(sessionFile))) {
-			await cp(sessionFile, join(artifactsDir, basename(sessionFile))).catch(() => undefined);
-		}
-		throw error;
-	} finally {
-		await capturePane(tmuxSession, join(artifactsDir, "final-pane.txt")).catch(() => undefined);
-		await killTmuxSession(tmuxSession);
-		if (!keepArtifacts && !failure) {
-			await rm(tempRoot, { force: true, recursive: true });
-		} else {
-			console.error(`${failure ? "Lifecycle artifacts retained for debugging" : "Lifecycle artifacts retained"}: ${tempRoot}`);
-		}
-	}
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -762,7 +134,7 @@ export async function main(argv = process.argv.slice(2)) {
 			return 2;
 		}
 		console.error("Lifecycle verification failed:");
-		console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+		console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
 		return 1;
 	}
 }
@@ -772,7 +144,12 @@ export function isDirectRun(metaUrl, argv = process.argv) {
 }
 
 if (isDirectRun(import.meta.url)) {
-	main().then((exitCode) => {
-		process.exitCode = exitCode;
-	});
+	main()
+		.then((exitCode) => {
+			process.exitCode = exitCode;
+		})
+		.catch((error) => {
+			console.error(error instanceof Error ? error.message : error);
+			process.exitCode = 1;
+		});
 }

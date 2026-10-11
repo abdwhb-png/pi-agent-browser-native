@@ -1,25 +1,16 @@
 import { exec as execCallback } from "node:child_process";
-import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 
 import {
 	SECRET_COMMAND_TIMEOUT_MS,
-	buildAgentBrowserConfigState,
-	getAgentBrowserConfigPaths,
 	getWebSearchCredentialSource,
 	getWebSearchProviderOrder,
 	loadAgentBrowserConfigStateSync,
-	mergeAgentBrowserConfig,
-	parseAgentBrowserConfigLayer,
 	resolveEnvInterpolations,
-} from "./config-policy.js";
-import type {
-	AgentBrowserConfig,
-	AgentBrowserConfigLoadOptions,
-	AgentBrowserConfigState,
-	ConfigLayer,
-	CredentialSource,
-	WebSearchProvider,
+	type AgentBrowserConfigLoadOptions,
+	type AgentBrowserConfigState,
+	type CredentialSource,
+	type WebSearchProvider,
 } from "./config-policy.js";
 
 export {
@@ -52,8 +43,6 @@ export {
 	getWebSearchProviderLabel,
 	getWebSearchProviderOrder,
 	hasPotentialCredentialSource,
-	isPlaintextCredentialValue,
-	isProjectSafeCredentialValueForProvider,
 	isWebSearchProvider,
 	loadAgentBrowserConfigStateSync,
 	mergeAgentBrowserConfig,
@@ -78,64 +67,29 @@ export type {
 	WebSearchProviderDescriptor,
 } from "./config-policy.js";
 
+// Node's callback-oriented exec returns ChildProcess; promisify intentionally ignores that return.
+// oxlint-disable-next-line typescript/strict-void-return
 const exec = promisify(execCallback);
 
 export interface ResolvedCredential {
-	source: CredentialSource;
-	value: string;
+	readonly source: CredentialSource;
+	readonly value: string;
 }
 
-async function readConfigLayer(path: string, scope: ConfigLayer["scope"], errors: string[], warnings: string[]): Promise<ConfigLayer | undefined> {
-	let raw: string;
-	try {
-		raw = await readFile(path, "utf8");
-	} catch (error) {
-		if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
-			return undefined;
-		}
-		errors.push(`Could not read ${scope} config ${path}: ${error instanceof Error ? error.message : String(error)}`);
-		return undefined;
-	}
-	return parseAgentBrowserConfigLayer(raw, path, scope, errors, warnings);
-}
-
-export async function loadAgentBrowserConfig(options: AgentBrowserConfigLoadOptions = {}): Promise<AgentBrowserConfigState> {
-	const env = options.env ?? process.env;
-	const paths = getAgentBrowserConfigPaths({ cwd: options.cwd, env });
-	const includeProjectConfig = options.includeProjectConfig !== false;
-	const errors: string[] = [];
-	const warnings: string[] = [];
-	const layerCandidates = [
-		{ path: paths.global, scope: "global" as const },
-		...(includeProjectConfig ? [{ path: paths.project, scope: "project" as const }] : []),
-		...(paths.override ? [{ path: paths.override, scope: "override" as const }] : []),
-	];
-	const layers: ConfigLayer[] = [];
-	let mergedConfig: AgentBrowserConfig = {};
-	for (const candidate of layerCandidates) {
-		const layer = await readConfigLayer(candidate.path, candidate.scope, errors, warnings);
-		if (!layer) continue;
-		layers.push(layer);
-		mergedConfig = mergeAgentBrowserConfig(mergedConfig, layer.config);
-	}
-	return buildAgentBrowserConfigState({
-		env,
-		errors,
-		layers,
-		mergedConfig,
-		paths,
-		projectConfigIncluded: includeProjectConfig,
-		warnings,
-	});
-}
-
-export function loadAgentBrowserConfigSync(options: AgentBrowserConfigLoadOptions = {}): AgentBrowserConfigState {
+export function loadAgentBrowserConfigSync(
+	options: AgentBrowserConfigLoadOptions = {},
+): AgentBrowserConfigState {
 	return loadAgentBrowserConfigStateSync(options);
 }
 
-async function resolveCommandCredential(rawValue: string, signal?: AbortSignal): Promise<string | undefined> {
+async function resolveCommandCredential(
+	rawValue: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
 	const command = rawValue.slice(1).trim();
-	if (!command) return undefined;
+	if (command.length === 0) {
+		return undefined;
+	}
 	try {
 		const result = await exec(command, {
 			signal,
@@ -145,16 +99,24 @@ async function resolveCommandCredential(rawValue: string, signal?: AbortSignal):
 		const value = result.stdout.trim();
 		return value.length > 0 ? value : undefined;
 	} catch (error) {
-		if (signal?.aborted) throw error;
-		throw new Error("Credential command failed without exposing command output. Check pi-agent-browser-config web-search status and the configured secret manager command.");
+		if (signal?.aborted === true) {
+			throw error;
+		}
+		// The native exec error contains the secret command/stdout/stderr; never expose it as a cause.
+		// oxlint-disable-next-line eslint/preserve-caught-error
+		throw new Error(
+			"Credential command failed without exposing command output. Check pi-agent-browser-config web-search status and the configured secret manager command.",
+		);
 	}
 }
 
-export async function resolveCredentialSource(
+async function resolveCredentialSource(
 	source: CredentialSource | undefined,
-	options: { env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
+	options: { readonly env?: NodeJS.ProcessEnv; readonly signal?: AbortSignal } = {},
 ): Promise<ResolvedCredential | undefined> {
-	if (!source) return undefined;
+	if (!source) {
+		return undefined;
+	}
 	let value: string | undefined;
 	if (source.kind === "command") {
 		value = await resolveCommandCredential(source.rawValue, options.signal);
@@ -163,26 +125,40 @@ export async function resolveCredentialSource(
 	} else {
 		value = source.rawValue.trim();
 	}
-	return value ? { source, value } : undefined;
+	return value !== undefined && value.length > 0 ? { source, value } : undefined;
 }
 
 export async function resolveWebSearchCredential(
 	state: AgentBrowserConfigState,
 	provider: WebSearchProvider,
-	options: { env?: NodeJS.ProcessEnv; signal?: AbortSignal } = {},
+	options: { readonly env?: NodeJS.ProcessEnv; readonly signal?: AbortSignal } = {},
 ): Promise<ResolvedCredential | undefined> {
-	if (!state.webSearchEnabled || state.errors.length > 0) return undefined;
+	if (!state.webSearchEnabled || state.errors.length > 0) {
+		return undefined;
+	}
 	return resolveCredentialSource(getWebSearchCredentialSource(state, provider), options);
 }
 
 export async function resolvePreferredWebSearchCredential(
 	state: AgentBrowserConfigState,
-	options: { env?: NodeJS.ProcessEnv; provider?: WebSearchProvider | "auto"; signal?: AbortSignal } = {},
-): Promise<{ provider: WebSearchProvider; credential: ResolvedCredential } | undefined> {
-	if (!state.webSearchEnabled || state.errors.length > 0) return undefined;
+	options: {
+		readonly env?: NodeJS.ProcessEnv;
+		readonly provider?: WebSearchProvider | "auto";
+		readonly signal?: AbortSignal;
+	} = {},
+): Promise<
+	{ readonly provider: WebSearchProvider; readonly credential: ResolvedCredential } | undefined
+> {
+	if (!state.webSearchEnabled || state.errors.length > 0) {
+		return undefined;
+	}
 	for (const provider of getWebSearchProviderOrder(state, options.provider)) {
+		// Resolve in configured preference order; later secret commands must not run once a key resolves.
+		// oxlint-disable-next-line no-await-in-loop
 		const credential = await resolveWebSearchCredential(state, provider, options);
-		if (credential) return { provider, credential };
+		if (credential) {
+			return { provider, credential };
+		}
 	}
 	return undefined;
 }

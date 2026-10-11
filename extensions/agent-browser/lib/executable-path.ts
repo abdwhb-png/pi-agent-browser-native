@@ -2,17 +2,31 @@ import { constants as fsConstants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 
+async function isExecutableFile(candidate: string): Promise<boolean> {
+	try {
+		await access(candidate, fsConstants.X_OK);
+		return (await stat(candidate)).isFile();
+	} catch {
+		return false;
+	}
+}
+
 export async function executableExistsOnPath(command: string): Promise<boolean> {
-	const extensions = process.platform === "win32" ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean) : [""];
-	for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
-		for (const extension of extensions) {
-			try {
-				const candidate = join(directory, `${command}${extension}`);
-				await access(candidate, fsConstants.X_OK);
-				if ((await stat(candidate)).isFile()) return true;
-			} catch {
-				// Try the next PATH candidate.
-			}
+	const extensions =
+		process.platform === "win32"
+			? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+			: [""];
+	const candidates = (process.env.PATH ?? "")
+		.split(delimiter)
+		.filter(Boolean)
+		.flatMap((directory) =>
+			extensions.map((extension) => join(directory, `${command}${extension}`)),
+		);
+	for (const candidate of candidates) {
+		// Respect PATH/PATHEXT precedence and stop probing after the first executable.
+		// oxlint-disable-next-line no-await-in-loop
+		if (await isExecutableFile(candidate)) {
+			return true;
 		}
 	}
 	return false;

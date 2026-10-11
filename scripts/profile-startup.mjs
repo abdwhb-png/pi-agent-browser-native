@@ -14,11 +14,11 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { DIRECT_IMPORT_BUDGET_MS, measureColdStartup } from "./startup-measurement.mjs";
+
 const execFile = promisify(execFileCallback);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DEFAULT_SAMPLES = 10;
-const CHILD_TIMEOUT_MS = 10_000;
-const DIRECT_IMPORT_BUDGET_MS = 250;
 const BUILD_SCRIPT = "./scripts/build.mjs";
 
 class UsageError extends Error {
@@ -52,26 +52,37 @@ Safety:
 `;
 }
 
+function parseSampleCount(value) {
+	if (!value || value.startsWith("-")) {
+		throw new UsageError("--samples requires a positive integer.");
+	}
+	const parsed = Number(value);
+	if (!Number.isInteger(parsed) || parsed <= 0) {
+		throw new UsageError("--samples requires a positive integer.");
+	}
+	return parsed;
+}
+
 function parseArgs(argv = process.argv.slice(2)) {
 	const options = { json: false, samples: DEFAULT_SAMPLES, showHelp: false };
 	for (let index = 0; index < argv.length; index += 1) {
 		const arg = argv[index];
-		if (arg === "-h" || arg === "--help") return { ...options, showHelp: true };
+		if (arg === "-h" || arg === "--help") {
+			return { ...options, showHelp: true };
+		}
 		if (arg === "--json") {
 			options.json = true;
 			continue;
 		}
 		if (arg === "--samples") {
-			const value = argv[index + 1];
-			if (!value || value.startsWith("-")) throw new UsageError("--samples requires a positive integer.");
-			const parsed = Number(value);
-			if (!Number.isInteger(parsed) || parsed <= 0) throw new UsageError("--samples requires a positive integer.");
-			options.samples = parsed;
+			options.samples = parseSampleCount(argv[index + 1]);
 			index += 1;
 			continue;
 		}
 		if (arg === "--timeout-ms") {
-			throw new UsageError("--timeout-ms was removed: startup-profile no longer launches full Pi/tmux sessions.");
+			throw new UsageError(
+				"--timeout-ms was removed: startup-profile no longer launches full Pi/tmux sessions.",
+			);
 		}
 		throw new UsageError(`Unknown option: ${arg}`);
 	}
@@ -95,47 +106,31 @@ async function readPackageEntrypoint() {
 	return extensionPath;
 }
 
-async function measureDirectImportSample(entrypoint, sampleIndex) {
-	const script = `
-const start = performance.now();
-const extension = await import(${JSON.stringify(entrypoint)});
-const imported = performance.now();
-const pi = {
-  events: [],
-  tools: [],
-  on(...args) { this.events.push(args); },
-  registerTool(tool) { this.tools.push(tool.name); }
-};
-extension.default(pi);
-const registered = performance.now();
-console.log(JSON.stringify({
-  events: pi.events.length,
-  importMs: imported - start,
-  sampleIndex: ${sampleIndex},
-  tools: pi.tools,
-  totalMs: registered - start
-}));
-`;
-	const result = await execFile(process.execPath, ["--input-type=module", "-e", script], {
-		cwd: repoRoot,
-		maxBuffer: 1024 * 1024,
-		timeout: CHILD_TIMEOUT_MS,
-	});
-	return { ...JSON.parse(result.stdout.trim()), ok: true };
-}
-
 async function measureDirectImportSamples(entrypoint, sampleCount) {
 	const samples = [];
 	for (let index = 0; index < sampleCount; index += 1) {
-		samples.push(await measureDirectImportSample(entrypoint, index + 1));
+		// Cold startup measurements must not compete for CPU with other samples.
+		// oxlint-disable-next-line no-await-in-loop
+		const sample = await measureColdStartup(entrypoint, repoRoot);
+		samples.push({
+			...sample,
+			sampleIndex: index + 1,
+			ok: true,
+		});
 	}
 	return samples;
 }
 
 function summarize(samples) {
-	const values = samples.filter((sample) => sample.ok).map((sample) => sample.totalMs).sort((a, b) => a - b);
-	if (values.length === 0) return { n: 0 };
-	const percentile = (p) => values[Math.min(values.length - 1, Math.max(0, Math.ceil((p / 100) * values.length) - 1))];
+	const values = samples
+		.filter((sample) => sample.ok)
+		.map((sample) => sample.totalMs)
+		.sort((a, b) => a - b);
+	if (values.length === 0) {
+		return { n: 0 };
+	}
+	const percentile = (p) =>
+		values[Math.min(values.length - 1, Math.max(0, Math.ceil((p / 100) * values.length) - 1))];
 	return {
 		budgetMs: DIRECT_IMPORT_BUDGET_MS,
 		maxMs: values.at(-1),
@@ -172,9 +167,6 @@ async function main(argv = process.argv.slice(2)) {
 	const packageEntrypoint = await readPackageEntrypoint();
 	const directImportSamples = await measureDirectImportSamples(packageEntrypoint, options.samples);
 	const directSummary = summarize(directImportSamples);
-	if (!directSummary.withinBudget) {
-		throw new Error(`Direct startup exceeded ${DIRECT_IMPORT_BUDGET_MS}ms budget: max ${directSummary.maxMs.toFixed(1)}ms.`);
-	}
 	const firstSample = directImportSamples[0] ?? { events: 0, tools: [] };
 	const report = {
 		artifactPath: resolve(repoRoot, ".artifacts", "startup-profile", "latest.json"),
@@ -200,19 +192,23 @@ async function main(argv = process.argv.slice(2)) {
 	await mkdir(dirname(report.artifactPath), { recursive: true });
 	await writeFile(report.artifactPath, `${JSON.stringify(report, null, "\t")}\n`, "utf8");
 	console.log(options.json ? JSON.stringify(report, null, 2) : formatHuman(report));
+	if (!directSummary.withinBudget) {
+		throw new Error(
+			`Direct startup exceeded ${DIRECT_IMPORT_BUDGET_MS}ms budget: max ${directSummary.maxMs.toFixed(1)}ms.`,
+		);
+	}
 	return 0;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-	main().then(
-		(code) => {
+if (import.meta.main) {
+	main()
+		.then((code) => {
 			process.exitCode = code;
-		},
-		(error) => {
+		})
+		.catch((error) => {
 			console.error(error instanceof Error ? error.message : String(error));
 			process.exitCode = error instanceof UsageError ? 2 : 1;
-		},
-	);
+		});
 }
 
 export { parseArgs, summarize };

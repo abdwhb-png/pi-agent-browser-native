@@ -1,119 +1,145 @@
 {
-  "name": "pi-agent-browser-native",
-  "version": "0.6.10",
-  "description": "pi extension that exposes agent-browser as a native tool for browser automation",
-  "type": "module",
-  "author": "Mitch Fultz (https://github.com/fitchmultz)",
-  "keywords": [
-    "pi-package",
-    "pi",
-    "pi-extension",
-    "extension",
-    "agent-browser",
-    "browser-automation",
-    "typescript",
-    "npm-package"
-  ],
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/fitchmultz/pi-agent-browser-native.git"
-  },
-  "homepage": "https://github.com/fitchmultz/pi-agent-browser-native#readme",
-  "bugs": {
-    "url": "https://github.com/fitchmultz/pi-agent-browser-native/issues"
-  },
-  "engines": {
-    "node": ">=22.19.0"
-  },
-  "bin": {
-    "pi-agent-browser-config": "scripts/config.mjs",
-    "pi-agent-browser-doctor": "scripts/doctor.mjs"
-  },
-  "files": [
-    "dist",
-    "platform-smoke.config.mjs",
-    "scripts/config.mjs",
-    "scripts/doctor.mjs",
-    "scripts/prepare.mjs",
-    "scripts/build.mjs",
-    "scripts/agent-browser-capability-baseline.mjs",
-    "scripts/agent-browser-target.mjs",
-    "scripts/platform-smoke.mjs",
-    "scripts/platform-smoke",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE",
-    "docs/ARCHITECTURE.md",
-    "docs/COMMAND_REFERENCE.md",
-    "docs/ELECTRON.md",
-    "docs/RELEASE.md",
-    "docs/platform-smoke.md",
-    "docs/REQUIREMENTS.md",
-    "docs/SUPPORT_MATRIX.md",
-    "docs/TOOL_CONTRACT.md"
-  ],
-  "pi": {
-    "extensions": [
-      "./dist/extensions/agent-browser/index.js"
-    ]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
-  },
-  "devDependencies": {
-    "@earendil-works/pi-ai": "0.84.0",
-    "@earendil-works/pi-coding-agent": "0.84.0",
-    "@earendil-works/pi-tui": "0.84.0",
-    "@types/cross-spawn": "6.0.6",
-    "@types/node": "^25.9.3",
-    "tsx": "^4.21.0",
-    "typebox": "^1.1.38",
-    "typescript": "^6.0.3"
-  },
-  "overrides": {
-    "basic-ftp": "6.0.1",
-    "esbuild": "0.28.1",
-    "protobufjs": "7.6.5"
-  },
-  "scripts": {
-    "docs": "node ./scripts/project.mjs docs",
-    "doctor": "node ./scripts/doctor.mjs",
-    "check:platform-smoke": "node --check platform-smoke.config.mjs && node --check scripts/platform-smoke.mjs && node --check scripts/platform-smoke/doctor.mjs && node --check scripts/platform-smoke/crabbox-runner.mjs && node --check scripts/platform-smoke/targets.mjs && node --check scripts/platform-smoke/artifacts.mjs && tsx --test test/platform-smoke.test.ts",
-    "smoke:platform": "node scripts/platform-smoke.mjs",
-    "smoke:platform:doctor": "node scripts/platform-smoke.mjs doctor",
-    "smoke:platform:ubuntu-image": "node scripts/platform-smoke/build-ubuntu-image.mjs",
-    "smoke:platform:macos": "node scripts/platform-smoke.mjs run --target macos",
-    "smoke:platform:ubuntu": "node scripts/platform-smoke.mjs run --target ubuntu",
-    "smoke:platform:windows-native": "node scripts/platform-smoke.mjs run --target windows-native",
-    "smoke:platform:all": "npm run smoke:platform:doctor && node scripts/platform-smoke.mjs run --target macos,ubuntu,windows-native",
-    "typecheck": "node ./scripts/project.mjs verify typecheck",
-    "test": "node ./scripts/build.mjs && tsx --test --test-concurrency=1 test/**/*.test.ts",
-    "verify": "node ./scripts/project.mjs verify",
-    "prepublishOnly": "npm run verify -- release && npm pack --dry-run",
-    "build": "node ./scripts/build.mjs",
-    "startup-profile": "node ./scripts/profile-startup.mjs",
-    "prepare": "node ./scripts/prepare.mjs"
-  },
-  "packageManager": "npm@11.14.0",
-  "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": {
-      "optional": true
-    },
-    "@earendil-works/pi-coding-agent": {
-      "optional": true
-    },
-    "@earendil-works/pi-tui": {
-      "optional": true
-    },
-    "typebox": {
-      "optional": true
-    }
-  },
-  "dependencies": {
-    "cross-spawn": "7.0.6"
-  }
+	"name": "pi-agent-browser-native",
+	"version": "0.9.4",
+	"description": "pi extension that exposes agent-browser as a native tool for browser automation",
+	"type": "module",
+	"author": "Mitch Fultz (https://github.com/fitchmultz)",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-extension",
+		"extension",
+		"agent-browser",
+		"browser-automation",
+		"typescript",
+		"npm-package"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fitchmultz/pi-agent-browser-native.git"
+	},
+	"homepage": "https://github.com/fitchmultz/pi-agent-browser-native#readme",
+	"bugs": {
+		"url": "https://github.com/fitchmultz/pi-agent-browser-native/issues"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"bin": {
+		"pi-agent-browser-config": "scripts/config.mjs",
+		"pi-agent-browser-convert": "scripts/convert-browser-session.mjs",
+		"pi-agent-browser-doctor": "scripts/doctor.mjs"
+	},
+	"files": [
+		"dist",
+		"platform-smoke.config.mjs",
+		"scripts/config.mjs",
+		"scripts/convert-browser-session.mjs",
+		"scripts/doctor.mjs",
+		"scripts/doctor-sources.mjs",
+		"scripts/prepare.mjs",
+		"scripts/build.mjs",
+		"scripts/agent-browser-capability-baseline.mjs",
+		"scripts/capability-core-commands.mjs",
+		"scripts/capability-options.mjs",
+		"scripts/capability-samples.mjs",
+		"scripts/capability-section.mjs",
+		"scripts/agent-browser-target.mjs",
+		"scripts/platform-smoke.mjs",
+		"scripts/platform-smoke",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE",
+		"docs/ARCHITECTURE.md",
+		"docs/CODE_QUALITY.md",
+		"docs/COMMAND_REFERENCE.md",
+		"docs/ELECTRON.md",
+		"docs/RELEASE.md",
+		"docs/SESSION_STORAGE.md",
+		"docs/platform-smoke.md",
+		"docs/REQUIREMENTS.md",
+		"docs/SUPPORT_MATRIX.md",
+		"docs/TOOL_CONTRACT.md"
+	],
+	"pi": {
+		"extensions": [
+			"./dist/extensions/agent-browser/index.js"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "1.0.2",
+		"@earendil-works/pi-coding-agent": "1.0.2",
+		"@earendil-works/pi-tui": "1.0.2",
+		"@types/cross-spawn": "6.0.6",
+		"@types/node": "24.19.1",
+		"@types/which": "2.0.2",
+		"esbuild": "0.28.2",
+		"eslint-node-test": "1.0.1",
+		"oxc-parser": "0.153.0",
+		"oxfmt": "0.72.0",
+		"oxlint": "1.87.0",
+		"oxlint-tsgolint": "7.0.2003",
+		"tsx": "4.23.15",
+		"typebox": "1.3.27",
+		"typescript": "7.0.2"
+	},
+	"scripts": {
+		"lint": "node ./scripts/code-quality.mjs lint",
+		"lint:agent": "node ./scripts/code-quality.mjs lint --format=agent",
+		"lint:fix": "node ./scripts/code-quality.mjs lint --fix",
+		"format": "oxfmt --write .",
+		"format:check": "oxfmt --check .",
+		"quality:scope": "node ./scripts/code-quality.mjs scope",
+		"quality:policy": "node ./scripts/code-quality.mjs check",
+		"quality:probes": "tsx --test --test-concurrency=1 test/code-quality*.test.ts",
+		"quality:mutations": "node ./scripts/verify-quality-mutations.mjs",
+		"quality": "node ./scripts/project.mjs verify quality",
+		"docs": "node ./scripts/project.mjs docs",
+		"doctor": "node ./scripts/doctor.mjs",
+		"check:platform-smoke": "node --check platform-smoke.config.mjs && node --check scripts/platform-smoke.mjs && node --check scripts/platform-smoke/doctor.mjs && node --check scripts/platform-smoke/crabbox-runner.mjs && node --check scripts/platform-smoke/targets.mjs && node --check scripts/platform-smoke/artifacts.mjs && tsx --test test/platform-smoke.test.ts",
+		"smoke:platform": "node scripts/platform-smoke.mjs",
+		"smoke:platform:doctor": "node scripts/platform-smoke.mjs doctor",
+		"smoke:platform:ubuntu-image": "node scripts/platform-smoke/build-ubuntu-image.mjs",
+		"smoke:platform:macos": "node scripts/platform-smoke.mjs run --target macos",
+		"smoke:platform:ubuntu": "node scripts/platform-smoke.mjs run --target ubuntu",
+		"smoke:platform:windows-native": "node scripts/platform-smoke.mjs run --target windows-native",
+		"smoke:platform:all": "npm run smoke:platform:doctor && node scripts/platform-smoke.mjs run --target macos,ubuntu,windows-native",
+		"check:compat": "node scripts/compat-host.mjs && npm run typecheck && npm test && node scripts/verify-package.mjs --smoke-pi",
+		"typecheck": "node ./scripts/project.mjs verify typecheck",
+		"test": "node ./scripts/build.mjs && tsx --test --test-reporter=tap --test-concurrency=1 \"test/**/*.test.ts\"",
+		"verify": "node ./scripts/project.mjs verify",
+		"prepublishOnly": "npm run verify -- release && npm pack --dry-run",
+		"build": "node ./scripts/build.mjs",
+		"startup-profile": "node ./scripts/profile-startup.mjs",
+		"prepare": "node ./scripts/prepare.mjs"
+	},
+	"packageManager": "npm@12.0.1",
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-ai": {
+			"optional": true
+		},
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
+	},
+	"dependencies": {
+		"cross-spawn": "7.0.6",
+		"path-key": "3.1.1",
+		"stream-json": "3.7.0",
+		"strip-json-comments": "5.0.3",
+		"which": "2.0.2"
+	}
 }

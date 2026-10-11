@@ -18,7 +18,10 @@ export function writeExitCode(dir, code, signal) {
 }
 
 export function writeSummary(dir, data) {
-	writeFileSync(resolve(dir, "summary.json"), JSON.stringify({ ...data, writtenAt: new Date().toISOString() }, null, 2));
+	writeFileSync(
+		resolve(dir, "summary.json"),
+		JSON.stringify({ ...data, writtenAt: new Date().toISOString() }, null, 2),
+	);
 }
 
 export function writeManifest(dir, expectedFiles) {
@@ -26,11 +29,16 @@ export function writeManifest(dir, expectedFiles) {
 	function walk(current) {
 		for (const entry of readdirSync(current, { withFileTypes: true })) {
 			const path = resolve(current, entry.name);
-			if (entry.isDirectory()) walk(path);
-			else if (entry.isFile()) present.push(relative(dir, path));
+			if (entry.isDirectory()) {
+				walk(path);
+			} else if (entry.isFile()) {
+				present.push(relative(dir, path));
+			}
 		}
 	}
-	if (existsSync(dir)) walk(dir);
+	if (existsSync(dir)) {
+		walk(dir);
+	}
 	const allPresent = [...new Set([...present, "artifact-manifest.json"])].sort();
 	const manifest = {
 		expected: expectedFiles,
@@ -43,7 +51,13 @@ export function writeManifest(dir, expectedFiles) {
 }
 
 export function collectSecretValues(envNames, env = process.env) {
-	return [...new Set(envNames.map((name) => env[name]).filter((value) => typeof value === "string" && value.length >= 8))];
+	return [
+		...new Set(
+			envNames
+				.map((name) => env[name])
+				.filter((value) => typeof value === "string" && value.length >= 8),
+		),
+	];
 }
 
 export function redactSecrets(text, secretValues = []) {
@@ -58,14 +72,21 @@ export function scanForSecrets(text, secretValues = []) {
 	const content = String(text ?? "");
 	const violations = [];
 	for (const secret of secretValues) {
-		if (secret && content.includes(secret)) violations.push("raw forwarded secret value");
+		if (secret && content.includes(secret)) {
+			violations.push("raw forwarded secret value");
+		}
 	}
 	for (const [pattern, label] of [
 		[/bearer\s+[A-Za-z0-9\-._~+/]{20,}=*/gi, "bearer token"],
 		[/Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*/gi, "authorization header"],
-		[/(?:api[_-]?key|access[_-]?token|refresh[_-]?token|cookie)\s*[:=]\s*["']?[A-Za-z0-9_./+\-=]{20,}/gi, "token-like field"],
+		[
+			/(?:api[_-]?key|access[_-]?token|refresh[_-]?token|cookie)\s*[:=]\s*["']?[A-Za-z0-9_./+\-=]{20,}/gi,
+			"token-like field",
+		],
 	]) {
-		if (pattern.test(content)) violations.push(label);
+		if (pattern.test(content)) {
+			violations.push(label);
+		}
 	}
 	return [...new Set(violations)];
 }
@@ -79,11 +100,17 @@ export function scanArtifactTextFiles(dir, secretValues = []) {
 				walk(path);
 				continue;
 			}
-			if (!entry.isFile()) continue;
-			if (!/\.(?:txt|json|jsonl|md|log|ps1|mjs|js)$/i.test(entry.name)) continue;
+			if (!entry.isFile()) {
+				continue;
+			}
+			if (!/\.(?:txt|json|jsonl|md|log|ps1|mjs|js)$/i.test(entry.name)) {
+				continue;
+			}
 			try {
 				const text = readFileSync(path, "utf8");
-				for (const violation of scanForSecrets(text, secretValues)) findings.push({ file: relative(dir, path), violation });
+				for (const violation of scanForSecrets(text, secretValues)) {
+					findings.push({ file: relative(dir, path), violation });
+				}
 			} catch {
 				// Ignore unreadable or non-text files.
 			}

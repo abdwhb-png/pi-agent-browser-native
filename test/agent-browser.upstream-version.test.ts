@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readRecord } from "./helpers/assertions.js";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
@@ -6,7 +7,6 @@ import test from "node:test";
 
 import {
 	MINIMUM_AGENT_BROWSER_VERSION,
-	RECOMMENDED_AGENT_BROWSER_VERSION_SERIES,
 	TARGET_AGENT_BROWSER_VERSION,
 	getAgentBrowserVersionValidationError,
 	parseAgentBrowserVersionOutput,
@@ -19,53 +19,93 @@ import {
 } from "./helpers/agent-browser-harness.js";
 
 test("upstream version output accepts stable versions at or above the supported floor", () => {
-	assert.equal(parseAgentBrowserVersionOutput(`agent-browser ${TARGET_AGENT_BROWSER_VERSION}\n`), TARGET_AGENT_BROWSER_VERSION);
-	for (const version of [MINIMUM_AGENT_BROWSER_VERSION, TARGET_AGENT_BROWSER_VERSION, "0.35.2", "1.0.0"]) {
+	assert.equal(
+		parseAgentBrowserVersionOutput(`agent-browser ${TARGET_AGENT_BROWSER_VERSION}\n`),
+		TARGET_AGENT_BROWSER_VERSION,
+	);
+	for (const version of [
+		MINIMUM_AGENT_BROWSER_VERSION,
+		TARGET_AGENT_BROWSER_VERSION,
+		"0.35.2",
+		"1.0.0",
+	]) {
+		// Every fixed supported stable version must pass the minimum-version contract.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(getAgentBrowserVersionValidationError(`agent-browser ${version}\n`), undefined);
 	}
-	assert.match(getAgentBrowserVersionValidationError("agent-browser 0.34.99\n") ?? "", /at least agent-browser 0\.35\.0/);
-	assert.match(getAgentBrowserVersionValidationError("agent-browser 0.35.1-beta.1\n") ?? "", /unsupported/);
-	assert.match(getAgentBrowserVersionValidationError("agent-browser 0.035.1\n") ?? "", /unsupported/);
+	assert.match(
+		getAgentBrowserVersionValidationError("agent-browser 0.34.99\n") ?? "",
+		/at least agent-browser 0\.35\.0/,
+	);
+	assert.match(
+		getAgentBrowserVersionValidationError("agent-browser 0.35.1-beta.1\n") ?? "",
+		/unsupported/,
+	);
+	assert.match(
+		getAgentBrowserVersionValidationError("agent-browser 0.035.1\n") ?? "",
+		/unsupported/,
+	);
 	assert.match(getAgentBrowserVersionValidationError("v0.35.1\n") ?? "", /unrecognized value/);
 });
 
-test("browser-backed calls fail before launch on upstream version mismatch while inspection stays available", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "piab-upstream-version-"));
-	const logPath = join(tempDir, "invocations.log");
-	try {
-		await writeFakeAgentBrowserBinary(tempDir, `
+test(
+	"browser-backed calls fail before launch on upstream version mismatch while inspection stays available",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "piab-upstream-version-"));
+		const logPath = join(tempDir, "invocations.log");
+		try {
+			await writeFakeAgentBrowserBinary(
+				tempDir,
+				`
 if (__piabFakeArgs.includes("--version")) {
   process.stdout.write("agent-browser 0.33.20\\n");
   process.exit(0);
 }
 require("node:fs").appendFileSync(${JSON.stringify(logPath)}, JSON.stringify(__piabFakeArgs) + "\\n");
 process.stdout.write(JSON.stringify({ success: true, data: { url: "https://example.com" } }));
-`);
-		await withPatchedEnv({
-			PATH: `${tempDir}${delimiter}${process.env.PATH ?? ""}`,
-			PI_AGENT_BROWSER_TEST_CUSTOM_VERSION: "1",
-		}, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			const blocked = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["open", "https://example.com"] });
-			assert.equal(blocked.isError, true);
-			assert.equal(blocked.details?.failureCategory, "validation-error");
-			assert.equal(blocked.details?.observedVersion, "0.33.20");
-			assert.equal(blocked.details?.minimumSupportedVersion, MINIMUM_AGENT_BROWSER_VERSION);
-			assert.equal(blocked.details?.expectedVersion, TARGET_AGENT_BROWSER_VERSION);
-			assert.equal(blocked.details?.capabilityBaselineVersion, TARGET_AGENT_BROWSER_VERSION);
-			assert.equal(blocked.details?.recommendedVersionSeries, RECOMMENDED_AGENT_BROWSER_VERSION_SERIES);
-			assert.ok((blocked.content[0]?.text ?? "").includes(`Install agent-browser ${TARGET_AGENT_BROWSER_VERSION}`));
-			await assert.rejects(readFile(logPath, "utf8"));
+`,
+			);
+			await withPatchedEnv(
+				{
+					PATH: `${tempDir}${delimiter}${process.env.PATH ?? ""}`,
+					PI_AGENT_BROWSER_TEST_CUSTOM_VERSION: "1",
+				},
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					const blocked = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["open", "https://example.com"],
+					});
+					assert.equal(blocked.isError, true);
+					assert.equal(readRecord(blocked.details).failureCategory, "validation-error");
+					assert.equal(readRecord(blocked.details).observedVersion, "0.33.20");
+					assert.equal(
+						readRecord(blocked.details).minimumSupportedVersion,
+						MINIMUM_AGENT_BROWSER_VERSION,
+					);
+					assert.equal(readRecord(blocked.details).expectedVersion, TARGET_AGENT_BROWSER_VERSION);
+					assert.ok(
+						(blocked.content.at(0)?.text ?? "").includes(
+							`Install agent-browser ${TARGET_AGENT_BROWSER_VERSION}`,
+						),
+					);
+					await assert.rejects(readFile(logPath, "utf8"));
 
-			const inspection = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["--version"] });
-			assert.equal(inspection.isError, false);
-			assert.match(inspection.content[0]?.text ?? "", /0\.33\.20/);
+					const inspection = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["--version"],
+					});
+					assert.equal(inspection.isError, false);
+					assert.match(inspection.content.at(0)?.text ?? "", /0\.33\.20/);
 
-			const doctor = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["doctor"] });
-			assert.equal(doctor.isError, false, JSON.stringify(doctor));
-			assert.match(await readFile(logPath, "utf8"), /doctor/);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					const doctor = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["doctor"],
+					});
+					assert.equal(doctor.isError, false, JSON.stringify(doctor));
+					assert.match(await readFile(logPath, "utf8"), /doctor/);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

@@ -4,13 +4,18 @@
  * Scope: Test-only helpers for agent-browser extension validation.
  */
 
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
+import { constants } from "node:fs";
+import { chmod, copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { Theme } from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Check } from "typebox/value";
+import { hasErrorCode } from "./assertions.js";
 
 import type { ElectronAppDiscovery } from "../../extensions/agent-browser/lib/electron/discovery.js";
-import type { AgentBrowserToolParams, AgentBrowserToolRenderContext } from "./agent-browser-harness.js";
+import type { AgentBrowserToolRenderContext } from "./agent-browser-harness.js";
 
 type RenderThemeColor = Parameters<Theme["fg"]>[0];
 type RenderThemeBg = Parameters<Theme["bg"]>[0];
@@ -36,6 +41,9 @@ const PLAIN_RENDER_FG_COLORS = {
 	mdQuote: "#ffffff",
 	mdQuoteBorder: "#ffffff",
 	muted: "#ffffff",
+	scrollbarTrack: "#ffffff",
+	scrollbarThumb: "#ffffff",
+	searchMatchText: "#ffffff",
 	success: "#ffffff",
 	syntaxComment: "#ffffff",
 	syntaxFunction: "#ffffff",
@@ -66,7 +74,7 @@ const PLAIN_RENDER_FG_COLORS = {
 
 const PLAIN_RENDER_BG_COLORS = {
 	customMessageBg: "#000000",
-	scrollbarThumb: "#000000",
+	searchMatchBg: "#000000",
 	selectedBg: "#000000",
 	toolErrorBg: "#000000",
 	toolPendingBg: "#000000",
@@ -76,7 +84,9 @@ const PLAIN_RENDER_BG_COLORS = {
 
 class PlainRenderTheme extends Theme {
 	constructor() {
-		super(PLAIN_RENDER_FG_COLORS, PLAIN_RENDER_BG_COLORS, "truecolor", { name: "plain-render-test" });
+		super(PLAIN_RENDER_FG_COLORS, PLAIN_RENDER_BG_COLORS, "truecolor", {
+			name: "plain-render-test",
+		});
 	}
 
 	override fg(color: RenderThemeColor, text: string): string {
@@ -111,10 +121,10 @@ class PlainRenderTheme extends Theme {
 export const PLAIN_RENDER_THEME = new PlainRenderTheme();
 
 export function createRenderContext(options: {
-	args: AgentBrowserToolParams;
-	expanded?: boolean;
-	isError?: boolean;
-	lastComponent?: AgentBrowserToolRenderContext["lastComponent"];
+	readonly args: unknown;
+	readonly expanded?: boolean;
+	readonly isError?: boolean;
+	readonly lastComponent?: AgentBrowserToolRenderContext["lastComponent"];
 }): AgentBrowserToolRenderContext {
 	return {
 		args: options.args,
@@ -122,7 +132,9 @@ export function createRenderContext(options: {
 		cwd: process.cwd(),
 		executionStarted: true,
 		expanded: options.expanded ?? false,
-		invalidate: () => undefined,
+		invalidate: () => {
+			/* Rendering fixtures do not schedule redraws. */
+		},
 		isError: options.isError ?? false,
 		isPartial: false,
 		lastComponent: options.lastComponent,
@@ -133,21 +145,25 @@ export function createRenderContext(options: {
 }
 
 export async function writeFakeMacElectronApp(options: {
-	applicationsDir: string;
-	bundleId: string;
-	executableName?: string;
-	name: string;
+	readonly applicationsDir: string;
+	readonly bundleId: string;
+	readonly executableName?: string;
+	readonly name: string;
 }): Promise<{ appPath: string; executablePath: string }> {
 	const executableName = options.executableName ?? options.name;
 	const appPath = join(options.applicationsDir, `${options.name}.app`);
 	const executablePath = join(appPath, "Contents", "MacOS", executableName);
-	await mkdir(join(appPath, "Contents", "Frameworks", "Electron Framework.framework"), { recursive: true });
+	await mkdir(join(appPath, "Contents", "Frameworks", "Electron Framework.framework"), {
+		recursive: true,
+	});
 	await mkdir(join(appPath, "Contents", "Resources"), { recursive: true });
 	await mkdir(join(appPath, "Contents", "MacOS"), { recursive: true });
 	await writeFile(join(appPath, "Contents", "Resources", "app.asar"), "asar", "utf8");
 	await writeFile(executablePath, "#!/bin/sh\n", "utf8");
 	await chmod(executablePath, 0o755);
-	await writeFile(join(appPath, "Contents", "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+	await writeFile(
+		join(appPath, "Contents", "Info.plist"),
+		`<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key><string>${options.name}</string>
@@ -156,7 +172,9 @@ export async function writeFakeMacElectronApp(options: {
 	<key>CFBundleExecutable</key><string>${executableName}</string>
 </dict>
 </plist>
-`, "utf8");
+`,
+		"utf8",
+	);
 	return { appPath, executablePath };
 }
 
@@ -171,12 +189,26 @@ export async function writeFakeLinuxElectronBinary(root: string, appName: string
 	return executablePath;
 }
 
-export function electronAppNames(apps: ElectronAppDiscovery[]): string[] {
-	return apps.map((app) => app.name).sort();
+export function electronAppNames(
+	apps: readonly Readonly<Pick<ElectronAppDiscovery, "name">>[],
+): string[] {
+	return apps
+		.map((app) => app.name)
+		.sort((a, b) => {
+			if (a < b) {
+				return -1;
+			}
+			if (a > b) {
+				return 1;
+			}
+			return 0;
+		});
 }
 
 export function isTestPidAlive(pid: number | undefined): boolean {
-	if (!pid) return false;
+	if (pid === undefined || pid === 0) {
+		return false;
+	}
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -186,26 +218,39 @@ export function isTestPidAlive(pid: number | undefined): boolean {
 }
 
 export function sleepMs(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
+	return new Promise((resolve) => {
+		setTimeout(resolve, ms);
+	});
 }
 
-export async function waitForTestPidExit(pid: number | undefined, timeoutMs = 2_000): Promise<boolean> {
+export async function waitForTestPidExit(
+	pid: number | undefined,
+	timeoutMs = 2_000,
+): Promise<boolean> {
 	const deadlineMs = Date.now() + timeoutMs;
 	while (Date.now() <= deadlineMs) {
-		if (!isTestPidAlive(pid)) return true;
+		if (!isTestPidAlive(pid)) {
+			return true;
+		}
+		// Poll only after the previous liveness check and delay have completed.
+		// oxlint-disable-next-line no-await-in-loop
 		await sleepMs(50);
 	}
 	return !isTestPidAlive(pid);
 }
 
 export async function stopTestPid(pid: number | undefined): Promise<void> {
-	if (!pid || !isTestPidAlive(pid)) return;
+	if (pid === undefined || pid === 0 || !isTestPidAlive(pid)) {
+		return;
+	}
 	try {
 		process.kill(pid, "SIGTERM");
 	} catch {
 		return;
 	}
-	if (await waitForTestPidExit(pid, 1_000)) return;
+	if (await waitForTestPidExit(pid, 1_000)) {
+		return;
+	}
 	try {
 		process.kill(pid, "SIGKILL");
 	} catch {
@@ -214,36 +259,77 @@ export async function stopTestPid(pid: number | undefined): Promise<void> {
 	await waitForTestPidExit(pid, 1_000);
 }
 
-interface FakeElectronLaunchLogEntry {
-	args: string[];
-	mode: "invalid-cdp" | "no-port-file" | "normal";
-	pid: number;
-	port?: number;
-	userDataDir: string;
+const FAKE_ELECTRON_LAUNCH_LOG_ENTRY = Type.Object({
+	args: Type.Array(Type.String()),
+	mode: Type.Union([
+		Type.Literal("invalid-cdp"),
+		Type.Literal("no-port-file"),
+		Type.Literal("normal"),
+	]),
+	pid: Type.Number(),
+	port: Type.Optional(Type.Number()),
+	userDataDir: Type.String(),
+});
+type FakeElectronLaunchLogEntry = Static<typeof FAKE_ELECTRON_LAUNCH_LOG_ENTRY>;
+function parseLaunchLogEntry(value: unknown): FakeElectronLaunchLogEntry {
+	assert.ok(Check(FAKE_ELECTRON_LAUNCH_LOG_ENTRY, value), "invalid fake Electron launch log entry");
+	return value;
 }
 
-export async function readOptionalFakeElectronLaunchLog(path: string): Promise<FakeElectronLaunchLogEntry[]> {
+export async function readOptionalFakeElectronLaunchLog(
+	path: string,
+): Promise<FakeElectronLaunchLogEntry[]> {
 	try {
 		const text = (await readFile(path, "utf8")).trim();
-		return text.length > 0 ? text.split("\n").map((line) => JSON.parse(line) as FakeElectronLaunchLogEntry) : [];
+		return text.length > 0
+			? text.split("\n").map((line) => parseLaunchLogEntry(JSON.parse(line)))
+			: [];
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		if (hasErrorCode(error, "ENOENT")) {
+			return [];
+		}
 		throw error;
 	}
 }
 
+// A native executable plus an ordinary script operand exercises the real spawn,
+// argv, PID, stdio and cleanup boundaries on Windows too. The Electron evidence
+// is synthetic just as in the discovery fixtures; production validation is unchanged.
+export async function writeFakeElectronProcessApp(options: {
+	readonly applicationsDir: string;
+	readonly bundleId: string;
+	readonly name: string;
+}): Promise<{ appPath: string; executablePath: string; scriptPath: string; appArgs: string[] }> {
+	let app: { appPath: string; executablePath: string };
+	if (process.platform === "win32") {
+		const directory = join(options.applicationsDir, options.name);
+		await mkdir(join(directory, "resources"), { recursive: true });
+		await writeFile(join(directory, "resources", "app.asar"), "asar");
+		await writeFile(join(directory, "resources.pak"), "pak");
+		const executablePath = join(directory, `${options.name}.exe`);
+		app = { appPath: executablePath, executablePath };
+	} else {
+		app = await writeFakeMacElectronApp(options);
+	}
+	await copyFile(process.execPath, app.executablePath, constants.COPYFILE_FICLONE);
+	const scriptPath = `${app.executablePath}.cjs`;
+	return { ...app, scriptPath, appArgs: [scriptPath] };
+}
+
 export async function writeFakeLaunchableElectronApp(options: {
-	applicationsDir: string;
-	bundleId: string;
-	includeWebview?: boolean;
-	launchLogPath: string;
-	mode?: "invalid-cdp" | "no-port-file" | "normal";
-	name: string;
-	writeLaunchLog?: boolean;
-}): Promise<{ appPath: string; executablePath: string }> {
-	const app = await writeFakeMacElectronApp(options);
+	readonly applicationsDir: string;
+	readonly bundleId: string;
+	readonly includeWebview?: boolean;
+	readonly launchLogPath: string;
+	readonly mode?: "invalid-cdp" | "no-port-file" | "normal";
+	readonly name: string;
+	readonly writeLaunchLog?: boolean;
+}): Promise<Awaited<ReturnType<typeof writeFakeElectronProcessApp>>> {
+	const app = await writeFakeElectronProcessApp(options);
 	const mode = options.mode ?? "normal";
-	await writeFile(app.executablePath, `#!/usr/bin/env node
+	await writeFile(
+		app.scriptPath,
+		`#!/usr/bin/env node
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
@@ -264,13 +350,19 @@ const server = http.createServer((request, response) => {
 			return;
 		}
 	response.writeHead(200, { "content-type": "application/json" });
-	response.end(JSON.stringify({ Browser: "Electron/Fake", "Protocol-Version": "1.3", "User-Agent": "FakeElectron", webSocketDebuggerUrl: ` + "`ws://127.0.0.1:${port}/devtools/browser/fake`" + ` }));
+	response.end(JSON.stringify({ Browser: "Electron/Fake", "Protocol-Version": "1.3", "User-Agent": "FakeElectron", webSocketDebuggerUrl: ` +
+			"`ws://127.0.0.1:${port}/devtools/browser/fake`" +
+			` }));
 	return;
 	}
 	if (request.url === "/json/list") {
 	response.writeHead(200, { "content-type": "application/json" });
-	const targets = [{ id: "page-1", type: "page", title: "Demo Electron", url: "app://demo", webSocketDebuggerUrl: ` + "`ws://127.0.0.1:${port}/devtools/page/page-1`" + ` }];
-	if (includeWebview) targets.push({ id: "webview-1", type: "webview", title: "Demo Webview", url: "app://webview", webSocketDebuggerUrl: ` + "`ws://127.0.0.1:${port}/devtools/page/webview-1`" + ` });
+	const targets = [{ id: "page-1", type: "page", title: "Demo Electron", url: "app://demo", webSocketDebuggerUrl: ` +
+			"`ws://127.0.0.1:${port}/devtools/page/page-1`" +
+			` }];
+	if (includeWebview) targets.push({ id: "webview-1", type: "webview", title: "Demo Webview", url: "app://webview", webSocketDebuggerUrl: ` +
+			"`ws://127.0.0.1:${port}/devtools/page/webview-1`" +
+			` });
 	response.end(JSON.stringify(targets));
 	return;
 	}
@@ -285,19 +377,24 @@ server.listen(0, "127.0.0.1", () => {
 const shutdown = () => server.close(() => process.exit(0));
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
-`, "utf8");
+`,
+		"utf8",
+	);
 	await chmod(app.executablePath, 0o755);
 	return app;
 }
 
-export function fakeAgentBrowserLifecycleScript(logPath: string, options: {
-	sessionTitle?: string;
-	sessionUrl?: string;
-	snapshotTitle?: string;
-	snapshotUrl?: string;
-	tabTitle?: string;
-	tabUrl?: string;
-} = {}): string {
+export function fakeAgentBrowserLifecycleScript(
+	logPath: string,
+	options: {
+		readonly sessionTitle?: string;
+		readonly sessionUrl?: string;
+		readonly snapshotTitle?: string;
+		readonly snapshotUrl?: string;
+		readonly tabTitle?: string;
+		readonly tabUrl?: string;
+	} = {},
+): string {
 	const sessionTitle = options.sessionTitle ?? "Demo Electron";
 	const sessionUrl = options.sessionUrl ?? "app://demo";
 	const snapshotTitle = options.snapshotTitle ?? "Demo Electron";
@@ -326,7 +423,7 @@ else if (command === "get" && subcommand === "title") data = { result: ${JSON.st
 else if (command === "get" && subcommand === "url") data = { result: ${JSON.stringify(sessionUrl)}, url: ${JSON.stringify(sessionUrl)} };
 else if (command === "eval") data = { result: { focusedElement: { id: "run-button", name: "Run", role: "button", tagName: "button" } } };
 else if (command === "tab" && subcommand === "list") data = { tabs: [{ active: true, index: 0, tabId: "page-1", title: ${JSON.stringify(tabTitle)}, type: "page", url: ${JSON.stringify(tabUrl)} }] };
-else if (command === "snapshot") data = { origin: ${JSON.stringify(snapshotUrl)}, title: ${JSON.stringify(snapshotTitle)}, url: ${JSON.stringify(snapshotUrl)}, refs: { e1: { role: "button", name: "Run" } }, snapshot: "- button \\\"Run\\\" [ref=e1]" };
+else if (command === "snapshot") data = { origin: ${JSON.stringify(snapshotUrl)}, title: ${JSON.stringify(snapshotTitle)}, url: ${JSON.stringify(snapshotUrl)}, refs: { e1: { role: "button", name: "Run" } }, snapshot: "- button \\"Run\\" [ref=e1]" };
 else if (command === "record") data = { path: args[commandIndex + 2] };
 else if (command === "pdf") data = { path: args[commandIndex + 1] };
 else if (command === "close") data = { closed: true };

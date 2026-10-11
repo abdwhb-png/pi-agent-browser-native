@@ -1,8 +1,8 @@
 export const TARGET_AGENT_BROWSER_SOURCE = "scripts/agent-browser-target.mjs";
-export const TARGET_AGENT_BROWSER_VERSION = "0.37.0";
+export const TARGET_AGENT_BROWSER_VERSION = "0.38.1";
 export const TARGET_AGENT_BROWSER_VERSION_LABEL = `agent-browser ${TARGET_AGENT_BROWSER_VERSION}`;
 export const CAPABILITY_BASELINE_AGENT_BROWSER_VERSION = TARGET_AGENT_BROWSER_VERSION;
-export const RECOMMENDED_AGENT_BROWSER_VERSION_SERIES = "0.37.x";
+export const RECOMMENDED_AGENT_BROWSER_VERSION_SERIES = `${TARGET_AGENT_BROWSER_VERSION.split(".").slice(0, 2).join(".")}.x`;
 export const MINIMUM_AGENT_BROWSER_VERSION = "0.35.0";
 export const MINIMUM_AGENT_BROWSER_VERSION_LABEL = `agent-browser ${MINIMUM_AGENT_BROWSER_VERSION}`;
 export const SUPPORTED_AGENT_BROWSER_VERSION_LABEL = `${MINIMUM_AGENT_BROWSER_VERSION_LABEL} or newer`;
@@ -15,14 +15,24 @@ function stableVersionParts(version) {
 export function isSupportedAgentBrowserVersion(version) {
 	const actual = stableVersionParts(version);
 	const minimum = stableVersionParts(MINIMUM_AGENT_BROWSER_VERSION);
-	if (!actual || !minimum) return false;
+	if (!actual || !minimum) {
+		return false;
+	}
 	for (let index = 0; index < minimum.length; index += 1) {
-		if (actual[index] !== minimum[index]) return actual[index] > minimum[index];
+		if (actual[index] !== minimum[index]) {
+			return actual[index] > minimum[index];
+		}
 	}
 	return true;
 }
 
 export function isRecommendedAgentBrowserVersion(version) {
 	const actual = stableVersionParts(version);
-	return actual?.[0] === 0 && actual[1] === 37;
+	const target = stableVersionParts(TARGET_AGENT_BROWSER_VERSION);
+	return (
+		actual !== undefined &&
+		target !== undefined &&
+		actual[0] === target[0] &&
+		actual[1] === target[1]
+	);
 }

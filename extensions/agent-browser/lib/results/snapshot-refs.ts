@@ -3,40 +3,59 @@ import { getEditableRefEvidence } from "./editable-ref-evidence.js";
 import { compareRefIds, normalizeWhitespace } from "./text.js";
 
 export interface SnapshotRefEntry {
-	id: string;
-	isEditable?: boolean;
-	lineIndex?: number;
-	name: string;
-	refData?: Record<string, unknown>;
-	role: string;
+	readonly id: string;
+	readonly isEditable?: boolean;
+	readonly lineIndex?: number;
+	readonly name: string;
+	readonly refData?: Readonly<Record<string, unknown>>;
+	readonly role: string;
 }
 
 export interface SnapshotLineRefInfo {
-	index: number;
-	name: string;
-	raw: string;
-	ref?: string;
-	role: string;
+	readonly index: number;
+	readonly name: string;
+	readonly raw: string;
+	readonly ref?: string;
+	readonly role: string;
+}
+
+/** Project native delta full responses onto the ordinary snapshot shape for local readers. */
+export function getFullSnapshotData(data: unknown): Record<string, unknown> | undefined {
+	if (!isRecord(data)) {
+		return undefined;
+	}
+	if (!isRecord(data.snapshot)) {
+		return data;
+	}
+	return data.snapshot.kind === "full"
+		? { ...data, snapshot: data.snapshot.tree, refs: data.snapshot.refs }
+		: undefined;
 }
 
 export function getSnapshotRefRecord(data: unknown): Record<string, unknown> | undefined {
-	return isRecord(data) && isRecord(data.refs) ? data.refs : undefined;
+	const full = getFullSnapshotData(data);
+	return full && isRecord(full.refs) ? full.refs : undefined;
 }
 
 export function getSnapshotLineTextByRef(data: unknown): Map<string, string> {
-	const snapshot = isRecord(data) && typeof data.snapshot === "string" ? data.snapshot : "";
+	const full = getFullSnapshotData(data);
+	const snapshot = typeof full?.snapshot === "string" ? full.snapshot : "";
 	const lineByRef = new Map<string, string>();
 	for (const line of snapshot.split("\n")) {
 		const ref = line.match(/\bref=([^,\]\s]+)/)?.[1];
-		if (!ref || lineByRef.has(ref)) continue;
+		if (ref === undefined || ref.length === 0 || lineByRef.has(ref)) {
+			continue;
+		}
 		lineByRef.set(ref, line);
 	}
 	return lineByRef;
 }
 
-export function getSnapshotRefEntries(data: Record<string, unknown>): SnapshotRefEntry[] {
+export function getSnapshotRefEntries(data: Readonly<Record<string, unknown>>): SnapshotRefEntry[] {
 	const refs = getSnapshotRefRecord(data);
-	if (!refs) return [];
+	if (!refs) {
+		return [];
+	}
 
 	return Object.entries(refs)
 		.map(([id, value]) => {
@@ -53,11 +72,18 @@ export function getSnapshotRefEntries(data: Record<string, unknown>): SnapshotRe
 
 function isEditableSnapshotLine(line: SnapshotLineRefInfo): boolean | undefined {
 	const editableEvidence = getEditableRefEvidence({ text: line.raw });
-	if (editableEvidence !== undefined) return editableEvidence;
-	return line.role === "searchbox" || line.role === "textbox" || line.role === "combobox" ? true : undefined;
+	if (editableEvidence !== undefined) {
+		return editableEvidence;
+	}
+	return line.role === "searchbox" || line.role === "textbox" || line.role === "combobox"
+		? true
+		: undefined;
 }
 
-export function getSnapshotRefRole(entry: { role?: unknown }, editableEvidence: boolean | undefined): string {
+export function getSnapshotRefRole(
+	entry: { readonly role?: unknown },
+	editableEvidence: boolean | undefined,
+): string {
 	const rawRole = typeof entry.role === "string" && entry.role.length > 0 ? entry.role : "unknown";
 	const normalizedRole = rawRole.toLowerCase();
 	if ((normalizedRole === "generic" || normalizedRole === "unknown") && editableEvidence === true) {
@@ -66,20 +92,44 @@ export function getSnapshotRefRole(entry: { role?: unknown }, editableEvidence: 
 	return rawRole;
 }
 
-export function enrichSnapshotRefEntries(refEntries: SnapshotRefEntry[], snapshotLines: SnapshotLineRefInfo[]): SnapshotRefEntry[] {
+function getSnapshotRefFallbackRole(role: string, line: SnapshotLineRefInfo | undefined): string {
+	if (role !== "unknown" && role !== "generic") {
+		return role;
+	}
+	return line && line.role !== "unknown" ? line.role : role;
+}
+
+function resolveSnapshotRefEditableEvidence(
+	evidence: boolean | undefined,
+	line: SnapshotLineRefInfo | undefined,
+): boolean {
+	if (evidence !== undefined) {
+		return evidence;
+	}
+	return (
+		line !== undefined &&
+		isEditableSnapshotLine(line) === true &&
+		!["unknown", "generic"].includes(line.role)
+	);
+}
+
+export function enrichSnapshotRefEntries(
+	refEntries: readonly SnapshotRefEntry[],
+	snapshotLines: readonly SnapshotLineRefInfo[],
+): SnapshotRefEntry[] {
 	const lineByRef = new Map<string, SnapshotLineRefInfo>();
 	for (const line of snapshotLines) {
-		if (!line.ref || lineByRef.has(line.ref)) continue;
+		if (line.ref === undefined || line.ref.length === 0 || lineByRef.has(line.ref)) {
+			continue;
+		}
 		lineByRef.set(line.ref, line);
 	}
 
 	return refEntries.map((entry) => {
 		const line = lineByRef.get(entry.id);
-		const lineRole = line && line.role !== "unknown" ? line.role : undefined;
 		const editableEvidence = getEditableRefEvidence({ ref: entry.refData, text: line?.raw });
-		const hasEditableRole = line ? isEditableSnapshotLine(line) === true && !["unknown", "generic"].includes(line.role) : false;
-		const isEditable = editableEvidence === true || (editableEvidence !== false && hasEditableRole);
-		const roleFromRefOrLine = entry.role !== "unknown" && entry.role !== "generic" ? entry.role : lineRole ?? entry.role;
+		const isEditable = resolveSnapshotRefEditableEvidence(editableEvidence, line);
+		const roleFromRefOrLine = getSnapshotRefFallbackRole(entry.role, line);
 		const role = getSnapshotRefRole({ role: roleFromRefOrLine }, isEditable);
 		return {
 			...entry,

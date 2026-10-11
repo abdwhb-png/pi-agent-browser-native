@@ -3,34 +3,57 @@
  * Responsibilities: Build fake pi extension contexts, run registered extension events/tools, patch process env safely, create fake agent-browser binaries, read invocation logs, and manage child-process fixtures.
  * Scope: Test-only utilities for `test/agent-browser.*.test.ts`; production code must not import this module.
  * Usage: Import focused helpers from `./helpers/agent-browser-harness.js` inside Node test-runner suites.
- * Invariants/Assumptions: Helpers preserve caller-owned cleanup responsibilities and restore patched environment variables after each run. `writeFakeAgentBrowserBinary` installs a Unix shell-script launcher or a Windows `agent-browser.cmd`; fake daemons report inactive `session info` by default, and stateful daemon tests set `PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO=1`; pass `platform: "win32"` to assert Windows launcher layout from non-Windows hosts (spawn/PATHEXT behavior still needs a real Windows runner).
+ * Invariants/Assumptions: Helpers preserve caller-owned cleanup responsibilities and restore patched environment variables after each run. `writeFakeAgentBrowserBinary` installs a Unix shell-script launcher or a Windows `agent-browser.cmd`; its default virtual daemon retains launch/close and process-generation metadata. Stateful daemon tests set `PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO=1`; pass `platform: "win32"` to assert Windows launcher layout from non-Windows hosts (spawn/PATHEXT behavior still needs a real Windows runner).
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { once } from "node:events";
+import type { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { EventEmitter, once } from "node:events";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, readFile, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execPath as nodeExecPath, platform as processPlatform } from "node:process";
 
 import type {
-	AgentToolResult,
+	ExtensionAPI,
 	Theme,
 	ToolDefinition,
 	ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import type { TSchema } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
+import { Check } from "typebox/value";
 
 import agentBrowserExtension from "../../extensions/agent-browser/index.js";
+import { convertBrowserEntries } from "../../extensions/agent-browser/lib/browser-session-conversion.js";
 import { TARGET_AGENT_BROWSER_VERSION_LABEL } from "../../scripts/agent-browser-target.mjs";
+import { hasErrorCode } from "./assertions.js";
 
 export const TEST_SESSION_ID = "12345678-1234-5678-9abc-def012345678";
 export const DOWNLOAD_FIXTURE_CONTENT = "download contract fixture report\n";
 export const DOWNLOAD_FIXTURE_FILENAME = "pi-agent-browser-wait-download-contract.txt";
+const journalFixtures = mkdtempSync(join(tmpdir(), "piab-journal-fixtures-"));
+process.once("exit", () => rmSync(journalFixtures, { recursive: true, force: true }));
+
+// macOS caps Unix socket paths at 103 characters, and realpath-canonicalized CI temp roots can push
+// mkdtemp()-based socket directories past that cap. Host browser sockets in a short private 0700
+// directory (production's own remediation guidance) instead; journal, state, and artifact roots stay
+// wherever the fixture placed them. The literal /tmp prefix must stay unresolved so the path string
+// itself stays short. Windows uses named pipes without a path cap, so it keeps the fixture root.
+export function createShortPrivateSocketDir(fallbackRoot: string): string {
+	if (process.platform !== "win32") {
+		try {
+			return mkdtempSync("/tmp/piab-s-");
+		} catch {
+			// Fall back to the fixture root when /tmp is unusable.
+		}
+	}
+	return join(fallbackRoot, "s");
+}
 
 export interface FixtureServer {
 	baseUrl: string;
@@ -48,7 +71,7 @@ function sendFixtureHtml(response: ServerResponse, html: string): void {
 export async function startAgentBrowserContractFixtureServer(): Promise<FixtureServer> {
 	const server = createServer((request: IncomingMessage, response: ServerResponse) => {
 		const url = new URL(request.url ?? "/", "http://127.0.0.1");
-		if (url.pathname === "/" || url.pathname === "/contract") {
+		if (["/", "/contract"].includes(url.pathname)) {
 			sendFixtureHtml(
 				response,
 				`<!doctype html>
@@ -97,15 +120,77 @@ export async function startAgentBrowserContractFixtureServer(): Promise<FixtureS
 			return;
 		}
 
+		if (url.pathname === "/browser-regressions") {
+			sendFixtureHtml(
+				response,
+				`<!doctype html><title>Browser regression fixture</title>
+				<style>#panel { width:400px; height:200px; overflow:auto; scroll-behavior:smooth } #rows { height:2000px }</style>
+				<a id="export" href="#" download="report.csv">Export report</a>
+				<a id="static-download" href="/download-file" download="static.txt">Static report</a>
+				<a id="redirect-download" href="/browser-download-redirect" download="redirect.txt">Redirected report</a>
+				<button id="save" title="Save changes" onclick="this.dataset.clicks=String(Number(this.dataset.clicks||0)+1); this.dataset.trusted=String(event.isTrusted)">Save</button>
+				<button id="copy" aria-labelledby="copy-label" onclick="this.dataset.clicks=String(Number(this.dataset.clicks||0)+1)">Save</button><span id="copy-label">Save a copy</span>
+				<button id="observe">Observe</button>
+				<button id="frame-button">Main frame button</button>
+				<iframe id="child-frame" src="/frame-child" title="Child frame"></iframe>
+				<div id="panel"><div id="rows">Report table</div></div>
+				<script>
+					document.querySelector('#export').addEventListener('click', event => {
+						event.preventDefault(); window.exportClicks=(window.exportClicks||0)+1;
+						const a=document.createElement('a');
+						a.href=URL.createObjectURL(new Blob(['name,total\\nAlice,42\\n'], {type:'text/csv'}));
+						a.download='report.csv'; a.click();
+					});
+					fetch('/browser-regression-api?access_token=fixture-url-secret', {headers:{Authorization:'Bearer fixture-header-secret'}})
+						.then(r=>r.json()).then(()=>document.body.dataset.ready='yes');
+				</script>`,
+			);
+			return;
+		}
+		if (url.pathname === "/browser-download-redirect") {
+			response.writeHead(302, { location: "/download-file" });
+			response.end();
+			return;
+		}
+		if (url.pathname === "/browser-regression-api") {
+			response.writeHead(200, { "content-type": "application/json" });
+			response.end('{"ok":true}');
+			return;
+		}
+
+		if (url.pathname === "/qa-error-residue") {
+			sendFixtureHtml(
+				response,
+				`<!doctype html><title>Repeated error fixture</title>
+				<h1>Repeated error fixture</h1><script>
+				window.qaErrorsThrown = 0;
+				const requested = sessionStorage.getItem("qa-error-count");
+				const count = requested === "0" ? 0 : requested === "1" ? 1 : 1100;
+				function raiseError() {
+					window.qaErrorsThrown += 1;
+					throw new Error("qa-repeat-error");
+				}
+				for (let i = 0; i < count; i++) setTimeout(raiseError, 0);
+			</script>`,
+			);
+			return;
+		}
+
 		if (url.pathname === "/duplicate-buttons") {
-			sendFixtureHtml(response, `<!doctype html><title>Duplicate buttons</title>
+			sendFixtureHtml(
+				response,
+				`<!doctype html><title>Duplicate buttons</title>
 				<button id="first" onclick="this.dataset.clicks = String(Number(this.dataset.clicks || 0) + 1); this.dataset.trusted = String(event.isTrusted); this.textContent = 'Remove';">Add to cart</button>
-				<button id="second" onclick="this.dataset.clicks = String(Number(this.dataset.clicks || 0) + 1); this.dataset.trusted = String(event.isTrusted); this.textContent = 'Remove';">Add to cart</button>`);
+				<button id="second" onclick="this.dataset.clicks = String(Number(this.dataset.clicks || 0) + 1); this.dataset.trusted = String(event.isTrusted); this.textContent = 'Remove';">Add to cart</button>`,
+			);
 			return;
 		}
 
 		if (url.pathname === "/headers") {
-			sendFixtureHtml(response, `<title>Header Fixture</title><input id="header-value" value="${request.headers["x-fixture"] === "batch-fidelity" ? "present" : "missing"}" />`);
+			sendFixtureHtml(
+				response,
+				`<title>Header Fixture</title><input id="header-value" value="${request.headers["x-fixture"] === "batch-fidelity" ? "present" : "missing"}" />`,
+			);
 			return;
 		}
 
@@ -225,8 +310,11 @@ export async function startAgentBrowserContractFixtureServer(): Promise<FixtureS
 		});
 	});
 
-	const address = server.address() as AddressInfo | null;
-	assert.ok(address, "expected fixture server to bind to a local port");
+	const address = server.address();
+	assert.ok(
+		address !== null && typeof address === "object",
+		"expected fixture server to bind to a local port",
+	);
 	return {
 		baseUrl: `http://127.0.0.1:${address.port}`,
 		close: async () => {
@@ -249,7 +337,10 @@ export function buildUserBranch(prompt = ""): unknown[] {
 		: [{ type: "message", message: { role: "user", content: [{ type: "text", text: prompt }] } }];
 }
 
-export function createToolBranchEntry(options: { details: Record<string, unknown>; isError?: boolean }): unknown {
+export function createToolBranchEntry(options: {
+	readonly details: Readonly<Record<string, unknown>>;
+	readonly isError?: boolean;
+}): unknown {
 	return {
 		type: "message",
 		message: {
@@ -261,94 +352,107 @@ export function createToolBranchEntry(options: { details: Record<string, unknown
 }
 
 export type AgentBrowserToolParams = {
-	script?: string;
-	args?: string[];
-	semanticAction?: {
-		action: "check" | "click" | "fill" | "select";
-		locator?: "alt" | "label" | "placeholder" | "role" | "testid" | "text" | "title";
-		value?: string;
-		values?: string[];
-		selector?: string;
-		text?: string;
-		role?: string;
-		name?: string;
-		session?: string;
+	readonly code?: string;
+	readonly args?: readonly string[];
+	readonly semanticAction?: {
+		readonly action: "check" | "click" | "fill" | "select";
+		readonly locator?: "alt" | "label" | "placeholder" | "role" | "testid" | "text" | "title";
+		readonly value?: string;
+		readonly values?: readonly string[];
+		readonly selector?: string;
+		readonly text?: string;
+		readonly role?: string;
+		readonly name?: string;
+		readonly session?: string;
 	};
-	job?: {
-		steps: Array<{
-			action: "open" | "click" | "fill" | "type" | "select" | "wait" | "assertText" | "assertUrl" | "waitForDownload" | "screenshot" | "snapshot";
-			url?: string;
-			loadState?: "domcontentloaded" | "load" | "networkidle";
-			selector?: string;
-			locator?: "alt" | "label" | "placeholder" | "role" | "testid" | "text" | "title";
-			role?: string;
-			name?: string;
-			text?: string;
-			value?: string;
-			values?: string[];
-			path?: string;
-			delayMs?: number;
-			press?: string;
-			milliseconds?: number;
-		}>;
+	readonly job?: {
+		readonly steps: readonly {
+			readonly action:
+				| "open"
+				| "click"
+				| "fill"
+				| "type"
+				| "select"
+				| "wait"
+				| "assertText"
+				| "assertUrl"
+				| "waitForDownload"
+				| "screenshot"
+				| "snapshot";
+			readonly url?: string;
+			readonly loadState?: "domcontentloaded" | "load" | "networkidle";
+			readonly selector?: string;
+			readonly locator?: "alt" | "label" | "placeholder" | "role" | "testid" | "text" | "title";
+			readonly role?: string;
+			readonly name?: string;
+			readonly text?: string;
+			readonly value?: string;
+			readonly values?: readonly string[];
+			readonly path?: string;
+			readonly delayMs?: number;
+			readonly press?: string;
+			readonly milliseconds?: number;
+		}[];
 	};
-	qa?: ({
-		attached: true;
-		expectedText?: string | string[];
-		expectedSelector?: string;
-		screenshotPath?: string;
-		checkConsole?: boolean;
-		checkErrors?: boolean;
-		checkNetwork?: boolean;
-	} | {
-		attached?: false;
-		url: string;
-		expectedText?: string | string[];
-		expectedSelector?: string;
-		screenshotPath?: string;
-		checkConsole?: boolean;
-		checkErrors?: boolean;
-		checkNetwork?: boolean;
-	});
-	sourceLookup?: {
-		selector?: string;
-		reactFiberId?: string;
-		componentName?: string;
-		includeDomHints?: boolean;
-		maxWorkspaceFiles?: number;
+	readonly qa?:
+		| {
+				readonly attached: true;
+				readonly expectedText?: string | readonly string[];
+				readonly expectedSelector?: string;
+				readonly screenshotPath?: string;
+				readonly checkConsole?: boolean;
+				readonly checkErrors?: boolean;
+				readonly checkNetwork?: boolean;
+		  }
+		| {
+				readonly attached?: false;
+				readonly url: string;
+				readonly expectedText?: string | readonly string[];
+				readonly expectedSelector?: string;
+				readonly screenshotPath?: string;
+				readonly checkConsole?: boolean;
+				readonly checkErrors?: boolean;
+				readonly checkNetwork?: boolean;
+		  };
+	readonly sourceLookup?: {
+		readonly selector?: string;
+		readonly reactFiberId?: string;
+		readonly componentName?: string;
+		readonly includeDomHints?: boolean;
+		readonly maxWorkspaceFiles?: number;
 	};
-	networkSourceLookup?: {
-		filter?: string;
-		requestId?: string;
-		session?: string;
-		url?: string;
-		maxWorkspaceFiles?: number;
+	readonly networkSourceLookup?: {
+		readonly filter?: string;
+		readonly requestId?: string;
+		readonly session?: string;
+		readonly url?: string;
+		readonly maxWorkspaceFiles?: number;
 	};
-	electron?: {
-		action: "list" | "launch" | "status" | "cleanup" | "probe";
-		query?: string;
-		maxResults?: number;
-		appPath?: string;
-		appName?: string;
-		bundleId?: string;
-		executablePath?: string;
-		appArgs?: string[];
-		handoff?: "connect" | "tabs" | "snapshot";
-		targetType?: "page" | "webview" | "any";
-		timeoutMs?: number;
-		allow?: string[];
-		deny?: string[];
-		launchId?: string;
-		all?: boolean;
+	readonly electron?: {
+		readonly action: "list" | "launch" | "status" | "cleanup" | "probe";
+		readonly query?: string;
+		readonly maxResults?: number;
+		readonly appPath?: string;
+		readonly appName?: string;
+		readonly bundleId?: string;
+		readonly executablePath?: string;
+		readonly appArgs?: readonly string[];
+		readonly handoff?: "connect" | "tabs" | "snapshot";
+		readonly targetType?: "page" | "webview" | "any";
+		readonly timeoutMs?: number;
+		readonly allow?: readonly string[];
+		readonly deny?: readonly string[];
+		readonly launchId?: string;
+		readonly all?: boolean;
 	};
-	outputPath?: string;
-	sessionMode?: "auto" | "fresh";
-	stdin?: string;
-	timeoutMs?: number;
+	readonly outputPath?: string;
+	readonly sessionMode?: "auto" | "fresh";
+	readonly stdin?: string;
+	readonly timeoutMs?: number;
 };
 
 export interface AgentBrowserToolRenderContext {
-	args: AgentBrowserToolParams;
+	args: unknown;
 	argsComplete: boolean;
 	cwd: string;
 	executionStarted: boolean;
@@ -362,27 +466,87 @@ export interface AgentBrowserToolRenderContext {
 	toolCallId: string;
 }
 
+const JSON_VALUE = Type.Cyclic(
+	{
+		Json: Type.Union([
+			Type.Null(),
+			Type.Boolean(),
+			Type.Number(),
+			Type.String(),
+			Type.Array(Type.Ref("Json")),
+			Type.Record(Type.String(), Type.Ref("Json")),
+		]),
+	},
+	"Json",
+);
+const TOOL_RESULT = Type.Object({
+	content: Type.Array(
+		Type.Union([
+			Type.Object({ type: Type.Literal("text"), text: Type.String() }),
+			Type.Object({
+				type: Type.Literal("image"),
+				data: Type.String(),
+				mimeType: Type.String(),
+				text: Type.Optional(Type.String()),
+			}),
+		]),
+	),
+	details: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+	isError: Type.Optional(Type.Boolean()),
+	structuredContent: Type.Optional(JSON_VALUE),
+});
+export type TestToolResult = Static<typeof TOOL_RESULT>;
+
 export type RegisteredTool = {
-	description: string;
-	parameters: TSchema;
-	execute: (
+	readonly description: string;
+	readonly parameters: TSchema;
+	readonly outputSchema?: ToolDefinition["outputSchema"];
+	readonly namespace?: ToolDefinition["namespace"];
+	readonly execute: (
 		toolCallId: string,
 		params: unknown,
 		signal: AbortSignal | undefined,
 		onUpdate: ((update: unknown) => void) | undefined,
 		ctx: unknown,
-	) => Promise<unknown>;
-	name: string;
-	promptGuidelines: string[];
-	promptSnippet: string;
-	renderCall?: (args: AgentBrowserToolParams, theme: Theme, context: AgentBrowserToolRenderContext) => Component;
-	renderResult?: (
-		result: AgentToolResult<unknown>,
-		options: ToolRenderResultOptions,
+	) => Promise<TestToolResult>;
+	readonly name: string;
+	readonly promptGuidelines: readonly string[];
+	readonly promptSnippet: string;
+	readonly renderCall?: (args: unknown, theme: Theme, context: unknown) => Component;
+	readonly renderResult?: (
+		result: unknown,
+		options: Readonly<ToolRenderResultOptions>,
 		theme: Theme,
-		context: AgentBrowserToolRenderContext,
+		context: unknown,
 	) => Component;
 };
+
+function assertComponent(value: unknown): asserts value is Component {
+	assert.ok(typeof value === "object" && value !== null, "expected a TUI component");
+	assert.ok("render" in value && typeof value.render === "function", "expected component.render");
+	assert.ok(
+		"invalidate" in value && typeof value.invalidate === "function",
+		"expected component.invalidate",
+	);
+	assert.ok(
+		!("handleInput" in value) ||
+			value.handleInput === undefined ||
+			typeof value.handleInput === "function",
+		"expected an optional component.handleInput callback",
+	);
+	assert.ok(
+		!("handleMouse" in value) ||
+			value.handleMouse === undefined ||
+			typeof value.handleMouse === "function",
+		"expected an optional component.handleMouse callback",
+	);
+	assert.ok(
+		!("wantsKeyRelease" in value) ||
+			value.wantsKeyRelease === undefined ||
+			typeof value.wantsKeyRelease === "boolean",
+		"expected an optional component.wantsKeyRelease flag",
+	);
+}
 
 function adaptRegisteredTool<TParams extends TSchema, TDetails, TState>(
 	tool: ToolDefinition<TParams, TDetails, TState>,
@@ -392,145 +556,426 @@ function adaptRegisteredTool<TParams extends TSchema, TDetails, TState>(
 
 	return {
 		description: tool.description,
-		execute: (toolCallId, params, signal, onUpdate, ctx) => {
-			type ExecuteArgs = Parameters<typeof tool.execute>;
-			return tool.execute(
+		outputSchema: tool.outputSchema,
+		namespace: tool.namespace,
+		execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+			// Tests intentionally send invalid params and partial contexts to registered callbacks.
+			// Dynamic invocation preserves that negative boundary; only the actual output is trusted.
+			const result: unknown = await Reflect.apply(tool.execute.bind(tool), tool, [
 				toolCallId,
-				params as ExecuteArgs[1],
+				params,
 				signal,
-				onUpdate as ExecuteArgs[3],
-				ctx as ExecuteArgs[4],
-			);
+				onUpdate,
+				ctx,
+			]);
+			assert.ok(Check(TOOL_RESULT, result), "registered tool returned an invalid result envelope");
+			return result;
 		},
 		name: tool.name,
 		parameters: tool.parameters,
 		promptGuidelines: tool.promptGuidelines ?? [],
 		promptSnippet: tool.promptSnippet ?? "",
-		renderCall: sourceRenderCall === undefined
-			? undefined
-			: (args, theme, context) => {
-				type RenderCallArgs = Parameters<typeof sourceRenderCall>;
-				return sourceRenderCall(args as RenderCallArgs[0], theme, context as RenderCallArgs[2]);
-			},
-		renderResult: sourceRenderResult === undefined
-			? undefined
-			: (result, options, theme, context) => {
-				type RenderResultArgs = Parameters<typeof sourceRenderResult>;
-				return sourceRenderResult(result as RenderResultArgs[0], options, theme, context as RenderResultArgs[3]);
-			},
+		renderCall:
+			sourceRenderCall === undefined
+				? undefined
+				: (args, theme, context) => {
+						const result: unknown = Reflect.apply(sourceRenderCall, undefined, [
+							args,
+							theme,
+							context,
+						]);
+						assertComponent(result);
+						return result;
+					},
+		renderResult:
+			sourceRenderResult === undefined
+				? undefined
+				: (result, options, theme, context) => {
+						const rendered: unknown = Reflect.apply(sourceRenderResult, undefined, [
+							result,
+							options,
+							theme,
+							context,
+						]);
+						assertComponent(rendered);
+						return rendered;
+					},
 	};
 }
 
-export function createExtensionHarness(options: {
-	branch?: unknown[];
-	cwd: string;
-	onAppendEntry?: (customType: string, data: unknown) => void;
-	projectTrusted?: boolean;
-	prompt?: string;
-	sessionDir?: string;
-	sessionFile?: string;
-	sessionId?: string;
-}) {
-	const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
-	const registeredTools = new Map<string, RegisteredTool>();
-	const appendedEntries: Array<{ customType: string; data: unknown }> = [];
+/** Mutable, caller-owned replay array shared with the harness's branch synchronization. */
+export type FixtureBranch = unknown[];
 
-	agentBrowserExtension({
+export interface ExtensionHarnessOptions {
+	// Live fixture-owned replay array: normalize in place so external append/fault tests stay visible.
+	readonly branch?: FixtureBranch;
+	readonly cwd: string;
+	readonly onBusEvent?: (channel: string, request: unknown) => void;
+	readonly onAppendEntry?: (customType: string, data: unknown) => void;
+	readonly projectTrusted?: boolean;
+	readonly prompt?: string;
+	readonly sessionDir?: string;
+	readonly sessionFile?: string | null;
+	readonly sessionId?: string;
+}
+type HarnessHandler = (...args: readonly unknown[]) => unknown;
+interface HarnessContext {
+	readonly cwd: string;
+	readonly isProjectTrusted: () => boolean;
+	readonly sessionManager: {
+		readonly getBranch: () => unknown[];
+		readonly getEntries: () => unknown[];
+		readonly getEntry: (id: string) => unknown;
+		readonly getHeader: () => {
+			type: string;
+			version: number;
+			id: string;
+			cwd: string;
+			timestamp: string;
+		};
+		readonly getLeafId: () => string | null;
+		readonly buildSessionProjection: () => { messages: unknown[] };
+		readonly getSessionDir: () => string | undefined;
+		readonly getSessionFile: () => string | undefined;
+		readonly getSessionId: () => string;
+	};
+}
+export interface ExtensionHarness {
+	readonly appendedEntries: Array<{ customType: string; data: unknown }>;
+	readonly ctx: HarnessContext;
+	readonly events: ExtensionAPI["events"];
+	readonly getTool: (name: string) => RegisteredTool | undefined;
+	readonly getActiveTools: () => string[];
+	readonly handlers: Map<string, HarnessHandler[]>;
+	readonly tools: Map<string, RegisteredTool>;
+	readonly setBranch: (nextBranch: FixtureBranch) => void;
+	readonly tool: RegisteredTool;
+}
+function entryId(value: unknown): string | undefined {
+	return typeof value === "object" &&
+		value !== null &&
+		"id" in value &&
+		typeof value.id === "string"
+		? value.id
+		: undefined;
+}
+function unsupportedHarnessOperation(): never {
+	throw new Error("This SDK operation is outside the focused extension harness");
+}
+
+export function createExtensionHarness(options: ExtensionHarnessOptions): ExtensionHarness {
+	const handlers = new Map<string, Array<(...args: readonly unknown[]) => unknown>>();
+	const registeredTools = new Map<string, RegisteredTool>();
+	let activeTools: string[] = ["read", "bash"];
+	const appendedEntries: Array<{ customType: string; data: unknown }> = [];
+	const events = new EventEmitter();
+	const sessionId = options.sessionId ?? TEST_SESSION_ID;
+	const sessionFile =
+		options.sessionFile === null
+			? undefined
+			: (options.sessionFile ?? join(journalFixtures, `${randomUUID()}.jsonl`));
+	const header = {
+		type: "session",
+		version: 3,
+		id: sessionId,
+		cwd: options.cwd,
+		timestamp: new Date().toISOString(),
+	};
+	const normalizeBranch = (entries = options.branch ?? buildUserBranch(options.prompt)) => {
+		let parentId: string | null = null;
+		const normalized = convertBrowserEntries(
+			entries.map((value) => {
+				if (typeof value !== "object" || value === null) {
+					return value;
+				}
+				const entry = {
+					...value,
+					id: "id" in value && typeof value.id === "string" ? value.id : randomUUID(),
+					parentId: "parentId" in value ? value.parentId : parentId,
+					timestamp: "timestamp" in value ? value.timestamp : new Date().toISOString(),
+				};
+				parentId = entry.id;
+				return entry;
+			}),
+			sessionId,
+		);
+		entries.splice(0, entries.length);
+		for (const entry of normalized) {
+			entries.push(entry);
+		}
+		return entries;
+	};
+	let branch = normalizeBranch();
+	const entries = [...branch];
+	if (sessionFile !== undefined && sessionFile.length > 0) {
+		mkdirSync(dirname(sessionFile), { recursive: true });
+		writeFileSync(
+			sessionFile,
+			[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+			{ mode: 0o600 },
+		);
+	}
+	const syncFixtureEntries = () => {
+		const ids = new Set(entries.map(entryId));
+		if (!branch.some((entry) => !ids.has(entryId(entry)))) {
+			return;
+		}
+		normalizeBranch(branch);
+		for (const entry of branch) {
+			if (!ids.has(entryId(entry))) {
+				ids.add(entryId(entry));
+				entries.push(entry);
+				if (sessionFile !== undefined && sessionFile.length > 0) {
+					appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+				}
+			}
+		}
+	};
+
+	const pi: ExtensionAPI &
+		Readonly<
+			Record<"refreshTools" | "registerProviderAuthFallback", typeof unsupportedHarnessOperation>
+		> = {
+		refreshTools: unsupportedHarnessOperation,
+		registerProviderAuthFallback: unsupportedHarnessOperation,
+		registerCommand: unsupportedHarnessOperation,
+		registerShortcut: unsupportedHarnessOperation,
+		registerFlag: unsupportedHarnessOperation,
+		getFlag: unsupportedHarnessOperation,
+		registerMessageRenderer: unsupportedHarnessOperation,
+		registerMarkdownTransformer: unsupportedHarnessOperation,
+		registerEntryRenderer: unsupportedHarnessOperation,
+		registerToolRenderer: unsupportedHarnessOperation,
+		sendMessage: unsupportedHarnessOperation,
+		sendUserMessage: unsupportedHarnessOperation,
+		setSessionName: unsupportedHarnessOperation,
+		getSessionName: unsupportedHarnessOperation,
+		setLabel: unsupportedHarnessOperation,
+		exec: unsupportedHarnessOperation,
+		getSettings: unsupportedHarnessOperation,
+		setModel: unsupportedHarnessOperation,
+		getThinkingLevel: unsupportedHarnessOperation,
+		setThinkingLevel: unsupportedHarnessOperation,
+		registerProvider: unsupportedHarnessOperation,
+		unregisterProvider: unsupportedHarnessOperation,
+		registerMcpServer: unsupportedHarnessOperation,
+		unregisterMcpServer: unsupportedHarnessOperation,
+		getMcpServers: unsupportedHarnessOperation,
+		registerVirtualModel: unsupportedHarnessOperation,
+		unregisterVirtualModel: unsupportedHarnessOperation,
+		events: {
+			emit(channel, request) {
+				options.onBusEvent?.(channel, request);
+				events.emit(channel, request);
+			},
+			on(channel, handler) {
+				events.on(channel, handler);
+				return () => {
+					events.off(channel, handler);
+				};
+			},
+		},
+		getCommands: () => [],
+		getActiveTools() {
+			return [...activeTools];
+		},
+		getAllTools() {
+			return [...registeredTools.values()].map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				promptGuidelines: [...tool.promptGuidelines],
+				namespace: tool.namespace,
+				outputSchema: tool.outputSchema,
+				id: tool.name,
+				exposure: "direct",
+				sourceInfo: {
+					path: "test",
+					source: "test",
+					scope: "temporary",
+					origin: "top-level",
+				},
+			}));
+		},
+		setActiveTools(names) {
+			activeTools = [...names];
+		},
 		appendEntry(customType, data) {
+			syncFixtureEntries();
 			appendedEntries.push({ customType, data });
-			branch.push({ type: "custom", customType, data });
+			const entry = {
+				type: "custom",
+				customType,
+				data,
+				id: randomUUID(),
+				parentId: entryId(branch.at(-1)) ?? null,
+				timestamp: new Date().toISOString(),
+			};
+			branch.push(entry);
+			entries.push(entry);
 			options.onAppendEntry?.(customType, data);
+			if (sessionFile !== undefined && sessionFile.length > 0) {
+				appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+			}
 		},
 		on(event, handler) {
 			const existingHandlers = handlers.get(event) ?? [];
-			existingHandlers.push(handler as (...args: unknown[]) => unknown);
+			const registeredHandler = (...args: readonly unknown[]): unknown =>
+				Reflect.apply(handler, undefined, args);
+			existingHandlers.push(registeredHandler);
 			handlers.set(event, existingHandlers);
+			return () => {
+				handlers.set(
+					event,
+					existingHandlers.filter((candidate) => candidate !== registeredHandler),
+				);
+			};
 		},
 		registerTool(tool) {
 			const registeredTool = adaptRegisteredTool(tool);
 			registeredTools.set(registeredTool.name, registeredTool);
+			activeTools.push(registeredTool.name);
 		},
-	} as Parameters<typeof agentBrowserExtension>[0]);
+	};
+	agentBrowserExtension(pi);
 
 	const registeredTool = registeredTools.get("agent_browser");
 	assert.ok(registeredTool, "expected the extension to register the agent_browser tool");
 
-	let branch = options.branch ?? buildUserBranch(options.prompt);
-	const sessionDir = options.sessionDir ?? (options.sessionFile ? dirname(options.sessionFile) : undefined);
+	const sessionDir =
+		options.sessionDir ??
+		(typeof options.sessionFile === "string" && options.sessionFile.length > 0
+			? dirname(options.sessionFile)
+			: undefined);
 	const ctx = {
 		cwd: options.cwd,
 		isProjectTrusted: () => options.projectTrusted ?? true,
 		sessionManager: {
-			getBranch: () => branch,
+			getBranch: () => {
+				syncFixtureEntries();
+				return branch;
+			},
+			getEntries: () => {
+				syncFixtureEntries();
+				return entries;
+			},
+			getEntry: (id: string) => {
+				syncFixtureEntries();
+				return entries.find(
+					(entry) =>
+						typeof entry === "object" && entry !== null && "id" in entry && entry.id === id,
+				);
+			},
+			getHeader: () => header,
+			getLeafId: () => {
+				syncFixtureEntries();
+				return entryId(branch.at(-1)) ?? null;
+			},
+			buildSessionProjection: () => ({
+				messages: branch.flatMap((entry) =>
+					typeof entry === "object" &&
+					entry !== null &&
+					"type" in entry &&
+					entry.type === "message" &&
+					"message" in entry
+						? [entry.message]
+						: [],
+				),
+			}),
 			getSessionDir: () => sessionDir,
-			getSessionFile: () => options.sessionFile,
-			getSessionId: () => options.sessionId ?? TEST_SESSION_ID,
+			getSessionFile: () => sessionFile,
+			getSessionId: () => sessionId,
 		},
 	} as const;
 
 	return {
 		appendedEntries,
 		ctx,
-		getTool(name: string) {
+		events: pi.events,
+		getTool(name: string): RegisteredTool | undefined {
 			return registeredTools.get(name);
 		},
+		getActiveTools: (): string[] => [...activeTools],
 		handlers,
 		tools: registeredTools,
-		setBranch(nextBranch: unknown[]) {
-			branch = nextBranch;
+		setBranch(nextBranch): void {
+			branch = normalizeBranch(nextBranch);
+			syncFixtureEntries();
 		},
 		tool: registeredTool,
 	};
 }
 
 export async function runExtensionEvent(
-	handlers: Map<string, Array<(...args: unknown[]) => unknown>>,
+	handlers: ReadonlyMap<string, readonly HarnessHandler[]>,
 	eventName: string,
-	...args: unknown[]
+	...args: readonly unknown[]
 ): Promise<void> {
 	for (const handler of handlers.get(eventName) ?? []) {
+		// Registered handlers share event/context state and must execute in registration order.
+		// oxlint-disable-next-line no-await-in-loop
 		await handler(...args);
 	}
 }
 
-export async function runExtensionEventResults<T>(
-	handlers: Map<string, Array<(...args: unknown[]) => unknown>>,
+export async function getBrowserInstructions(harness: {
+	readonly handlers: ReadonlyMap<string, readonly HarnessHandler[]>;
+	readonly ctx: unknown;
+}): Promise<string> {
+	const event: {
+		prompt: string;
+		systemPromptOptions: { sections: Partial<Record<string, string>> };
+	} = {
+		prompt: "Please continue.",
+		systemPromptOptions: { sections: {} },
+	};
+	await runExtensionEvent(harness.handlers, "before_agent_start", event, harness.ctx);
+	return event.systemPromptOptions.sections.agent_browser ?? "";
+}
+
+export async function runExtensionEventResults(
+	handlers: ReadonlyMap<string, readonly HarnessHandler[]>,
 	eventName: string,
-	...args: unknown[]
-): Promise<T[]> {
-	const results: T[] = [];
+	...args: readonly unknown[]
+): Promise<unknown[]> {
+	const results: unknown[] = [];
 	for (const handler of handlers.get(eventName) ?? []) {
+		// Result handlers must observe preceding handler mutations.
+		// oxlint-disable-next-line no-await-in-loop
 		const result = await handler(...args);
 		if (result !== undefined) {
-			results.push(result as T);
+			results.push(result);
 		}
 	}
 	return results;
 }
 
 export async function executeRegisteredTool(
-	tool: NonNullable<ReturnType<typeof createExtensionHarness>["tool"]>,
-	ctx: ReturnType<typeof createExtensionHarness>["ctx"],
+	tool: Readonly<RegisteredTool>,
+	ctx: unknown,
 	params: unknown,
 	signal: AbortSignal = new AbortController().signal,
-) {
-	return (await tool.execute("test-tool-call", params, signal, undefined, ctx)) as {
-		content: Array<{ type: string; text?: string }>;
-		details?: Record<string, unknown>;
-		isError?: boolean;
-	};
+): Promise<TestToolResult> {
+	return await tool.execute("test-tool-call", params, signal, undefined, ctx);
 }
 
 const patchedEnvScope = new AsyncLocalStorage<boolean>();
 let patchedEnvQueue: Promise<void> = Promise.resolve();
 
-async function runWithPatchedEnv<T>(patch: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+async function runWithPatchedEnv<T>(
+	patch: Readonly<Record<string, string | undefined>>,
+	run: () => Promise<T>,
+): Promise<T> {
 	const previousValues = new Map<string, string | undefined>();
 	for (const [name, value] of Object.entries(patch)) {
 		previousValues.set(name, process.env[name]);
 		if (value === undefined) {
 			delete process.env[name];
-		} else if (processPlatform === "win32" && name.toLowerCase() === "path" && previousValues.get(name)) {
+		} else if (
+			processPlatform === "win32" &&
+			name.toLowerCase() === "path" &&
+			(previousValues.get(name)?.length ?? 0) > 0
+		) {
 			const previousPath = previousValues.get(name) ?? "";
 			const posixStyleSuffix = `:${previousPath}`;
 			process.env[name] = value.endsWith(posixStyleSuffix)
@@ -554,20 +999,30 @@ async function runWithPatchedEnv<T>(patch: Record<string, string | undefined>, r
 	}
 }
 
-export async function withPatchedEnv<T>(patch: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
-	if (patchedEnvScope.getStore()) {
+export async function withPatchedEnv<T>(
+	patch: Readonly<Record<string, string | undefined>>,
+	run: () => Promise<T>,
+): Promise<T> {
+	if (patchedEnvScope.getStore() === true) {
 		return await runWithPatchedEnv(patch, run);
 	}
 
-	const queuedRun = patchedEnvQueue
-		.catch(() => undefined)
-		.then(() => patchedEnvScope.run(true, () => runWithPatchedEnv(patch, run)));
-	patchedEnvQueue = queuedRun.then(() => undefined, () => undefined);
+	const queuedRun = patchedEnvQueue.then(() =>
+		patchedEnvScope.run(true, () => runWithPatchedEnv(patch, run)),
+	);
+	patchedEnvQueue = queuedRun.then(
+		() => {
+			/* Queue tracks completion only; the caller owns the actual result. */ return;
+		},
+		() => {
+			/* The original queuedRun rejection is returned to its caller below. */ return;
+		},
+	);
 	return await queuedRun;
 }
 
 /** Fake script body that spawns a detached descendant inheriting stdio (stdio-linger regressions). */
-export function buildStdioLingerFakeScript(options: { afterSpawnBody: string }): string {
+export function buildStdioLingerFakeScript(options: { readonly afterSpawnBody: string }): string {
 	return `const { spawn } = require("node:child_process");
 const { writeFileSync } = require("node:fs");
 const { tmpdir } = require("node:os");
@@ -588,13 +1043,39 @@ export async function writeFakeAgentBrowserBinary(
 ): Promise<string> {
 	const defaultSessionInfo = `if (process.env.PI_AGENT_BROWSER_TEST_PRESERVE_INTERNAL_LAUNCH_FLAGS !== "1") {
   const rawArgsIndex = process.argv.indexOf("--args");
-  if (rawArgsIndex >= 0 && process.argv[rawArgsIndex + 1] === "") process.argv.splice(rawArgsIndex, 2);
+  if (rawArgsIndex >= 0 && ["", "--no-startup-window"].includes(process.argv[rawArgsIndex + 1])) process.argv.splice(rawArgsIndex, 2);
   const fileAccessIndex = process.argv.indexOf("--allow-file-access");
   if (fileAccessIndex >= 0 && process.argv[fileAccessIndex + 1] === "false") process.argv.splice(fileAccessIndex, 2);
 }
 const __piabFakeArgs = process.argv.slice(2);
+const __piabFs = require("node:fs");
+const __piabRuntimeRoot = ${JSON.stringify(tempDir)};
+const __piabSession = __piabFakeArgs.includes("--session") ? __piabFakeArgs[__piabFakeArgs.indexOf("--session")+1] : process.env.AGENT_BROWSER_SESSION || "default";
+const __piabNamespace = (__piabFakeArgs.includes("--namespace") ? __piabFakeArgs[__piabFakeArgs.indexOf("--namespace")+1] : process.env.AGENT_BROWSER_NAMESPACE || "").toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const __piabKey = require('node:crypto').createHash('sha256').update(JSON.stringify([__piabNamespace, __piabSession])).digest('hex');
+const __piabRuntimePath = require('node:path').join(__piabRuntimeRoot, 'fake-daemon-' + __piabKey + '.json');
+let __piabRuntime; try { __piabRuntime = JSON.parse(__piabFs.readFileSync(__piabRuntimePath, "utf8")); } catch {}
+const __piabWrite = process.stdout.write.bind(process.stdout);
+process.stdout.write = (chunk, ...rest) => {
+  try {
+    const reply = JSON.parse(String(chunk));
+    const info = __piabFakeArgs.includes("session") && __piabFakeArgs.includes("info");
+    if (!info && reply.success === true && __piabFakeArgs.some(arg => ["open","get","snapshot","eval","click","fill","batch","screenshot","record","connect","close","quit","exit"].includes(arg))) {
+      const closed = __piabFakeArgs.some(arg => ["close","quit","exit"].includes(arg)) && !__piabFakeArgs.includes("batch");
+      __piabRuntime = closed ? { active: false, runtime: null } : { active: true, runtime: {
+        restoreKey: process.env.AGENT_BROWSER_RESTORE || null, backgroundPid: process.ppid, socketDir: "test-fixture-runtime", browserLaunched: true
+      }};
+      __piabFs.writeFileSync(__piabRuntimePath, JSON.stringify(__piabRuntime), { mode: 0o600 });
+    }
+  } catch {}
+  return __piabWrite(chunk, ...rest);
+};
 if (process.env.PI_AGENT_BROWSER_TEST_CUSTOM_VERSION !== "1" && __piabFakeArgs.includes("--version")) {
   process.stdout.write(${JSON.stringify(`${TARGET_AGENT_BROWSER_VERSION_LABEL}\n`)});
+  process.exit(0);
+}
+if (process.env.PI_AGENT_BROWSER_TEST_PAGE_URL && __piabFakeArgs.at(-2) === "get" && __piabFakeArgs.at(-1) === "url") {
+  process.stdout.write(JSON.stringify({ success: true, data: { url: process.env.PI_AGENT_BROWSER_TEST_PAGE_URL } }));
   process.exit(0);
 }
 if (process.env.PI_AGENT_BROWSER_ARGV_INSPECTION === "1" && process.env.PI_AGENT_BROWSER_TEST_CUSTOM_HELP !== "1" && __piabFakeArgs.includes("--help")) {
@@ -605,7 +1086,7 @@ if (process.env.PI_AGENT_BROWSER_ARGV_INSPECTION === "1" && process.env.PI_AGENT
   process.exit(0);
 }
 if (process.env.PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO !== "1" && __piabFakeArgs.includes("session") && __piabFakeArgs.includes("info")) {
-  process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
+  process.stdout.write(JSON.stringify({ success: true, data: __piabRuntime || { active: false, runtime: null } }));
   process.exit(0);
 }`;
 	const wrappedScriptBody = `${defaultSessionInfo}\n${scriptBody}`;
@@ -628,23 +1109,30 @@ if (process.env.PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO !== "1" && __piabFakeA
 	return fakeAgentBrowserPath;
 }
 
-export interface InvocationLogEntry {
-	agentcoreApiKey?: string | null;
-	apiKey?: string | null;
-	args: string[];
-	autosave?: string | null;
-	browserbaseApiKey?: string | null;
-	browserlessApiKey?: string | null;
-	browserUseApiKey?: string | null;
-	defaultTimeout?: string | null;
-	event?: string;
-	idleTimeout?: string | null;
-	iosDevice?: string | null;
-	kernelApiKey?: string | null;
-	model?: string | null;
-	sessionName?: string;
-	socketDir?: string | null;
-	stdin?: string | null;
+const NULLABLE_LOG_STRING = Type.Optional(Type.Union([Type.String(), Type.Null()]));
+const INVOCATION_LOG_ENTRY = Type.Object({
+	agentcoreApiKey: NULLABLE_LOG_STRING,
+	apiKey: NULLABLE_LOG_STRING,
+	args: Type.Array(Type.String()),
+	autosave: NULLABLE_LOG_STRING,
+	browserbaseApiKey: NULLABLE_LOG_STRING,
+	browserlessApiKey: NULLABLE_LOG_STRING,
+	browserUseApiKey: NULLABLE_LOG_STRING,
+	confirmActions: NULLABLE_LOG_STRING,
+	defaultTimeout: NULLABLE_LOG_STRING,
+	event: Type.Optional(Type.String()),
+	idleTimeout: NULLABLE_LOG_STRING,
+	iosDevice: NULLABLE_LOG_STRING,
+	kernelApiKey: NULLABLE_LOG_STRING,
+	model: NULLABLE_LOG_STRING,
+	sessionName: Type.Optional(Type.String()),
+	socketDir: NULLABLE_LOG_STRING,
+	stdin: NULLABLE_LOG_STRING,
+});
+export type InvocationLogEntry = Static<typeof INVOCATION_LOG_ENTRY>;
+function parseInvocationLogEntry(value: unknown): InvocationLogEntry {
+	assert.ok(Check(INVOCATION_LOG_ENTRY, value), "invalid fake-upstream invocation log entry");
+	return value;
 }
 
 export async function readInvocationLog(logPath: string): Promise<InvocationLogEntry[]> {
@@ -654,17 +1142,19 @@ export async function readInvocationLog(logPath: string): Promise<InvocationLogE
 			.split("\n")
 			.map((line) => line.trim())
 			.filter((line) => line.length > 0)
-			.map((line) => JSON.parse(line) as InvocationLogEntry);
+			.map((line) => parseInvocationLogEntry(JSON.parse(line)));
 	} catch (error) {
-		const errorWithCode = error as NodeJS.ErrnoException;
-		if (errorWithCode.code === "ENOENT") {
+		if (hasErrorCode(error, "ENOENT")) {
 			return [];
 		}
 		throw error;
 	}
 }
 
-export async function readChildStdoutJsonLine<T>(child: ReturnType<typeof spawn>, timeoutMs = 15_000): Promise<T> {
+export async function readChildStdoutJsonLine(
+	child: ReturnType<typeof spawn>,
+	timeoutMs = 15_000,
+): Promise<unknown> {
 	assert.ok(child.stdout, "expected child stdout pipe");
 	assert.ok(child.stderr, "expected child stderr pipe");
 	let stdout = "";
@@ -673,25 +1163,38 @@ export async function readChildStdoutJsonLine<T>(child: ReturnType<typeof spawn>
 	child.stderr.on("data", (chunk: string) => {
 		stderr += chunk;
 	});
-	return await new Promise<T>((resolve, reject) => {
+	return await new Promise<unknown>((resolve, reject) => {
 		const timeout = setTimeout(() => {
-			reject(new Error(`Timed out waiting for child stdout JSON line. stdout=${stdout} stderr=${stderr}`));
+			reject(
+				new Error(
+					`Timed out waiting for child stdout JSON line. stdout=${stdout} stderr=${stderr}`,
+				),
+			);
 		}, timeoutMs);
 		child.stdout?.setEncoding("utf8");
 		child.stdout?.on("data", (chunk: string) => {
 			stdout += chunk;
 			const firstLine = stdout.split("\n").find((line) => line.trim().length > 0);
-			if (!firstLine) return;
+			if (firstLine === undefined || firstLine.length === 0) {
+				return;
+			}
 			clearTimeout(timeout);
 			try {
-				resolve(JSON.parse(firstLine) as T);
+				const value: unknown = JSON.parse(firstLine);
+				resolve(value);
 			} catch (error) {
-				reject(error);
+				reject(
+					error instanceof Error ? error : new Error("Failed parsing child JSON", { cause: error }),
+				);
 			}
 		});
 		child.once("exit", (code, signal) => {
 			clearTimeout(timeout);
-			reject(new Error(`Child exited before stdout JSON line: code=${code} signal=${signal} stdout=${stdout} stderr=${stderr}`));
+			reject(
+				new Error(
+					`Child exited before stdout JSON line: code=${String(code)} signal=${String(signal)} stdout=${stdout} stderr=${stderr}`,
+				),
+			);
 		});
 		child.once("error", (error) => {
 			clearTimeout(timeout);
@@ -701,9 +1204,13 @@ export async function readChildStdoutJsonLine<T>(child: ReturnType<typeof spawn>
 }
 
 export async function stopChildProcess(child: ReturnType<typeof spawn>): Promise<void> {
-	if (child.exitCode !== null || child.signalCode !== null) return;
+	if (child.exitCode !== null || child.signalCode !== null) {
+		return;
+	}
 	child.kill("SIGTERM");
-	const timeout = setTimeout(() => child.kill("SIGKILL"), 2_000);
+	const timeout = setTimeout(() => {
+		child.kill("SIGKILL");
+	}, 2_000);
 	try {
 		await once(child, "exit");
 	} finally {

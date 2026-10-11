@@ -1,3 +1,4 @@
+import { readRecord } from "./helpers/assertions.js";
 /**
  * Purpose: Verify pure selector-miss recovery helpers without spawning agent-browser.
  * Responsibilities: Lock visible-ref fallback matching, rich-input recovery actions, fill-text redaction, and excluded selector shapes.
@@ -40,20 +41,36 @@ const snapshotData = {
 };
 
 test("visible ref fallback excludes direct fill args and rich input recovery never echoes fill text", () => {
-	const target = getVisibleRefFallbackTarget({ commandTokens: ["find", "label", "Email", "fill", "super-secret"] });
-	assert.deepEqual(target, { action: "fill", roles: ["textbox"], targetName: "Email", text: "super-secret" });
+	const target = getVisibleRefFallbackTarget({
+		commandTokens: ["find", "label", "Email", "fill", "super-secret"],
+	});
+	assert.deepEqual(target, {
+		action: "fill",
+		roles: ["textbox"],
+		targetName: "Email",
+		text: "super-secret",
+	});
 
-	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({ snapshotData, target: target! });
+	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({
+		snapshotData,
+		target: target,
+	});
 	assert.equal(diagnostic?.candidates.length, 2);
-	assert.deepEqual(diagnostic?.candidates.map((candidate) => candidate.ref), ["@e1", "@e2"]);
-	assert.deepEqual(diagnostic?.candidates.map((candidate) => candidate.args), [undefined, undefined]);
-	assert.equal(diagnostic?.candidates[1]?.role, "textbox");
+	assert.deepEqual(
+		diagnostic.candidates.map((candidate) => candidate.ref),
+		["@e1", "@e2"],
+	);
+	assert.deepEqual(
+		diagnostic.candidates.map((candidate) => candidate.args),
+		[undefined, undefined],
+	);
+	assert.equal(diagnostic.candidates[1]?.role, "textbox");
 
-	const visibleActions = diagnostic ? buildVisibleRefFallbackNextActions({ diagnostic, sessionName: "s1" }) : [];
+	const visibleActions = buildVisibleRefFallbackNextActions({ diagnostic, sessionName: "s1" });
 	assert.deepEqual(visibleActions, []);
 
-	const publicDiagnostic = diagnostic ? sanitizeVisibleRefFallbackDiagnostic(diagnostic) : undefined;
-	assert.equal("editableEvidence" in (publicDiagnostic?.candidates[0] ?? {}), false);
+	const publicDiagnostic = sanitizeVisibleRefFallbackDiagnostic(diagnostic);
+	assert.equal("editableEvidence" in (publicDiagnostic.candidates[0] ?? {}), false);
 	assert.equal(JSON.stringify(publicDiagnostic).includes("super-secret"), false);
 
 	const richInput = buildRichInputRecoveryDiagnostic(diagnostic);
@@ -63,51 +80,90 @@ test("visible ref fallback excludes direct fill args and rich input recovery nev
 		"focus-current-editable-ref-2",
 		"click-current-editable-ref-2",
 	]);
-	const richActions = richInput ? buildRichInputRecoveryNextActions({ diagnostic: richInput, sessionName: "s1" }) : [];
-	assert.deepEqual(richActions.map((action) => action.params?.args), [
-		["--session", "s1", "focus", "@e1"],
-		["--session", "s1", "click", "@e1"],
-		["--session", "s1", "focus", "@e2"],
-		["--session", "s1", "click", "@e2"],
-	]);
+	const richActions = buildRichInputRecoveryNextActions({
+		diagnostic: richInput,
+		sessionName: "s1",
+	});
+	assert.deepEqual(
+		richActions.map((action) => readRecord(action.params).args),
+		[
+			["--session", "s1", "focus", "@e1"],
+			["--session", "s1", "click", "@e1"],
+			["--session", "s1", "focus", "@e2"],
+			["--session", "s1", "click", "@e2"],
+		],
+	);
 	assert.equal(JSON.stringify(richActions).includes("super-secret"), false);
 	assert.equal(formatVisibleRefFallbackText(diagnostic)?.includes("super-secret"), false);
 	assert.equal(formatRichInputRecoveryText(richInput)?.includes("super-secret"), false);
 });
 
 test("visible ref fallback builds direct current-ref actions for non-fill text clicks", () => {
-	const target = getVisibleRefFallbackTarget({ commandTokens: ["find", "text", "Submit", "click"] });
+	const target = getVisibleRefFallbackTarget({
+		commandTokens: ["find", "text", "Submit", "click"],
+	});
 	assert.deepEqual(target, { action: "click", roles: ["button", "link"], targetName: "Submit" });
 
-	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({ snapshotData, target: target! });
-	assert.deepEqual(diagnostic?.candidates.map((candidate) => [candidate.ref, candidate.role, candidate.args]), [
-		["@e3", "button", ["click", "@e3"]],
-		["@e4", "link", ["click", "@e4"]],
-	]);
-	assert.deepEqual(diagnostic ? buildVisibleRefFallbackNextActions({ diagnostic }).map((action) => action.id) : [], [
-		"try-current-visible-ref-1",
-		"try-current-visible-ref-2",
-	]);
+	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({
+		snapshotData,
+		target: target,
+	});
+	assert.deepEqual(
+		diagnostic?.candidates.map((candidate) => [candidate.ref, candidate.role, candidate.args]),
+		[
+			["@e3", "button", ["click", "@e3"]],
+			["@e4", "link", ["click", "@e4"]],
+		],
+	);
+	assert.deepEqual(
+		buildVisibleRefFallbackNextActions({ diagnostic }).map((action) => action.id),
+		["try-current-visible-ref-1", "try-current-visible-ref-2"],
+	);
 });
 
 test("selector recovery parses locator select targets and still requires exact names", () => {
-	assert.deepEqual(getVisibleRefFallbackTarget({ commandTokens: ["find", "label", "Flavor", "select", "chocolate"] }), {
-		action: "select",
-		optionValues: ["chocolate"],
-		roles: ["combobox", "listbox"],
-		targetName: "Flavor",
+	assert.deepEqual(
+		getVisibleRefFallbackTarget({
+			commandTokens: ["find", "label", "Flavor", "select", "chocolate"],
+		}),
+		{
+			action: "select",
+			optionValues: ["chocolate"],
+			roles: ["combobox", "listbox"],
+			targetName: "Flavor",
+		},
+	);
+	assert.deepEqual(
+		getVisibleRefFallbackTarget({
+			commandTokens: ["find", "role", "combobox", "select", "chocolate", "--name", "Flavor"],
+		}),
+		{
+			action: "select",
+			optionValues: ["chocolate"],
+			roles: ["combobox"],
+			targetName: "Flavor",
+		},
+	);
+	assert.equal(
+		getVisibleRefFallbackTarget({
+			commandTokens: ["find", "role", "button", "select", "danger", "--name", "Delete"],
+		}),
+		undefined,
+	);
+	assert.equal(
+		getVisibleRefFallbackTarget({
+			commandTokens: ["find", "placeholder", "Flavor", "select", "chocolate"],
+		}),
+		undefined,
+	);
+	const target = getVisibleRefFallbackTarget({
+		commandTokens: ["find", "label", "Email address", "fill", "value"],
 	});
-	assert.deepEqual(getVisibleRefFallbackTarget({ commandTokens: ["find", "role", "combobox", "select", "chocolate", "--name", "Flavor"] }), {
-		action: "select",
-		optionValues: ["chocolate"],
-		roles: ["combobox"],
-		targetName: "Flavor",
-	});
-	assert.equal(getVisibleRefFallbackTarget({ commandTokens: ["find", "role", "button", "select", "danger", "--name", "Delete"] }), undefined);
-	assert.equal(getVisibleRefFallbackTarget({ commandTokens: ["find", "placeholder", "Flavor", "select", "chocolate"] }), undefined);
-	const target = getVisibleRefFallbackTarget({ commandTokens: ["find", "label", "Email address", "fill", "value"] });
 	assert.ok(target);
-	assert.equal(buildVisibleRefFallbackDiagnosticFromSnapshot({ snapshotData, target: target! }), undefined);
+	assert.equal(
+		buildVisibleRefFallbackDiagnosticFromSnapshot({ snapshotData, target: target }),
+		undefined,
+	);
 });
 
 test("semantic visible-ref resolution requires exact role/name matches", () => {
@@ -146,13 +202,34 @@ test("semantic fill visible-ref resolution is internal-only and requires one exa
 		locator: "role" as const,
 	};
 
-	assert.equal(resolveVisibleRefActionFromSnapshot({ compiledAction, snapshotData: comboboxSnapshot }), undefined);
-	assert.deepEqual(resolveVisibleRefActionFromSnapshot({ allowFill: true, compiledAction, snapshotData: comboboxSnapshot })?.args, ["fill", "@e17", "private search"]);
+	assert.equal(
+		resolveVisibleRefActionFromSnapshot({ compiledAction, snapshotData: comboboxSnapshot }),
+		undefined,
+	);
+	assert.deepEqual(
+		resolveVisibleRefActionFromSnapshot({
+			allowFill: true,
+			compiledAction,
+			snapshotData: comboboxSnapshot,
+		})?.args,
+		["fill", "@e17", "private search"],
+	);
 
 	const target = getVisibleRefFallbackTarget({ commandTokens: compiledAction.args });
-	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({ snapshotData: comboboxSnapshot, target: target! });
-	assert.deepEqual(diagnostic?.candidates.map((candidate) => candidate.args), [undefined]);
-	assert.equal(JSON.stringify(sanitizeVisibleRefFallbackDiagnostic(diagnostic!)).includes("private search"), false);
+	const diagnostic = buildVisibleRefFallbackDiagnosticFromSnapshot({
+		snapshotData: comboboxSnapshot,
+		// A missing fill target fails immediately; the diagnostic assertions always receive a target.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		target: target ?? assert.fail("fill command must produce a recovery target"),
+	});
+	assert.deepEqual(
+		diagnostic?.candidates.map((candidate) => candidate.args),
+		[undefined],
+	);
+	assert.equal(
+		JSON.stringify(sanitizeVisibleRefFallbackDiagnostic(diagnostic)).includes("private search"),
+		false,
+	);
 
 	const ambiguousSnapshot = {
 		...comboboxSnapshot,
@@ -162,7 +239,14 @@ test("semantic fill visible-ref resolution is internal-only and requires one exa
 		},
 		snapshot: '- combobox "Search" [ref=e17]\n- combobox "Search" [ref=e18]',
 	};
-	assert.equal(resolveVisibleRefActionFromSnapshot({ allowFill: true, compiledAction, snapshotData: ambiguousSnapshot }), undefined);
+	assert.equal(
+		resolveVisibleRefActionFromSnapshot({
+			allowFill: true,
+			compiledAction,
+			snapshotData: ambiguousSnapshot,
+		}),
+		undefined,
+	);
 
 	const nonEditableSnapshot = {
 		...comboboxSnapshot,
@@ -171,5 +255,12 @@ test("semantic fill visible-ref resolution is internal-only and requires one exa
 		},
 		snapshot: '- combobox "Search" [editable=false, ref=e17]',
 	};
-	assert.equal(resolveVisibleRefActionFromSnapshot({ allowFill: true, compiledAction, snapshotData: nonEditableSnapshot }), undefined);
+	assert.equal(
+		resolveVisibleRefActionFromSnapshot({
+			allowFill: true,
+			compiledAction,
+			snapshotData: nonEditableSnapshot,
+		}),
+		undefined,
+	);
 });

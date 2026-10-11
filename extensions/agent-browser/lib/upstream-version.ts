@@ -29,8 +29,10 @@ export function parseAgentBrowserVersionOutput(stdout: string): string | undefin
 
 export function getAgentBrowserVersionValidationError(stdout: string): string | undefined {
 	const observed = parseAgentBrowserVersionOutput(stdout);
-	if (observed && isSupportedAgentBrowserVersion(observed)) return undefined;
-	return observed
+	if (observed !== undefined && isSupportedAgentBrowserVersion(observed)) {
+		return undefined;
+	}
+	return observed !== undefined
 		? `Installed agent-browser ${observed} is unsupported; stable versions must be at least ${MINIMUM_AGENT_BROWSER_VERSION_LABEL}. Install ${TARGET_AGENT_BROWSER_VERSION_LABEL} (recommended), run pi-agent-browser-doctor, then reload Pi.`
 		: `agent-browser --version returned an unrecognized value; expected ${SUPPORTED_AGENT_BROWSER_VERSION_LABEL}. Run pi-agent-browser-doctor and install a supported upstream version.`;
 }

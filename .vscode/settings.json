@@ -1,0 +1,9 @@
+{
+	"oxc.path.oxlint": "./scripts/oxlint.mjs",
+	"typescript.validate.enable": true,
+	"javascript.validate.enable": true,
+	"[javascript][javascriptreact][typescript][typescriptreact][json][jsonc][markdown]": {
+		"editor.defaultFormatter": "oxc.oxc-vscode",
+		"editor.formatOnSave": true
+	}
+}

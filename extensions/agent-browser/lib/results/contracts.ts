@@ -1,23 +1,49 @@
-import type { AgentBrowserNextAction } from "./next-actions.js";
+import type { AgentBrowserNextAction } from "./action-contracts.js";
+import type { ReadConfirmation, RecordingRecovery } from "./evidence-contracts.js";
+import type {
+	ArtifactVerificationSummary,
+	FileArtifactMetadata,
+	SavedFilePresentationDetails,
+	SessionArtifactManifest,
+} from "./artifact-contracts.js";
+export type {
+	ArtifactRetentionState,
+	ArtifactStorageScope,
+	ArtifactVerificationEntry,
+	ArtifactVerificationState,
+	ArtifactVerificationSummary,
+	ArtifactRequestContext,
+	FileArtifactKind,
+	FileArtifactStatus,
+	FileArtifactMetadata,
+	SavedFilePresentationDetails,
+	SessionArtifactManifestEntry,
+	SessionArtifactManifest,
+} from "./artifact-contracts.js";
 
-export type { AgentBrowserNextAction } from "./next-actions.js";
+export type { AgentBrowserNextAction } from "./action-contracts.js";
 
 export interface AgentBrowserEnvelope {
-	data?: unknown;
-	error?: unknown;
-	success: boolean;
+	readonly data?: unknown;
+	readonly error?: unknown;
+	readonly success: boolean;
 }
 
 export interface AgentBrowserBatchResult {
-	command?: string[];
-	error?: unknown;
-	result?: unknown;
-	success?: boolean;
+	readonly command?: readonly string[];
+	readonly error?: unknown;
+	readonly result?: unknown;
+	readonly success?: boolean;
 }
 
 export type AgentBrowserResultCategory = "failure" | "success";
 
-export type AgentBrowserSuccessCategory = "artifact-pending" | "artifact-saved" | "artifact-unverified" | "completed" | "inspection";
+export type AgentBrowserSuccessCategory =
+	| "artifact-pending"
+	| "artifact-saved"
+	| "artifact-unverified"
+	| "completed"
+	| "inspection";
 
 export type AgentBrowserFailureCategory =
 	| "aborted"
@@ -40,16 +66,40 @@ export type AgentBrowserFailureCategory =
 	| "validation-error";
 
 export interface AgentBrowserResultCategoryDetails {
-	failureCategory?: AgentBrowserFailureCategory;
-	resultCategory: AgentBrowserResultCategory;
-	successCategory?: AgentBrowserSuccessCategory;
+	readonly failureCategory?: AgentBrowserFailureCategory;
+	readonly resultCategory: AgentBrowserResultCategory;
+	readonly successCategory?: AgentBrowserSuccessCategory;
+}
+
+// Unknown detail projection guarantees only the wrapper-owned outcome fields.
+// Producer observations retain their richer contract below.
+export interface ProjectedAgentBrowserObservation {
+	readonly [key: string]: unknown;
+	readonly success: boolean;
+	readonly resultCategory: AgentBrowserResultCategory;
+}
+
+export interface AgentBrowserObservation extends AgentBrowserResultCategoryDetails {
+	[key: string]: unknown;
+	success: boolean;
+	data?: unknown;
+	error?: unknown;
+	summary?: string;
+	sessionName?: string;
+	namespace?: string;
+	failures?: AgentBrowserObservation[];
+	nextActions?: readonly AgentBrowserNextAction[];
+	artifacts?: readonly FileArtifactMetadata[];
+	artifactVerification?: ArtifactVerificationSummary;
+	imageObservations?: readonly ImageObservation[];
+	batchSteps?: Array<AgentBrowserObservation & { index: number; command?: string[] }>;
 }
 
 export interface AgentBrowserPageChangeSummary {
 	artifactCount?: number;
 	changeType: "artifact" | "confirmation" | "mutation" | "navigation";
 	command?: string;
-	nextActionIds?: string[];
+	nextActionIds?: readonly string[];
 	observed: boolean;
 	savedFilePath?: string;
 	summary: string;
@@ -57,104 +107,8 @@ export interface AgentBrowserPageChangeSummary {
 	url?: string;
 }
 
-export type FileArtifactKind = "download" | "file" | "har" | "image" | "pdf" | "profile" | "trace" | "video";
-
-export type FileArtifactStatus = "missing" | "pending" | "repaired-from-temp" | "saved" | "stale" | "upstream-temp-only";
-
-export interface FileArtifactMetadata {
-	absolutePath: string;
-	artifactType?: FileArtifactKind;
-	command?: string;
-	cwd?: string;
-	exists?: boolean;
-	extension?: string;
-	kind: FileArtifactKind;
-	mediaType?: string;
-	namespace?: string;
-	path: string;
-	recordingState?: "openRecording";
-	requestedPath?: string;
-	session?: string;
-	sizeBytes?: number;
-	status?: FileArtifactStatus;
-	subcommand?: string;
-	tempPath?: string;
-	updatedAtMs?: number;
-	willExistOnStop?: boolean;
-}
-
-export type ArtifactVerificationState = "missing" | "pending" | "unverified" | "verified";
-
-export interface ArtifactVerificationEntry {
-	absolutePath?: string;
-	exists?: boolean;
-	kind: FileArtifactKind | "spill";
-	limitation?: string;
-	mediaType?: string;
-	path: string;
-	requestedPath?: string;
-	recordingState?: "openRecording";
-	retentionState?: ArtifactRetentionState;
-	sizeBytes?: number;
-	state: ArtifactVerificationState;
-	status?: FileArtifactStatus;
-	storageScope?: ArtifactStorageScope;
-	updatedAtMs?: number;
-	willExistOnStop?: boolean;
-}
-
-export interface ArtifactVerificationSummary {
-	artifacts: ArtifactVerificationEntry[];
-	missingCount: number;
-	pendingCount: number;
-	unverifiedCount: number;
-	verified: boolean;
-	verifiedCount: number;
-}
-
-export interface SavedFilePresentationDetails {
-	command: "download" | "pdf" | "wait";
-	kind: "download" | "pdf";
-	metadata?: Record<string, unknown>;
-	path: string;
-	subcommand?: string;
-}
-
-export type ArtifactRetentionState = "evicted" | "ephemeral" | "live" | "missing";
-
-export type ArtifactStorageScope = "explicit-path" | "persistent-session" | "process-temp";
-
-export interface SessionArtifactManifestEntry {
-	absolutePath?: string;
-	command?: string;
-	createdAtMs: number;
-	cwd?: string;
-	evictedAtMs?: number;
-	exists?: boolean;
-	extension?: string;
-	kind: FileArtifactKind | "spill";
-	mediaType?: string;
-	namespace?: string;
-	path: string;
-	requestedPath?: string;
-	retentionState: ArtifactRetentionState;
-	session?: string;
-	sizeBytes?: number;
-	storageScope: ArtifactStorageScope;
-	subcommand?: string;
-}
-
-export interface SessionArtifactManifest {
-	entries: SessionArtifactManifestEntry[];
-	evictedCount: number;
-	liveCount: number;
-	maxEntries: number;
-	updatedAtMs: number;
-	version: 1;
-}
-
 export interface AgentBrowserLifecycle {
-	effectiveLaunch: { browserLaunched: boolean };
+	readonly effectiveLaunch: { readonly browserLaunched: boolean };
 }
 
 export interface AgentBrowserWindow {
@@ -164,21 +118,63 @@ export interface AgentBrowserWindow {
 	visibility: "unverified";
 }
 
+export interface ScreenshotSample {
+	readonly rendering?: "text";
+	readonly url: string;
+	readonly frame: "main" | "child";
+	readonly childFrameCount: number;
+	readonly viewport: { readonly width: number; readonly height: number };
+	readonly document: { readonly width: number; readonly height: number };
+	readonly scroll: { readonly x: number; readonly y: number };
+	readonly dpr: number;
+	readonly visualViewport: { readonly x: number; readonly y: number; readonly scale: number };
+	readonly element?: {
+		readonly x: number;
+		readonly y: number;
+		readonly width: number;
+		readonly height: number;
+	};
+}
+
+export interface ImageObservation {
+	readonly rendering?: "text";
+	readonly id?: string;
+	readonly path: string;
+	readonly mimeType: string;
+	readonly pixels?: { readonly width: number; readonly height: number };
+	readonly capture: "viewport" | "full-page" | "element" | "unknown";
+	readonly geometry: {
+		readonly status: "measured" | "unknown";
+		readonly reason: string;
+		readonly before?: ScreenshotSample;
+		readonly after?: ScreenshotSample;
+		/** CSS document coordinates of the captured rectangle, not mouse coordinates. */
+		readonly crop?: {
+			readonly x: number;
+			readonly y: number;
+			readonly width: number;
+			readonly height: number;
+		};
+		readonly pixelsPerCssPixel?: { readonly x: number; readonly y: number };
+	};
+}
+
 export interface BatchStepPresentationDetails {
 	artifactVerification?: ArtifactVerificationSummary;
-	artifacts?: FileArtifactMetadata[];
-	command?: string[];
+	artifacts?: readonly FileArtifactMetadata[];
+	command?: readonly string[];
 	commandText: string;
 	data?: unknown;
 	failureCategory?: AgentBrowserFailureCategory;
 	fullOutputPath?: string;
-	fullOutputPaths?: string[];
+	fullOutputPaths?: readonly string[];
 	imagePath?: string;
-	imagePaths?: string[];
+	imagePaths?: readonly string[];
+	imageObservations?: readonly ImageObservation[];
 	index: number;
 	lifecycle?: AgentBrowserLifecycle;
-	networkRouteDiagnostics?: NetworkRouteDiagnostic[];
-	nextActions?: AgentBrowserNextAction[];
+	networkRouteDiagnostics?: readonly NetworkRouteDiagnostic[];
+	nextActions?: readonly AgentBrowserNextAction[];
 	pageChangeSummary?: AgentBrowserPageChangeSummary;
 	resultCategory: AgentBrowserResultCategory;
 	savedFile?: SavedFilePresentationDetails;
@@ -197,21 +193,26 @@ export interface BatchFailurePresentationDetails {
 }
 
 export interface ToolPresentation {
+	readConfirmation?: ReadConfirmation;
+	recordingRecovery?: RecordingRecovery;
 	artifactManifest?: SessionArtifactManifest;
 	artifactRetentionSummary?: string;
 	artifactVerification?: ArtifactVerificationSummary;
-	artifacts?: FileArtifactMetadata[];
+	artifacts?: readonly FileArtifactMetadata[];
 	batchFailure?: BatchFailurePresentationDetails;
-	batchSteps?: BatchStepPresentationDetails[];
-	content: Array<{ text: string; type: "text" } | { data: string; mimeType: string; type: "image" }>;
+	batchSteps?: readonly BatchStepPresentationDetails[];
+	content: Array<
+		{ text: string; type: "text" } | { data: string; mimeType: string; type: "image" }
+	>;
 	data?: unknown;
 	failureCategory?: AgentBrowserFailureCategory;
 	fullOutputPath?: string;
-	fullOutputPaths?: string[];
+	fullOutputPaths?: readonly string[];
 	imagePath?: string;
-	imagePaths?: string[];
-	networkRouteDiagnostics?: NetworkRouteDiagnostic[];
-	nextActions?: AgentBrowserNextAction[];
+	imagePaths?: readonly string[];
+	imageObservations?: readonly ImageObservation[];
+	networkRouteDiagnostics?: readonly NetworkRouteDiagnostic[];
+	nextActions?: readonly AgentBrowserNextAction[];
 	pageChangeSummary?: AgentBrowserPageChangeSummary;
 	resultCategory?: AgentBrowserResultCategory;
 	savedFile?: SavedFilePresentationDetails;
@@ -238,15 +239,18 @@ export interface NetworkFailureSummary {
 }
 
 export interface NetworkRouteRecord {
-	mode: "abort" | "body" | "handler" | "unknown";
-	pattern: string;
+	readonly mode: "abort" | "body" | "handler" | "unknown";
+	readonly pattern: string;
 }
 
 export interface NetworkRouteDiagnostic {
-	mode: NetworkRouteRecord["mode"];
-	reason: "pending-routed-request" | "cors-likely-routed-request" | "unfulfilled-routed-request";
-	requestId?: string;
-	requestUrl?: string;
-	routePattern: string;
-	summary: string;
+	readonly mode: NetworkRouteRecord["mode"];
+	readonly reason:
+		| "pending-routed-request"
+		| "cors-likely-routed-request"
+		| "unfulfilled-routed-request";
+	readonly requestId?: string;
+	readonly requestUrl?: string;
+	readonly routePattern: string;
+	readonly summary: string;
 }

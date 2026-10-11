@@ -1,578 +1,441 @@
-import { extractUpstreamCommandTokens } from "./argv-descriptor.js";
-import { getAgentBrowserSessionIdentityKey, isAgentBrowserSessionIdentityKeyInNamespace } from "./argv-grammar.js";
-import { batchHasSuccessfulCloseAll, getSuccessfulBatchCloseLifecycle } from "./batch-lifecycle.js";
-import { isCloseAllCommand, isCloseCommand, isReadOnlyDiagnosticSessionTargetCommand, isRecordPageTransitionCommand, isUnverifiedPageTransitionCommand, isWebMcpPageMutationCommand, isWindowOrDiffPageTransitionCommand } from "./command-taxonomy.js";
 import { isRecord } from "./parsing.js";
-import { getEditableRefEvidence } from "./results/editable-ref-evidence.js";
-import { enrichSnapshotRefEntries, getSnapshotRefEntries } from "./results/snapshot-refs.js";
-import { parseSnapshotLines } from "./results/snapshot-segments.js";
-
-export interface SessionTabTarget {
-	title?: string;
-	url: string;
-}
-
-interface OrderedSessionTabTarget {
-	order: number;
-	reopenPending?: boolean;
-	target: SessionTabTarget;
-}
-
-export interface SessionRefSnapshot {
-	refIds: string[];
-	refs?: Record<string, { isContentEditable?: boolean; isEditable?: boolean; name: string; role: string }>;
-	target?: SessionTabTarget;
-}
-
-interface OrderedSessionRefSnapshot extends SessionRefSnapshot {
-	order: number;
-}
-
-export interface SessionRefSnapshotInvalidation {
-	reason: "no-active-page" | "page-transition";
-	summary: string;
-}
-
-interface OrderedSessionRefSnapshotInvalidation extends SessionRefSnapshotInvalidation {
-	order: number;
-}
-
-export interface BatchRefSnapshotState {
-	invalidation?: SessionRefSnapshotInvalidation;
-	snapshot?: SessionRefSnapshot;
-}
-
-export type SessionTabPinningReason = "drift" | "restore";
-
-export type SessionPageStateUpdateToken = number & { readonly __sessionPageStateUpdateToken: unique symbol };
-
-export interface SessionPageStateView {
-	pinningReason?: SessionTabPinningReason;
-	tabReopenPending?: boolean;
-	tabTargetUnknown?: true;
-	refSnapshot?: SessionRefSnapshot;
-	refSnapshotInvalidation?: SessionRefSnapshotInvalidation;
-	tabTarget?: SessionTabTarget;
-}
-
-export interface SessionPageStateUpdateResult extends SessionPageStateView {
-	applied: boolean;
-	stale?: boolean;
-}
-
-export function normalizeComparableUrl(url: string | undefined): string | undefined {
-	const normalizedUrl = url?.trim();
-	if (!normalizedUrl) {
-		return undefined;
-	}
-	try {
-		const parsedUrl = new URL(normalizedUrl);
-		parsedUrl.hash = "";
-		return parsedUrl.toString();
-	} catch {
-		return undefined;
-	}
-}
-
-export function normalizeSessionTabTarget(target: { title?: string; url?: string } | undefined): SessionTabTarget | undefined {
-	if (!target) {
-		return undefined;
-	}
-	const url = target.url?.trim();
-	if (!url || normalizeComparableUrl(url) === undefined) {
-		return undefined;
-	}
-	const title = target.title?.trim();
-	return { title: title && title.length > 0 ? title : undefined, url };
-}
-
-export function isAboutBlankUrl(url: string | undefined): boolean {
-	return normalizeComparableUrl(url) === "about:blank";
-}
-
-export function isAboutBlankSessionTabTarget(target: SessionTabTarget | undefined): boolean {
-	return isAboutBlankUrl(target?.url);
-}
-
-export function commandExplicitlyTargetsAboutBlank(commandTokens: string[]): boolean {
-	return (commandTokens[0] === "window" && commandTokens[1] === "new") || commandTokens.some((token) => isAboutBlankUrl(token));
-}
-
-export function targetsMatch(left: SessionTabTarget | undefined, right: SessionTabTarget | undefined): boolean {
-	if (!left || !right) return true;
-	return normalizeComparableUrl(left.url) === normalizeComparableUrl(right.url);
-}
-
-function extractStringResultField(data: unknown, fieldName: "result" | "title" | "url" | "value"): string | undefined {
-	if (typeof data === "string") {
-		if (fieldName === "value") return data;
-		const text = data.trim();
-		return text.length > 0 ? text : undefined;
-	}
-	if (!isRecord(data) || typeof data[fieldName] !== "string") {
-		return undefined;
-	}
-	if (fieldName === "value") return data[fieldName];
-	const text = data[fieldName].trim();
-	return text.length > 0 ? text : undefined;
-}
-
-export function extractSessionTabTargetFromData(data: unknown): SessionTabTarget | undefined {
-	const directTarget = normalizeSessionTabTarget({
-		title: extractStringResultField(data, "title"),
-		url: extractStringResultField(data, "url"),
-	});
-	if (directTarget) {
-		return directTarget;
-	}
-	if (isRecord(data) && typeof data.origin === "string") {
-		return normalizeSessionTabTarget({ url: data.origin });
-	}
-	return undefined;
-}
-
-function extractBatchResultCommand(item: Record<string, unknown>): string[] {
-	return Array.isArray(item.command) ? item.command.filter((token): token is string => typeof token === "string") : [];
-}
-
-export function extractSessionTabTargetFromCommandData(commandTokens: string[], data: unknown): SessionTabTarget | undefined {
-	const [command, subcommand] = commandTokens;
-	if (command === "get" && subcommand === "url") {
-		return normalizeSessionTabTarget({ url: extractStringResultField(data, "url") ?? extractStringResultField(data, "result") });
-	}
-	return isReadOnlyDiagnosticSessionTargetCommand(command, subcommand) ? undefined : extractSessionTabTargetFromData(data);
-}
-
-export function extractSessionTabTargetFromBatchResults(data: unknown): SessionTabTarget | undefined {
-	if (!Array.isArray(data)) {
-		return undefined;
-	}
-
-	let currentTarget: SessionTabTarget | undefined;
-	let pendingTitle: string | undefined;
-	for (const item of data) {
-		if (!isRecord(item)) continue;
-		const [name, subcommand] = extractUpstreamCommandTokens(extractBatchResultCommand(item));
-		if (isWindowOrDiffPageTransitionCommand(name, subcommand)) {
-			currentTarget = undefined;
-			pendingTitle = undefined;
-		}
-		if (item.success === false) continue;
-		const result = item.result;
-
-		if (isCloseCommand(name)) {
-			currentTarget = undefined;
-			pendingTitle = undefined;
-			continue;
-		}
-		if (name === "get" && subcommand === "title") {
-			pendingTitle = extractStringResultField(result, "title");
-			continue;
-		}
-		if (name === "get" && subcommand === "url") {
-			const url = extractStringResultField(result, "url");
-			const target = normalizeSessionTabTarget({ title: pendingTitle, url });
-			if (target) {
-				currentTarget = target;
-			}
-			pendingTitle = undefined;
-			continue;
-		}
-		const resultTarget = extractSessionTabTargetFromCommandData([name, subcommand].filter((token): token is string => token !== undefined), result);
-		if (resultTarget) {
-			currentTarget = resultTarget;
-		}
-		pendingTitle = undefined;
-	}
-	return currentTarget;
-}
-
-export function deriveSessionTabTarget(options: {
-	command?: string;
-	data: unknown;
-	navigationSummary?: { title?: string; url?: string };
-	previousTarget?: SessionTabTarget;
-	subcommand?: string;
-}): SessionTabTarget | undefined {
-	if (isCloseCommand(options.command)) {
-		return undefined;
-	}
-	const commandDataTarget = isReadOnlyDiagnosticSessionTargetCommand(options.command, options.subcommand)
-		? undefined
-		: extractSessionTabTargetFromData(options.data);
-	const observedTarget = normalizeSessionTabTarget(options.navigationSummary)
-		?? extractSessionTabTargetFromBatchResults(options.data)
-		?? commandDataTarget;
-	if (observedTarget || !isUnverifiedPageTransitionCommand(options.command, options.subcommand)) return observedTarget ?? options.previousTarget;
-	return undefined;
-}
-
-function batchContainsOnlyReadOnlyDiagnosticTargets(data: unknown): boolean {
-	if (!Array.isArray(data) || data.length === 0) {
-		return false;
-	}
-	return data.every((item) => {
-		if (!isRecord(item)) return false;
-		const [command, subcommand] = extractBatchResultCommand(item);
-		return isReadOnlyDiagnosticSessionTargetCommand(command, subcommand);
-	});
-}
-
-function getRestoredSessionTabTarget(details: Record<string, unknown>, command: string | undefined, subcommand: string | undefined): SessionTabTarget | undefined {
-	if (isReadOnlyDiagnosticSessionTargetCommand(command, subcommand)) {
-		return undefined;
-	}
-	const storedTarget = isRecord(details.sessionTabTarget)
-		? normalizeSessionTabTarget({
-			title: typeof details.sessionTabTarget.title === "string" ? details.sessionTabTarget.title : undefined,
-			url: typeof details.sessionTabTarget.url === "string" ? details.sessionTabTarget.url : undefined,
-		  })
-		: undefined;
-	if (command !== "batch") {
-		return storedTarget;
-	}
-	const batchTarget = extractSessionTabTargetFromBatchResults(details.data);
-	if (batchTarget) {
-		return batchTarget;
-	}
-	if (isRecord(details.compiledNetworkSourceLookup) || batchContainsOnlyReadOnlyDiagnosticTargets(details.data)) {
-		return undefined;
-	}
-	return storedTarget;
-}
-
-function extractRefSnapshotRefs(data: unknown): Record<string, { isContentEditable?: boolean; isEditable?: boolean; name: string; role: string }> | undefined {
-	if (!isRecord(data) || !isRecord(data.refs)) return undefined;
-	const snapshotLines = typeof data.snapshot === "string" ? parseSnapshotLines(data.snapshot) : [];
-	const lineByRef = new Map(snapshotLines.flatMap((line) => line.ref ? [[line.ref, line.raw] as const] : []));
-	const entries = enrichSnapshotRefEntries(getSnapshotRefEntries(data), snapshotLines);
-	const refs = Object.fromEntries(entries.flatMap((entry) => {
-		if (!/^e\d+$/.test(entry.id) || entry.role.length === 0) return [];
-		const isContentEditable = getEditableRefEvidence({ ref: entry.refData, text: lineByRef.get(entry.id) });
-		return [[entry.id, { ...(isContentEditable === true ? { isContentEditable: true } : {}), ...(entry.isEditable !== undefined ? { isEditable: entry.isEditable } : {}), name: entry.name, role: entry.role }] as const];
-	}));
-	return Object.keys(refs).length > 0 ? refs : undefined;
-}
-
-export function extractRefSnapshotFromData(data: unknown): SessionRefSnapshot | undefined {
-	if (!isRecord(data)) return undefined;
-	const refs = extractRefSnapshotRefs(data);
-	return {
-		refIds: isRecord(data.refs) ? Object.keys(data.refs).filter((refId) => /^e\d+$/.test(refId)) : [],
-		...(refs ? { refs } : {}),
-		target: extractSessionTabTargetFromData(data),
-	};
-}
-
-function getBatchResultFailureText(item: Record<string, unknown>): string | undefined {
-	const result = isRecord(item.result) ? item.result : undefined;
-	const parts = [item.error, result?.error, typeof item.result === "string" ? item.result : undefined]
-		.filter((part): part is string => typeof part === "string" && part.trim().length > 0);
-	return parts.length > 0 ? parts.join("\n") : undefined;
-}
-
-export function buildNoActivePageRefSnapshotInvalidation(): SessionRefSnapshotInvalidation {
-	return {
-		reason: "no-active-page",
-		summary: "The latest snapshot for this session reported No active page. Old page-scoped refs are invalid until snapshot -i succeeds.",
-	};
-}
-
-export function buildPageTransitionRefSnapshotInvalidation(summary?: string): SessionRefSnapshotInvalidation {
-	return {
-		reason: "page-transition",
-		summary: summary ?? "Recording starts and URL-bearing restarts conservatively invalidate earlier page-scoped refs. Run snapshot -i before using refs; this is not evidence of a page change.",
-	};
-}
-
-export function getCommandRefSnapshotInvalidation(commandTokens: readonly string[]): SessionRefSnapshotInvalidation | undefined {
-	if (isRecordPageTransitionCommand(commandTokens)) return buildPageTransitionRefSnapshotInvalidation();
-	if (isWindowOrDiffPageTransitionCommand(commandTokens[0], commandTokens[1])) {
-		return buildPageTransitionRefSnapshotInvalidation("A window new or diff url command replaced or navigated the active page and invalidated prior refs. Run snapshot -i before using page-scoped refs.");
-	}
-	if (isWebMcpPageMutationCommand(commandTokens)) {
-		return buildPageTransitionRefSnapshotInvalidation("A WebMCP invoke, result, or cancel command can mutate, rerender, or navigate the page, so the prior snapshot refs were invalidated. Run snapshot -i before using page-scoped refs.");
-	}
-	return undefined;
-}
-
-export function isNoActivePageSnapshotFailure(command: string | undefined, text: string | undefined): boolean {
-	return command === "snapshot" && /\bno active page\b/i.test(text ?? "");
-}
-
-export function extractLatestRefSnapshotStateFromBatchResults(data: unknown): BatchRefSnapshotState | undefined {
-	if (!Array.isArray(data)) return undefined;
-	let latestState: BatchRefSnapshotState | undefined;
-	for (const item of data) {
-		if (!isRecord(item)) continue;
-		const commandTokens = extractUpstreamCommandTokens(extractBatchResultCommand(item));
-		const [name] = commandTokens;
-		if (item.success !== false && isCloseCommand(name)) {
-			latestState = undefined;
-			continue;
-		}
-		const transitionInvalidation = getCommandRefSnapshotInvalidation(commandTokens);
-		if (transitionInvalidation) {
-			latestState = { invalidation: transitionInvalidation };
-			continue;
-		}
-		if (name !== "snapshot") continue;
-		if (item.success === false) {
-			if (isNoActivePageSnapshotFailure(name, getBatchResultFailureText(item))) {
-				latestState = { invalidation: buildNoActivePageRefSnapshotInvalidation() };
-			}
-			continue;
-		}
-		const snapshot = extractRefSnapshotFromData(item.result);
-		if (snapshot) {
-			latestState = { snapshot };
-		}
-	}
-	return latestState;
-}
-
-function getRestoredRefSnapshotInvalidation(details: Record<string, unknown>, command: string | undefined): SessionRefSnapshotInvalidation | undefined {
-	const invalidation = isRecord(details.refSnapshotInvalidation) ? details.refSnapshotInvalidation : undefined;
-	if (invalidation?.reason === "no-active-page") return buildNoActivePageRefSnapshotInvalidation();
-	if (invalidation?.reason === "page-transition") return buildPageTransitionRefSnapshotInvalidation(typeof invalidation.summary === "string" ? invalidation.summary : undefined);
-	const errorText = typeof details.error === "string"
-		? details.error
-		: typeof details.summary === "string"
-			? details.summary
-			: undefined;
-	return isNoActivePageSnapshotFailure(command, errorText) ? buildNoActivePageRefSnapshotInvalidation() : undefined;
-}
-
-function getRestoredRefSnapshot(details: Record<string, unknown>): SessionRefSnapshot | undefined {
-	const refSnapshot = isRecord(details.refSnapshot) ? details.refSnapshot : undefined;
-	if (!refSnapshot || !Array.isArray(refSnapshot.refIds)) return undefined;
-	const refIds = refSnapshot.refIds.filter((refId): refId is string => typeof refId === "string" && /^e\d+$/.test(refId));
-	const refRecord = isRecord(refSnapshot.refs) ? refSnapshot.refs : undefined;
-	const refEntries = refRecord
-		? Object.fromEntries(refIds.flatMap((refId) => {
-			const entry = refRecord[refId];
-			if (!isRecord(entry) || typeof entry.name !== "string" || typeof entry.role !== "string") return [];
-			const isContentEditable = typeof entry.isContentEditable === "boolean" ? entry.isContentEditable : undefined;
-			const isEditable = typeof entry.isEditable === "boolean" ? entry.isEditable : undefined;
-			return [[refId, { ...(isContentEditable !== undefined ? { isContentEditable } : {}), ...(isEditable !== undefined ? { isEditable } : {}), name: entry.name, role: entry.role }] as const];
-		}))
-		: undefined;
-	return {
-		refIds,
-		...(refEntries && Object.keys(refEntries).length > 0 ? { refs: refEntries } : {}),
-		target: isRecord(refSnapshot.target)
-			? normalizeSessionTabTarget({
-				title: typeof refSnapshot.target.title === "string" ? refSnapshot.target.title : undefined,
-				url: typeof refSnapshot.target.url === "string" ? refSnapshot.target.url : undefined,
-			  })
-			: undefined,
-	};
-}
-
-function getLatestTabTargetOrder(targets: Map<string, OrderedSessionTabTarget>, unknownTargets: Map<string, number>): number {
-	let latestOrder = 0;
-	for (const target of targets.values()) latestOrder = Math.max(latestOrder, target.order);
-	for (const order of unknownTargets.values()) latestOrder = Math.max(latestOrder, order);
-	return latestOrder;
-}
-
-function getLatestRefStateOrder(
-	snapshots: Map<string, OrderedSessionRefSnapshot>,
-	invalidations: Map<string, OrderedSessionRefSnapshotInvalidation>,
-): number {
-	let latestOrder = 0;
-	for (const snapshot of snapshots.values()) latestOrder = Math.max(latestOrder, snapshot.order);
-	for (const invalidation of invalidations.values()) latestOrder = Math.max(latestOrder, invalidation.order);
-	return latestOrder;
-}
-
-function shouldApplyTabTargetUpdate(current: { order: number } | undefined, unknownOrder: number | undefined, updateOrder: number): boolean {
-	return updateOrder >= Math.max(current?.order ?? 0, unknownOrder ?? 0);
-}
-
-function shouldApplyRefStateUpdate(options: {
-	currentInvalidation?: { order: number };
-	currentSnapshot?: { order: number };
-	updateOrder: number;
-}): boolean {
-	const currentOrder = Math.max(options.currentSnapshot?.order ?? 0, options.currentInvalidation?.order ?? 0);
-	return options.updateOrder >= currentOrder;
-}
-
-function stripRefSnapshotOrder(snapshot: OrderedSessionRefSnapshot | SessionRefSnapshot | undefined): SessionRefSnapshot | undefined {
-	return snapshot ? { refIds: snapshot.refIds, ...(snapshot.refs ? { refs: snapshot.refs } : {}), target: snapshot.target } : undefined;
-}
-
-function stripRefSnapshotInvalidationOrder(invalidation: OrderedSessionRefSnapshotInvalidation | SessionRefSnapshotInvalidation | undefined): SessionRefSnapshotInvalidation | undefined {
-	return invalidation ? { reason: invalidation.reason, summary: invalidation.summary } : undefined;
-}
-
-export function getSessionPageStateKey(sessionName: string | undefined, namespace?: string): string | undefined {
-	return sessionName ? getAgentBrowserSessionIdentityKey(sessionName, namespace) : undefined;
-}
+import { randomUUID } from "node:crypto";
+import {
+	getAgentBrowserSessionIdentityKey,
+	isAgentBrowserSessionIdentityKeyInNamespace,
+} from "./argv-grammar.js";
+import {
+	getBrowserRecord,
+	snapshotFromDefinition,
+	type BrowserRecord,
+	type BrowserPageChange,
+} from "./browser-transcript.js";
+import {
+	findReadConfirmation as findPendingReadConfirmation,
+	parseReadConfirmation,
+	type ReadConfirmation,
+} from "./read-confirmation.js";
+import {
+	buildPageTransitionRefSnapshotInvalidation,
+	stripRefSnapshotOrder,
+	stripRefSnapshotInvalidationOrder,
+	shouldApplyTabTargetUpdate,
+	shouldApplyRefStateUpdate,
+	type OrderedSessionTabTarget,
+	type OrderedSessionRefSnapshot,
+	type OrderedSessionRefSnapshotInvalidation,
+	type SessionTabTarget,
+	type SessionRefSnapshot,
+	type SessionRefSnapshotInvalidation,
+	type SessionTabPinningReason,
+	type SessionPageStateUpdateToken,
+	type SessionPageStateView,
+	type SessionPageStateUpdateResult,
+} from "./session-page-observation.js";
+export * from "./session-page-observation.js";
 
 export class SessionPageState {
+	private confirmActions = new Map<string, string>();
+	private readConfirmations = new Map<string, { order: number; value: ReadConfirmation }>();
 	private refSnapshotInvalidations = new Map<string, OrderedSessionRefSnapshotInvalidation>();
 	private refSnapshots = new Map<string, OrderedSessionRefSnapshot>();
 	private tabPinningReasons = new Map<string, SessionTabPinningReason>();
 	private tabTargetUnknownOrders = new Map<string, number>();
 	private tabTargets = new Map<string, OrderedSessionTabTarget>();
 	private updateOrder = 0;
+	private nativeGenerations = new Map<string, string>();
+	private pending = new Map<
+		string,
+		{ operationId: string; snapshot?: OrderedSessionRefSnapshot }
+	>();
 
-	static fromBranch(branch: unknown[]): SessionPageState {
+	static fromBranch(branch: readonly unknown[]): SessionPageState {
 		const state = new SessionPageState();
-		let restoredOrder = 0;
 		for (const entry of branch) {
-			if (!isRecord(entry) || entry.type !== "message") continue;
-			const message = isRecord(entry.message) ? entry.message : undefined;
-			if (!message || message.toolName !== "agent_browser") continue;
-			const details = isRecord(message.details) ? message.details : undefined;
-			if (!details) continue;
-			const sessionName = typeof details.sessionName === "string" ? details.sessionName : undefined;
-			const namespace = typeof details.namespace === "string" ? details.namespace : undefined;
-			const sessionKey = getSessionPageStateKey(sessionName, namespace);
-			const args = Array.isArray(details.args) && details.args.every((arg) => typeof arg === "string") ? details.args : [];
-			const commandTokens = extractUpstreamCommandTokens(args);
-			const command = typeof details.command === "string" ? details.command : commandTokens[0];
-			const subcommand = typeof details.subcommand === "string" ? details.subcommand : commandTokens[1];
-			const batchCloseLifecycle = getSuccessfulBatchCloseLifecycle(details.batchSteps);
-			const closeAllApplied = details.closeAllApplied === true
-				|| (message.isError !== true && isCloseAllCommand(commandTokens))
-				|| batchHasSuccessfulCloseAll(details.batchSteps);
-			if (closeAllApplied) {
-				restoredOrder += 1;
-				state.clearNamespace(namespace);
-				if (isCloseCommand(command) || batchCloseLifecycle?.endsClosed === true) continue;
-			}
-			if (!sessionKey) continue;
-			if (!closeAllApplied && ((isCloseCommand(command) && message.isError !== true) || batchCloseLifecycle)) {
-				restoredOrder += 1;
-				state.clearSession(sessionKey);
-				if (isCloseCommand(command) || batchCloseLifecycle?.endsClosed === true) continue;
-			}
-			const tabTarget = getRestoredSessionTabTarget(details, command, subcommand);
-			const tabTargetUnknown = details.sessionTabTargetUnknown === true;
-			const reopenPending = typeof details.sessionTabReopenPending === "boolean" ? details.sessionTabReopenPending : undefined;
-			const refSnapshotInvalidation = getRestoredRefSnapshotInvalidation(details, command);
-			const refSnapshot = refSnapshotInvalidation ? undefined : getRestoredRefSnapshot(details);
-			if (!tabTarget && !tabTargetUnknown && !refSnapshotInvalidation && !refSnapshot && reopenPending === undefined) continue;
-			restoredOrder += 1;
-			if (tabTargetUnknown) {
-				state.refSnapshots.delete(sessionKey);
-				if (refSnapshotInvalidation) state.refSnapshotInvalidations.set(sessionKey, { ...refSnapshotInvalidation, order: restoredOrder });
-				else state.refSnapshotInvalidations.delete(sessionKey);
-				state.tabTargets.delete(sessionKey);
-				state.tabTargetUnknownOrders.set(sessionKey, restoredOrder);
-				continue;
-			}
-			if (tabTarget) {
-				state.tabTargetUnknownOrders.delete(sessionKey);
-				state.tabTargets.set(sessionKey, { order: restoredOrder, reopenPending: state.tabTargets.get(sessionKey)?.reopenPending, target: tabTarget });
-			}
-			const currentTarget = state.tabTargets.get(sessionKey);
-			if (currentTarget && reopenPending !== undefined) currentTarget.reopenPending = reopenPending;
-			if (refSnapshotInvalidation) {
-				state.refSnapshots.delete(sessionKey);
-				state.refSnapshotInvalidations.set(sessionKey, { ...refSnapshotInvalidation, order: restoredOrder });
-			} else if (refSnapshot) {
-				state.refSnapshotInvalidations.delete(sessionKey);
-				state.refSnapshots.set(sessionKey, { ...refSnapshot, order: restoredOrder });
+			const record = getBrowserRecord(entry);
+			if (record) {
+				state.applyBrowserRecord(record);
 			}
 		}
-		state.updateOrder = Math.max(
-			restoredOrder,
-			getLatestTabTargetOrder(state.tabTargets, state.tabTargetUnknownOrders),
-			getLatestRefStateOrder(state.refSnapshots, state.refSnapshotInvalidations),
-		);
-		state.tabPinningReasons = new Map([...state.tabTargets.keys()].map((sessionName) => [sessionName, "restore"]));
+		for (const key of state.tabTargets.keys()) {
+			state.tabPinningReasons.set(key, "restore");
+		}
 		return state;
+	}
+
+	/** A command operates on its admitted state while the committed view is unavailable. */
+	fork(): SessionPageState {
+		const state = new SessionPageState();
+		state.confirmActions = new Map(this.confirmActions);
+		state.readConfirmations = new Map(this.readConfirmations);
+		state.refSnapshotInvalidations = new Map(this.refSnapshotInvalidations);
+		state.refSnapshots = new Map(this.refSnapshots);
+		state.tabPinningReasons = new Map(this.tabPinningReasons);
+		state.tabTargetUnknownOrders = new Map(this.tabTargetUnknownOrders);
+		state.tabTargets = new Map([...this.tabTargets].map(([key, value]) => [key, { ...value }]));
+		state.pending = new Map(this.pending);
+		state.nativeGenerations = new Map(this.nativeGenerations);
+		state.updateOrder = this.updateOrder;
+		return state;
+	}
+
+	views(): Map<string, SessionPageStateView> {
+		return new Map(
+			[
+				...new Set([
+					...this.confirmActions.keys(),
+					...this.tabTargets.keys(),
+					...this.tabTargetUnknownOrders.keys(),
+					...this.refSnapshots.keys(),
+					...this.refSnapshotInvalidations.keys(),
+				]),
+			].map((key) => [key, this.get(key)]),
+		);
+	}
+
+	/** The same reducer commits live observations and replays selected journal envelopes. */
+	applyBrowserRecord({ event, snapshot }: BrowserRecord): void {
+		const update = this.beginUpdate();
+		const confirmation = parseReadConfirmation(event.state.readConfirmation);
+		for (const page of event.pages ?? []) {
+			this.applyPageRecord({ page, event, snapshot, update });
+		}
+		if (confirmation) {
+			this.applyReadConfirmation(confirmation, update);
+		}
+	}
+
+	private applyPageRecord(options: {
+		readonly page: BrowserPageChange;
+		readonly event: BrowserRecord["event"];
+		readonly snapshot?: unknown;
+		readonly update: SessionPageStateUpdateToken;
+	}): void {
+		const { page, event, snapshot, update } = options;
+		const key = page.key;
+		if (page.clear === true) {
+			this.clearSession(key);
+			return;
+		}
+		const pending = this.pending.get(key);
+		if (event.phase === "finish" && pending && pending.operationId !== event.operationId) {
+			return;
+		}
+		if (page.confirmActions !== undefined) {
+			this.setConfirmActions(key, page.confirmActions ?? undefined);
+		}
+		if (this.applyUnknownPageRecord(page, event, update)) {
+			return;
+		}
+		this.applyPageTargetRecord(page, update);
+		this.applyPageRefsRecord({
+			page,
+			snapshot,
+			candidate: pending?.snapshot ?? this.refSnapshots.get(key),
+			update,
+		});
+		this.pending.delete(key);
+	}
+
+	private applyUnknownPageRecord(
+		page: BrowserPageChange,
+		event: BrowserRecord["event"],
+		update: SessionPageStateUpdateToken,
+	): boolean {
+		const key = page.key;
+		if (event.phase === "begin") {
+			this.pending.set(key, {
+				operationId: event.operationId,
+				snapshot: this.refSnapshots.get(key) ?? this.pending.get(key)?.snapshot,
+			});
+			this.invalidateUnknownPage(
+				key,
+				update,
+				buildPageTransitionRefSnapshotInvalidation(
+					"This browser operation has no persisted finish. Inspect the current URL and take a fresh snapshot before using refs; changes may already have happened.",
+				),
+			);
+			return true;
+		}
+		if (page.unknown === true || page.refs.kind === "unknown") {
+			this.invalidateUnknownPage(
+				key,
+				update,
+				page.refs.kind === "unknown" && page.refs.invalidation
+					? page.refs.invalidation
+					: buildPageTransitionRefSnapshotInvalidation(
+							"The browser target or operation outcome is unknown. Verify the current URL and take a fresh snapshot before using refs.",
+						),
+			);
+			return true;
+		}
+		return false;
+	}
+
+	private invalidateUnknownPage(
+		key: string,
+		update: SessionPageStateUpdateToken,
+		invalidation: SessionRefSnapshotInvalidation,
+	): void {
+		this.markTabTargetUnknown({ sessionName: key, update });
+		this.applyRefSnapshotInvalidation({ sessionName: key, update, invalidation });
+	}
+
+	private applyPageTargetRecord(
+		page: BrowserPageChange,
+		update: SessionPageStateUpdateToken,
+	): void {
+		if (page.target) {
+			this.applyTabTarget({ sessionName: page.key, target: page.target, update });
+		} else {
+			this.tabTargets.delete(page.key);
+			this.tabTargetUnknownOrders.delete(page.key);
+		}
+		if (page.reopenPending !== undefined) {
+			this.setTabReopenPending({ pending: page.reopenPending, sessionName: page.key, update });
+		}
+		if (page.pinningReason !== undefined) {
+			this.markPinning(page.key, page.pinningReason);
+		} else {
+			this.tabPinningReasons.delete(page.key);
+		}
+	}
+
+	private applyPageRefsRecord(options: {
+		readonly page: BrowserPageChange;
+		readonly snapshot?: unknown;
+		readonly candidate?: OrderedSessionRefSnapshot;
+		readonly update: SessionPageStateUpdateToken;
+	}): void {
+		const { page, snapshot, candidate, update } = options;
+		const key = page.key;
+		if (page.refs.kind === "replace") {
+			const definition =
+				isRecord(snapshot) && snapshot.id === page.refs.snapshotId && Boolean(snapshot.refs)
+					? snapshotFromDefinition(snapshot)
+					: { snapshotId: page.refs.snapshotId, refIds: [] };
+			this.applyRefSnapshot({
+				sessionName: key,
+				snapshot: definition,
+				fallbackTarget: page.target,
+				update,
+			});
+		} else if (page.refs.kind === "reuse") {
+			if (candidate?.snapshotId === page.refs.snapshotId) {
+				this.applyRefSnapshot({
+					sessionName: key,
+					snapshot: candidate,
+					fallbackTarget: page.target,
+					update,
+				});
+			} else {
+				this.applyRefSnapshotInvalidation({
+					sessionName: key,
+					update,
+					invalidation: buildPageTransitionRefSnapshotInvalidation(
+						"The ancestral snapshot definition is unavailable. Take a new complete snapshot before using refs.",
+					),
+				});
+			}
+		} else {
+			this.refSnapshots.delete(key);
+			if (page.refs.invalidation) {
+				this.applyRefSnapshotInvalidation({
+					sessionName: key,
+					invalidation: page.refs.invalidation,
+					update,
+				});
+			} else {
+				this.refSnapshotInvalidations.delete(key);
+			}
+		}
 	}
 
 	beginUpdate(): SessionPageStateUpdateToken {
 		this.updateOrder += 1;
+		// This sole constructor brands the privately incremented numeric order without changing runtime comparison semantics.
+		// oxlint-disable-next-line typescript/no-unsafe-type-assertion
 		return this.updateOrder as SessionPageStateUpdateToken;
 	}
 
 	reset(): void {
-		this.refSnapshotInvalidations = new Map<string, OrderedSessionRefSnapshotInvalidation>();
-		this.refSnapshots = new Map<string, OrderedSessionRefSnapshot>();
-		this.tabPinningReasons = new Map<string, SessionTabPinningReason>();
-		this.tabTargetUnknownOrders = new Map<string, number>();
-		this.tabTargets = new Map<string, OrderedSessionTabTarget>();
+		this.confirmActions.clear();
+		this.readConfirmations.clear();
+		this.pending.clear();
+		this.nativeGenerations.clear();
+		this.refSnapshotInvalidations = new Map();
+		this.refSnapshots = new Map();
+		this.tabPinningReasons = new Map();
+		this.tabTargetUnknownOrders = new Map();
+		this.tabTargets = new Map();
 		this.updateOrder = 0;
 	}
 
 	get(sessionName: string | undefined): SessionPageStateView {
-		if (!sessionName) return {};
+		if (sessionName === undefined || sessionName.length === 0) {
+			return {};
+		}
 		return {
+			...(this.confirmActions.has(sessionName)
+				? { confirmActions: this.confirmActions.get(sessionName) }
+				: {}),
 			pinningReason: this.tabPinningReasons.get(sessionName),
-			...(this.tabTargets.get(sessionName)?.reopenPending !== undefined ? { tabReopenPending: this.tabTargets.get(sessionName)?.reopenPending } : {}),
+			...(this.tabTargets.get(sessionName)?.reopenPending !== undefined
+				? { tabReopenPending: this.tabTargets.get(sessionName)?.reopenPending }
+				: {}),
 			refSnapshot: stripRefSnapshotOrder(this.refSnapshots.get(sessionName)),
-			refSnapshotInvalidation: stripRefSnapshotInvalidationOrder(this.refSnapshotInvalidations.get(sessionName)),
+			refSnapshotInvalidation: stripRefSnapshotInvalidationOrder(
+				this.refSnapshotInvalidations.get(sessionName),
+			),
 			...(this.tabTargetUnknownOrders.has(sessionName) ? { tabTargetUnknown: true as const } : {}),
 			tabTarget: this.tabTargets.get(sessionName)?.target,
 		};
 	}
 
+	findReadConfirmation(
+		args: readonly string[],
+		namespace?: string,
+		stdin?: string,
+	): ReadConfirmation | undefined {
+		return findPendingReadConfirmation(
+			args,
+			[...this.readConfirmations.values()].map((entry) => entry.value),
+			namespace,
+			stdin,
+		);
+	}
+	setConfirmActions(sessionName: string, value: string | undefined): void {
+		if (value !== undefined) {
+			this.confirmActions.set(sessionName, value);
+		} else {
+			this.confirmActions.delete(sessionName);
+		}
+	}
+	getReadConfirmation(sessionKey: string): ReadConfirmation | undefined {
+		return this.readConfirmations.get(sessionKey)?.value;
+	}
+	applyReadConfirmation(value: ReadConfirmation, update: SessionPageStateUpdateToken): void {
+		const key = getAgentBrowserSessionIdentityKey(value.sessionName, value.namespace);
+		if (update >= (this.readConfirmations.get(key)?.order ?? 0)) {
+			this.readConfirmations.set(key, { value, order: update });
+		}
+	}
 	applyTabTarget(options: {
-		sessionName: string;
-		target: SessionTabTarget;
-		update: SessionPageStateUpdateToken;
+		readonly sessionName: string;
+		readonly target: SessionTabTarget;
+		readonly update: SessionPageStateUpdateToken;
 	}): SessionPageStateUpdateResult {
 		const current = this.tabTargets.get(options.sessionName);
-		if (!shouldApplyTabTargetUpdate(current, this.tabTargetUnknownOrders.get(options.sessionName), options.update)) {
+		if (
+			!shouldApplyTabTargetUpdate(
+				current,
+				this.tabTargetUnknownOrders.get(options.sessionName),
+				options.update,
+			)
+		) {
 			return { ...this.get(options.sessionName), applied: false, stale: true };
 		}
 		this.tabTargetUnknownOrders.delete(options.sessionName);
-		this.tabTargets.set(options.sessionName, { order: options.update, reopenPending: current?.reopenPending, target: options.target });
+		this.tabTargets.set(options.sessionName, {
+			order: options.update,
+			reopenPending: current?.reopenPending,
+			target: options.target,
+		});
 		return { ...this.get(options.sessionName), applied: true };
 	}
-
-	setTabReopenPending(options: { pending: boolean; sessionName: string; update: SessionPageStateUpdateToken }): void {
+	setTabReopenPending(options: {
+		readonly pending: boolean;
+		readonly sessionName: string;
+		readonly update: SessionPageStateUpdateToken;
+	}): void {
 		const current = this.tabTargets.get(options.sessionName);
-		if (!current || !shouldApplyTabTargetUpdate(current, this.tabTargetUnknownOrders.get(options.sessionName), options.update)) return;
-		this.tabTargets.set(options.sessionName, { ...current, order: options.update, reopenPending: options.pending });
+		if (
+			!current ||
+			!shouldApplyTabTargetUpdate(
+				current,
+				this.tabTargetUnknownOrders.get(options.sessionName),
+				options.update,
+			)
+		) {
+			return;
+		}
+		this.tabTargets.set(options.sessionName, {
+			...current,
+			order: options.update,
+			reopenPending: options.pending,
+		});
 	}
-
 	applyRefSnapshot(options: {
-		fallbackTarget?: SessionTabTarget;
-		sessionName: string;
-		snapshot: SessionRefSnapshot;
-		update: SessionPageStateUpdateToken;
+		readonly fallbackTarget?: SessionTabTarget;
+		readonly sessionName: string;
+		readonly snapshot: SessionRefSnapshot;
+		readonly update: SessionPageStateUpdateToken;
 	}): SessionPageStateUpdateResult {
-		if (!shouldApplyRefStateUpdate({
-			currentInvalidation: this.refSnapshotInvalidations.get(options.sessionName),
-			currentSnapshot: this.refSnapshots.get(options.sessionName),
-			updateOrder: options.update,
-		})) {
+		if (
+			!shouldApplyRefStateUpdate({
+				currentInvalidation: this.refSnapshotInvalidations.get(options.sessionName),
+				currentSnapshot: this.refSnapshots.get(options.sessionName),
+				updateOrder: options.update,
+			})
+		) {
 			return { ...this.get(options.sessionName), applied: false, stale: true };
 		}
-		const snapshot = { ...options.snapshot, target: options.snapshot.target ?? options.fallbackTarget };
+		const snapshot = {
+			...options.snapshot,
+			generation: options.snapshot.generation ?? this.nativeGenerations.get(options.sessionName),
+			snapshotId: options.snapshot.snapshotId ?? randomUUID(),
+			target: options.snapshot.target ?? options.fallbackTarget,
+		};
 		this.refSnapshotInvalidations.delete(options.sessionName);
 		this.refSnapshots.set(options.sessionName, { ...snapshot, order: options.update });
 		return { ...this.get(options.sessionName), applied: true };
 	}
-
+	bindSnapshotGeneration(sessionName: string, generation: string | undefined): void {
+		if (generation !== undefined && generation.length > 0) {
+			this.nativeGenerations.set(sessionName, generation);
+		} else {
+			this.nativeGenerations.delete(sessionName);
+		}
+		const snapshot = this.refSnapshots.get(sessionName);
+		if (snapshot) {
+			this.refSnapshots.set(sessionName, { ...snapshot, generation });
+		}
+	}
 	applyRefSnapshotInvalidation(options: {
-		invalidation: SessionRefSnapshotInvalidation;
-		sessionName: string;
-		update: SessionPageStateUpdateToken;
+		readonly invalidation: SessionRefSnapshotInvalidation;
+		readonly sessionName: string;
+		readonly update: SessionPageStateUpdateToken;
 	}): SessionPageStateUpdateResult {
-		if (!shouldApplyRefStateUpdate({
-			currentInvalidation: this.refSnapshotInvalidations.get(options.sessionName),
-			currentSnapshot: this.refSnapshots.get(options.sessionName),
-			updateOrder: options.update,
-		})) {
+		if (
+			!shouldApplyRefStateUpdate({
+				currentInvalidation: this.refSnapshotInvalidations.get(options.sessionName),
+				currentSnapshot: this.refSnapshots.get(options.sessionName),
+				updateOrder: options.update,
+			})
+		) {
 			return { ...this.get(options.sessionName), applied: false, stale: true };
 		}
 		this.refSnapshots.delete(options.sessionName);
-		this.refSnapshotInvalidations.set(options.sessionName, { ...options.invalidation, order: options.update });
+		this.refSnapshotInvalidations.set(options.sessionName, {
+			...options.invalidation,
+			order: options.update,
+		});
 		return { ...this.get(options.sessionName), applied: true };
 	}
-
-	markTabTargetUnknown(options: { sessionName: string; update: SessionPageStateUpdateToken }): SessionPageStateUpdateResult {
+	markTabTargetUnknown(options: {
+		readonly sessionName: string;
+		readonly update: SessionPageStateUpdateToken;
+	}): SessionPageStateUpdateResult {
 		const current = this.tabTargets.get(options.sessionName);
-		if (!shouldApplyTabTargetUpdate(current, this.tabTargetUnknownOrders.get(options.sessionName), options.update)) return { ...this.get(options.sessionName), applied: false, stale: true };
+		if (
+			!shouldApplyTabTargetUpdate(
+				current,
+				this.tabTargetUnknownOrders.get(options.sessionName),
+				options.update,
+			)
+		) {
+			return { ...this.get(options.sessionName), applied: false, stale: true };
+		}
 		this.refSnapshotInvalidations.delete(options.sessionName);
 		this.refSnapshots.delete(options.sessionName);
 		this.tabPinningReasons.delete(options.sessionName);
@@ -580,17 +443,21 @@ export class SessionPageState {
 		this.tabTargetUnknownOrders.set(options.sessionName, options.update);
 		return { ...this.get(options.sessionName), applied: true };
 	}
-
 	clearSession(sessionName: string): void {
+		this.confirmActions.delete(sessionName);
+		this.pending.delete(sessionName);
+		this.nativeGenerations.delete(sessionName);
+		this.readConfirmations.delete(sessionName);
 		this.refSnapshotInvalidations.delete(sessionName);
 		this.refSnapshots.delete(sessionName);
 		this.tabPinningReasons.delete(sessionName);
 		this.tabTargetUnknownOrders.delete(sessionName);
 		this.tabTargets.delete(sessionName);
 	}
-
 	clearNamespace(namespace?: string): void {
 		const sessionKeys = new Set([
+			...this.confirmActions.keys(),
+			...this.readConfirmations.keys(),
 			...this.refSnapshotInvalidations.keys(),
 			...this.refSnapshots.keys(),
 			...this.tabPinningReasons.keys(),
@@ -598,14 +465,14 @@ export class SessionPageState {
 			...this.tabTargets.keys(),
 		]);
 		for (const sessionKey of sessionKeys) {
-			if (isAgentBrowserSessionIdentityKeyInNamespace(sessionKey, namespace)) this.clearSession(sessionKey);
+			if (isAgentBrowserSessionIdentityKeyInNamespace(sessionKey, namespace)) {
+				this.clearSession(sessionKey);
+			}
 		}
 	}
-
 	markPinning(sessionName: string, reason: SessionTabPinningReason): void {
 		this.tabPinningReasons.set(sessionName, reason);
 	}
-
 	clearRestorePinning(sessionName: string): void {
 		if (this.tabPinningReasons.get(sessionName) === "restore") {
 			this.tabPinningReasons.delete(sessionName);

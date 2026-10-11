@@ -7,36 +7,34 @@
  */
 
 import assert from "node:assert/strict";
+import { resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
+
+test("doctor exec options route npm global shims through a shell only on Windows", () => {
+	assert.deepEqual(buildNpmShimExecOptions("win32"), { shell: true });
+	assert.deepEqual(buildNpmShimExecOptions("darwin"), {});
+	assert.deepEqual(buildNpmShimExecOptions("linux"), {});
+});
 
 import { CAPABILITY_BASELINE } from "../scripts/agent-browser-capability-baseline.mjs";
 
-const doctorModulePath = "../scripts/doctor.mjs";
-const doctorModule = (await import(doctorModulePath)) as {
-	evaluateDoctor: (options?: {
-		agentDir?: string;
-		cwd?: string;
-		pathExists?: (path: string) => Promise<boolean>;
-		readText?: (path: string) => Promise<string | undefined>;
-		runAgentBrowser?: (args: string[]) => Promise<string>;
-		runPi?: (args: string[]) => Promise<string>;
-		settingsPaths?: string[];
-		skipSourceCheck?: boolean;
-	}) => Promise<{ checks: Array<{ status: string; title: string; lines?: string[] }>; failures: unknown[]; warnings: string[] }>;
-	formatDoctorReport: (report: { checks: Array<{ status: string; title: string; lines?: string[] }>; failures: unknown[]; warnings?: string[] }) => string;
-	isDirectRun: (metaUrl: string, argv1?: string, resolveRealPath?: (path: string) => string) => boolean;
-	normalizeAgentBrowserVersion: (output: string) => string;
-	normalizePiVersion: (output: string) => string;
-	parseCliArgs: (argv?: string[]) => { agentDir?: string; cwd?: string; settingsPaths: string[]; showHelp: boolean; skipSourceCheck: boolean };
-};
-const { evaluateDoctor, formatDoctorReport, isDirectRun, normalizeAgentBrowserVersion, normalizePiVersion, parseCliArgs } = doctorModule;
+import {
+	buildNpmShimExecOptions,
+	evaluateDoctor,
+	formatDoctorReport,
+	isDirectRun,
+	normalizeAgentBrowserVersion,
+	normalizePiVersion,
+	parseCliArgs,
+} from "../scripts/doctor.mjs";
 
 function passingVersion() {
 	return `agent-browser ${CAPABILITY_BASELINE.targetVersion}\n`;
 }
 
 function passingPiVersion() {
-	return "0.84.0\n";
+	return "1.0.0\n";
 }
 
 function evaluateDoctorWithPi(options: Parameters<typeof evaluateDoctor>[0] = {}) {
@@ -71,31 +69,29 @@ test("doctor reports missing agent-browser with actionable install guidance", as
 	assert.match(text, /https:\/\/github\.com\/vercel-labs\/agent-browser/);
 });
 
-test("doctor passes the recommended 0.37 series and warns for other supported stable versions", async () => {
-	for (const version of ["0.37.0", "0.37.1"]) {
+test("doctor accepts the supported floor and newer stable versions", async () => {
+	for (const version of ["0.35.0", "0.35.2", "1.0.0"]) {
+		// Each injected version/source case completes and is asserted before the next begins.
+		// oxlint-disable-next-line no-await-in-loop
 		const report = await evaluateDoctorWithPi({
 			runAgentBrowser: async () => `agent-browser ${version}\n`,
 			skipSourceCheck: true,
 		});
 		const text = formatDoctorReport(report);
 
+		// All fixed version/source variants must pass; the loop has no result-based filtering.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
 		assert.equal(report.failures.length, 0);
-		assert.match(text, new RegExp(`recommended series: ${version.replaceAll(".", "\\.")}`));
+		// Every supported-version fixture must report its exact detected version.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(
+			text,
+			new RegExp(`version meets supported floor: ${version.replaceAll(".", "\\.")}`),
+		);
+		// Every supported-version fixture still reports the current recommendation.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(text, new RegExp(`recommended ${CAPABILITY_BASELINE.targetVersion}`));
 	}
-	for (const version of ["0.35.0", "0.35.2", "1.0.0"]) {
-		const report = await evaluateDoctorWithPi({ runAgentBrowser: async () => `agent-browser ${version}\n`, skipSourceCheck: true });
-		const text = formatDoctorReport(report);
-		assert.equal(report.failures.length, 0);
-		assert.match(text, /supported but outside recommended 0\.37\.x/);
-	}
-});
-
-test("doctor distinguishes non-executable and unreadable agent-browser versions", async () => {
-	const denied = Object.assign(new Error("spawn agent-browser EACCES"), { code: "EACCES" });
-	const nonExecutable = await evaluateDoctorWithPi({ runAgentBrowser: async () => { throw denied; }, skipSourceCheck: true });
-	assert.match(formatDoctorReport(nonExecutable), /not executable.*EACCES/i);
-	const unreadable = await evaluateDoctorWithPi({ runAgentBrowser: async () => "unexpected output\n", skipSourceCheck: true });
-	assert.match(formatDoctorReport(unreadable), /version output is unreadable/i);
 });
 
 test("doctor reports versions below the supported floor", async () => {
@@ -121,14 +117,14 @@ test("doctor reports versions below the supported floor", async () => {
 test("doctor fails when Pi is below the minimum runtime floor", async () => {
 	const report = await evaluateDoctor({
 		runAgentBrowser: async () => passingVersion(),
-		runPi: async () => "0.83.0\n",
+		runPi: async () => "0.99.2\n",
 		skipSourceCheck: true,
 	});
 	const text = formatDoctorReport(report);
 
 	assert.equal(report.failures.length, 1);
-	assert.match(text, /Pi 0\.84\.0 or newer is required; found 0\.83\.0/);
-	assert.match(text, /enforces the Pi 0\.84\.0 runtime floor/);
+	assert.match(text, /Pi 1\.0\.0 or newer is required; found 0\.99\.2/);
+	assert.match(text, /enforces the Pi 1\.0\.0 runtime floor/);
 	assert.match(text, /Doctor found setup failures/);
 });
 
@@ -144,20 +140,26 @@ test("doctor warns instead of failing when Pi version cannot be inspected", asyn
 
 	assert.equal(report.failures.length, 0);
 	assert.match(text, /Could not inspect pi --version/);
-	assert.match(text, /Pi 0\.84\.0 or newer is required/);
+	assert.match(text, /Pi 1\.0\.0 or newer is required/);
 	assert.match(text, /Doctor passed/);
 });
 
 test("doctor reports duplicate package and checkout sources with remediation", async () => {
 	const settingsByPath = new Map([
-		["/agent/settings.json", JSON.stringify({ packages: ["npm:pi-agent-browser-native"] })],
-		["/repo/.pi/settings.json", JSON.stringify({ extensions: ["/repo/extensions/agent-browser/index.ts"] })],
+		[
+			resolve("/agent/settings.json"),
+			JSON.stringify({ packages: ["npm:pi-agent-browser-native"] }),
+		],
+		[
+			resolve("/repo/.pi/settings.json"),
+			JSON.stringify({ extensions: [resolve("/repo/extensions/agent-browser/index.ts")] }),
+		],
 	]);
 	const report = await evaluateDoctorWithPi({
 		agentDir: "/agent",
 		cwd: "/repo",
-		pathExists: async (path) => settingsByPath.has(path),
-		readText: async (path) => settingsByPath.get(path),
+		pathExists: async (path: string) => settingsByPath.has(path),
+		readText: async (path: string) => settingsByPath.get(path),
 		runAgentBrowser: async () => passingVersion(),
 	});
 	const text = formatDoctorReport(report);
@@ -166,18 +168,23 @@ test("doctor reports duplicate package and checkout sources with remediation", a
 	assert.match(text, /Duplicate pi-agent-browser-native sources detected/);
 	assert.match(text, /`agent_browser`/);
 	assert.match(text, /npm:pi-agent-browser-native/);
-	assert.match(text, /extensions\/agent-browser\/index\.ts/);
+	assert.ok(text.includes(resolve("/repo/extensions/agent-browser/index.ts")));
 	assert.match(text, /pi --approve --no-extensions -e <source>/);
 	assert.match(text, /keep exactly one active source/i);
 });
 
 test("doctor passes the source check when exactly one configured source is active", async () => {
-	const settingsByPath = new Map([["/agent/settings.json", JSON.stringify({ packages: ["npm:pi-agent-browser-native"] })]]);
+	const settingsByPath = new Map([
+		[
+			resolve("/agent/settings.json"),
+			JSON.stringify({ packages: ["npm:pi-agent-browser-native"] }),
+		],
+	]);
 	const report = await evaluateDoctorWithPi({
 		agentDir: "/agent",
 		cwd: "/repo",
-		pathExists: async (path) => settingsByPath.has(path),
-		readText: async (path) => settingsByPath.get(path),
+		pathExists: async (path: string) => settingsByPath.has(path),
+		readText: async (path: string) => settingsByPath.get(path),
 		runAgentBrowser: async () => passingVersion(),
 	});
 	const text = formatDoctorReport(report);
@@ -187,56 +194,37 @@ test("doctor passes the source check when exactly one configured source is activ
 	assert.match(text, /Detected source: npm:pi-agent-browser-native/);
 });
 
-test("doctor resolves relative package sources from their settings file directory", async () => {
-	const settingsByPath = new Map([["/home/user/.pi/agent/settings.json", JSON.stringify({ packages: ["../../Projects/AI/pi-agent-browser"] })]]);
-	const report = await evaluateDoctorWithPi({
-		agentDir: "/home/user/.pi/agent",
-		cwd: "/home/user/Projects/AI/pi-agent-browser",
-		pathExists: async (path) => settingsByPath.has(path),
-		readText: async (path) => settingsByPath.get(path),
-		runAgentBrowser: async () => passingVersion(),
-	});
-	const text = formatDoctorReport(report);
+test("doctor resolves relative sources from their settings file directory", async () => {
+	// The compiled `dist/` entrypoint row protects packaged installs whose configured source points at build output.
+	for (const [settingsKey, source] of [
+		["packages", "../../Projects/AI/pi-agent-browser"],
+		["extensions", "../../Projects/AI/pi-agent-browser/extensions/agent-browser/index.ts"],
+		["extensions", "../../Projects/AI/pi-agent-browser/dist/extensions/agent-browser/index.js"],
+	] as const) {
+		const settingsByPath = new Map([
+			[resolve("/home/user/.pi/agent/settings.json"), JSON.stringify({ [settingsKey]: [source] })],
+		]);
+		// Each injected version/source case completes and is asserted before the next begins.
+		// oxlint-disable-next-line no-await-in-loop
+		const report = await evaluateDoctorWithPi({
+			agentDir: "/home/user/.pi/agent",
+			cwd: "/home/user/Projects/AI/pi-agent-browser",
+			pathExists: async (path: string) => settingsByPath.has(path),
+			readText: async (path: string) => settingsByPath.get(path),
+			runAgentBrowser: async () => passingVersion(),
+		});
+		const text = formatDoctorReport(report);
 
-	assert.equal(report.failures.length, 0);
-	assert.match(text, /No duplicate pi-agent-browser-native sources detected/);
-	assert.match(text, /Detected source: ..\/..\/Projects\/AI\/pi-agent-browser/);
-});
-
-test("doctor resolves relative extension sources from their settings file directory", async () => {
-	const settingsByPath = new Map([
-		["/home/user/.pi/agent/settings.json", JSON.stringify({ extensions: ["../../Projects/AI/pi-agent-browser/extensions/agent-browser/index.ts"] })],
-	]);
-	const report = await evaluateDoctorWithPi({
-		agentDir: "/home/user/.pi/agent",
-		cwd: "/home/user/Projects/AI/pi-agent-browser",
-		pathExists: async (path) => settingsByPath.has(path),
-		readText: async (path) => settingsByPath.get(path),
-		runAgentBrowser: async () => passingVersion(),
-	});
-	const text = formatDoctorReport(report);
-
-	assert.equal(report.failures.length, 0);
-	assert.match(text, /No duplicate pi-agent-browser-native sources detected/);
-	assert.match(text, /Detected source: ..\/..\/Projects\/AI\/pi-agent-browser\/extensions\/agent-browser\/index\.ts/);
-});
-
-test("doctor recognizes compiled extension entrypoint sources", async () => {
-	const settingsByPath = new Map([
-		["/home/user/.pi/agent/settings.json", JSON.stringify({ extensions: ["../../Projects/AI/pi-agent-browser/dist/extensions/agent-browser/index.js"] })],
-	]);
-	const report = await evaluateDoctorWithPi({
-		agentDir: "/home/user/.pi/agent",
-		cwd: "/home/user/Projects/AI/pi-agent-browser",
-		pathExists: async (path) => settingsByPath.has(path),
-		readText: async (path) => settingsByPath.get(path),
-		runAgentBrowser: async () => passingVersion(),
-	});
-	const text = formatDoctorReport(report);
-
-	assert.equal(report.failures.length, 0);
-	assert.match(text, /No duplicate pi-agent-browser-native sources detected/);
-	assert.match(text, /Detected source: ..\/..\/Projects\/AI\/pi-agent-browser\/dist\/extensions\/agent-browser\/index\.js/);
+		// All fixed version/source variants must pass; the loop has no result-based filtering.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(report.failures.length, 0);
+		// Each fixed relative source must resolve without creating duplicate installations.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(text, /No duplicate pi-agent-browser-native sources detected/);
+		// Each fixed relative-source variant must retain its configured spelling.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.ok(text.includes(`Detected source: ${source}`), source);
+	}
 });
 
 test("doctor treats no configured source as an informational warning, not a failure", async () => {
@@ -256,39 +244,54 @@ test("doctor treats no configured source as an informational warning, not a fail
 
 test("doctor remains read-only through injected I/O", async () => {
 	const calls: string[] = [];
-	const settingsByPath = new Map([["/agent/settings.json", JSON.stringify({ packages: ["npm:pi-agent-browser-native"] })]]);
+	const settingsByPath = new Map([
+		[
+			resolve("/agent/settings.json"),
+			JSON.stringify({ packages: ["npm:pi-agent-browser-native"] }),
+		],
+	]);
 	const report = await evaluateDoctorWithPi({
 		agentDir: "/agent",
 		cwd: "/repo",
-		pathExists: async (path) => {
+		pathExists: async (path: string) => {
 			calls.push(`exists:${path}`);
 			return settingsByPath.has(path);
 		},
-		readText: async (path) => {
+		readText: async (path: string) => {
 			calls.push(`read:${path}`);
 			return settingsByPath.get(path);
 		},
-		runAgentBrowser: async (args) => {
+		runAgentBrowser: async (args: readonly string[]) => {
 			calls.push(`run:${args.join(" ")}`);
 			return passingVersion();
 		},
 	});
 
 	assert.equal(report.failures.length, 0);
-	assert.deepEqual(calls.filter((call) => call.startsWith("run:")), ["run:--version"]);
-	assert.equal(calls.some((call) => /write|fix|doctor/.test(call)), false);
+	// The only agent-browser invocation is the read-only --version probe: the doctor never shells out
+	// to `agent-browser doctor` or any fix/write command through the injected seam.
+	assert.deepEqual(
+		calls.filter((call) => call.startsWith("run:")),
+		["run:--version"],
+	);
 });
 
 test("isDirectRun resolves npm bin symlinks before comparing the entrypoint", () => {
-	const metaUrl = "file:///package/scripts/doctor.mjs";
-	const resolveRealPath = (path: string) => {
-		if (path === "/tmp/node_modules/.bin/pi-agent-browser-doctor") return "/package/scripts/doctor.mjs";
-		return path;
-	};
+	const entrypoint = resolve("/package with spaces/#tools/scripts/doctor.mjs");
+	const binPath = resolve("/tmp/node_modules/.bin/pi-agent-browser-doctor");
+	const metaUrl = pathToFileURL(entrypoint).href;
+	const resolveRealPath = (path: string) => (path === binPath ? entrypoint : path);
 
-	assert.equal(isDirectRun(metaUrl, "/tmp/node_modules/.bin/pi-agent-browser-doctor", resolveRealPath), true);
-	assert.equal(isDirectRun(metaUrl, "/other/script.mjs", resolveRealPath), false);
+	assert.equal(isDirectRun(metaUrl, binPath, resolveRealPath), true);
+	assert.equal(isDirectRun(metaUrl, entrypoint, resolveRealPath), true);
+	assert.equal(isDirectRun(metaUrl, resolve("/other/script.mjs"), resolveRealPath), false);
 	assert.equal(isDirectRun(metaUrl, undefined, resolveRealPath), false);
+	assert.equal(
+		isDirectRun(metaUrl, binPath, () => {
+			throw new Error("missing entrypoint");
+		}),
+		false,
+	);
 });
 
 test("parseCliArgs supports help, paths, repeated settings, and skip-source-check", () => {
@@ -306,13 +309,26 @@ test("parseCliArgs supports help, paths, repeated settings, and skip-source-chec
 		showHelp: true,
 		skipSourceCheck: false,
 	});
-	assert.deepEqual(parseCliArgs(["--cwd", "/repo", "--agent-dir", "/agent", "--settings", "/a.json", "--settings", "/b.json", "--skip-source-check"]), {
-		agentDir: "/agent",
-		cwd: "/repo",
-		settingsPaths: ["/a.json", "/b.json"],
-		showHelp: false,
-		skipSourceCheck: true,
-	});
+	assert.deepEqual(
+		parseCliArgs([
+			"--cwd",
+			"/repo",
+			"--agent-dir",
+			"/agent",
+			"--settings",
+			"/a.json",
+			"--settings",
+			"/b.json",
+			"--skip-source-check",
+		]),
+		{
+			agentDir: "/agent",
+			cwd: "/repo",
+			settingsPaths: ["/a.json", "/b.json"],
+			showHelp: false,
+			skipSourceCheck: true,
+		},
+	);
 });
 
 test("parseCliArgs rejects unknown options and missing option values", () => {

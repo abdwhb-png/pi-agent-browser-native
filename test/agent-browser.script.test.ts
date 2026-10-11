@@ -1,28 +1,30 @@
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rename, rm } from "node:fs/promises";
+import { readRecord, readString, readArray } from "./helpers/assertions.js";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { Check } from "typebox/value";
-
-import { AGENT_BROWSER_PARAMS } from "../extensions/agent-browser/lib/input-modes/params.js";
 import {
 	AGENT_BROWSER_SCRIPT_CODE_MAX_BYTES,
 	AGENT_BROWSER_SCRIPT_FINAL_OUTPUT_MAX_BYTES,
 	AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES,
 	AGENT_BROWSER_SCRIPT_MAX_CALLS,
-	AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES,
-	compileAgentBrowserScript,
+	bindBrowserCodeCall,
 	runAgentBrowserScript,
 	validateAgentBrowserScriptBrowserParams,
+	resolveScriptChildNodePath,
 	type AgentBrowserScriptBrowserEnvelope,
 } from "../extensions/agent-browser/lib/input-modes/script.js";
-import { resolveAgentBrowserInput } from "../extensions/agent-browser/lib/orchestration/input-plan.js";
-import { buildScriptBrowserEnvelope, buildScriptToolResult } from "../extensions/agent-browser/lib/orchestration/script-mode.js";
-import { TARGET_AGENT_BROWSER_VERSION_LABEL } from "../scripts/agent-browser-target.mjs";
+import { createBrowserCodeOutput } from "../extensions/agent-browser/lib/orchestration/script-mode.js";
+import { convertBrowserEntries } from "../extensions/agent-browser/lib/browser-session-conversion.js";
+import {
+	BROWSER_TRANSITION_ENTRY,
+	getBrowserRecord,
+} from "../extensions/agent-browser/lib/browser-transcript.js";
+import { getAgentBrowserSessionIdentityKey } from "../extensions/agent-browser/lib/argv-grammar.js";
+import { SessionPageState } from "../extensions/agent-browser/lib/session-page-state.js";
 import {
 	createExtensionHarness,
 	executeRegisteredTool,
@@ -32,812 +34,909 @@ import {
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
 
-const successEnvelope = (data: unknown, summary = "Browser call completed."): AgentBrowserScriptBrowserEnvelope => ({
+test("code child resolves a real Node runtime on Bun binaries and fails clearly without one", () => {
+	assert.equal(
+		resolveScriptChildNodePath({
+			runtime: {},
+			execPath: "/usr/bin/node",
+			whichNode: () => "/usr/bin/node",
+		}),
+		"/usr/bin/node",
+	);
+	assert.equal(
+		resolveScriptChildNodePath({
+			runtime: { bun: "1.2.0" },
+			execPath: "/usr/local/bin/pi",
+			whichNode: () => "/opt/node/bin/node",
+		}),
+		"/opt/node/bin/node",
+	);
+	assert.throws(
+		() =>
+			resolveScriptChildNodePath({
+				runtime: { bun: "1.2.0" },
+				execPath: "/usr/local/bin/pi",
+				whichNode: () => null,
+			}),
+		/requires a `node` runtime on PATH when pi runs on a Bun binary/,
+	);
+});
+
+const successEnvelope = (data: unknown): AgentBrowserScriptBrowserEnvelope => ({
 	data,
-	ok: true,
+	success: true,
 	resultCategory: "success",
 	successCategory: "inspection",
-	summary,
-	text: summary,
+	summary: "Browser call completed.",
 });
 
-const resolveInput = (params: Parameters<typeof resolveAgentBrowserInput>[0]["params"]) => resolveAgentBrowserInput({
-	getBatchPreflightValidationError: () => undefined,
-	params,
-});
+const PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j4L8AAAAASUVORK5CYII=",
+	"base64",
+);
 
-test("script input schema and runtime validation enforce one top-level mode", () => {
-	assert.equal(Check(AGENT_BROWSER_PARAMS, { script: "emit(1)" }), true);
-	assert.equal(Check(AGENT_BROWSER_PARAMS, { script: 1 }), false);
-	assert.equal(Check(AGENT_BROWSER_PARAMS, { script: "x".repeat(AGENT_BROWSER_SCRIPT_CODE_MAX_BYTES + 1) }), false);
-	assert.equal(resolveInput({ script: "emit(1)" }).kind, "script");
-	const invalidInputs: Array<[Parameters<typeof resolveAgentBrowserInput>[0]["params"], RegExp]> = [
-		[{ args: ["get", "title"], script: "emit(1)" }, /exactly one/],
-		[{ script: "emit(1)", stdin: "no" }, /Do not provide stdin with script/],
-		[{ script: "emit(1)", sessionMode: "fresh" }, /Do not provide sessionMode with script/],
-		[{ script: "emit(1)", timeoutMs: 300_001 }, /300000 or less/],
-	];
-	for (const [params, expected] of invalidInputs) {
-		const input = resolveInput(params);
-		assert.equal(input.status, "invalid");
-		assert.match(input.validationError, expected);
-	}
-	assert.match(compileAgentBrowserScript("💥".repeat(AGENT_BROWSER_SCRIPT_CODE_MAX_BYTES / 2)).error ?? "", /65536 bytes or less/);
-	assert.ok(AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES * 2 <= AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES, "rehydrated spills must leave room for the response envelope");
-});
-
-test("script runner supports loops, conditionals, emit, and serialized Promise.all", async () => {
+test("code runner uses branches and native batch while serializing concurrent inner calls", async () => {
 	let active = 0;
 	let maxActive = 0;
-	const calls: string[] = [];
+	const calls: string[][] = [];
 	const result = await runAgentBrowserScript({
-		code: `
-const kept = [];
-for (const name of ["one", "skip", "two"]) {
-  const result = await browser({ args: ["get", name] });
-  if (result.ok && name !== "skip") kept.push(result.data.value);
-}
-const parallel = await Promise.all([
-  browser({ args: ["get", "three"] }),
-  browser({ args: ["get", "four"] }),
-]);
-emit({ kept, parallel: parallel.map((item) => item.data.value) });`,
+		code: `const kept=[]; for (const name of ["one","skip","two"]) { const r=await browser({args:["get",name]}); if(r.success && name!=="skip") kept.push(r.data.value); }
+const parallel=await Promise.all([browser({args:["get","three"]}),browser({args:["get","four"]})]);
+const batch=await browser({args:["batch","--bail"],stdin:JSON.stringify([["get","title"],["get","url"]])});
+emit({kept,parallel:parallel.map(r=>r.data.value),batch:batch.data.value});`,
 		dispatch: async (params) => {
 			active += 1;
-			maxActive = Math.max(maxActive, active);
-			calls.push(params.args[1] ?? "");
+			maxActive = Math.max(active, maxActive);
+			calls.push([...params.args]);
 			await delay(5);
 			active -= 1;
 			return successEnvelope({ value: params.args[1] });
 		},
 	});
 	assert.equal(result.ok, true, result.error);
-	assert.deepEqual(result.data, { kept: ["one", "two"], parallel: ["three", "four"] });
-	assert.deepEqual(calls, ["one", "skip", "two", "three", "four"]);
+	assert.deepEqual(result.data, {
+		kept: ["one", "two"],
+		parallel: ["three", "four"],
+		batch: "--bail",
+	});
 	assert.equal(maxActive, 1);
-	assert.equal(result.steps.length, 5);
+	assert.equal(calls.length, 6);
+	assert.deepEqual(calls.at(-1), ["batch", "--bail"]);
 });
 
-test("script browser envelopes expose actionable rejected-call errors and emit aggregation is deterministic", async () => {
-	const rejected = await runAgentBrowserScript({
-		code: `const result = await browser({ args: ["close"] }); emit({ error: result.error, failureCategory: result.details.failureCategory });`,
-		dispatch: async () => { throw new Error("rejected calls must not dispatch"); },
-	});
-	assert.deepEqual(rejected.data, {
-		error: "script browser calls cannot close, quit, or exit their isolated session.",
-		failureCategory: "policy-blocked",
-	});
-	assert.equal(rejected.rejectedCallCount, 1);
-
-	const emissions = await runAgentBrowserScript({
-		code: `emit("first"); emit("second"); return "ignored";`,
-		dispatch: async () => successEnvelope(null),
-	});
-	assert.deepEqual(emissions.data, ["first", "second"]);
-	assert.equal(emissions.emitCount, 2);
-
-	const returned = await runAgentBrowserScript({
-		code: `return { returned: true };`,
-		dispatch: async () => successEnvelope(null),
-	});
-	assert.deepEqual(returned.data, { returned: true });
-
-	const missingParams = await runAgentBrowserScript({
-		code: `const result = await browser(); emit({ error: result.error, ok: result.ok });`,
-		dispatch: async () => { throw new Error("invalid calls must not dispatch"); },
-	});
-	assert.deepEqual(missingParams.data, { error: "script browser(params) requires an object.", ok: false });
-	assert.equal(missingParams.rejectedCallCount, 1);
-
-	for (const code of [`emit(undefined);`, `emit(() => 1);`]) {
-		const invalidEmit = await runAgentBrowserScript({ code, dispatch: async () => successEnvelope(null) });
-		assert.equal(invalidEmit.ok, false);
-		assert.equal(invalidEmit.failureCategory, "validation-error");
-		assert.match(invalidEmit.error ?? "", /emit\(value\) requires a JSON-serializable value/);
+test("code validates JSON calls without restricting native commands or local authority", async () => {
+	for (const args of [
+		["close"],
+		["connect", "9222"],
+		["state", "save", "saved.json"],
+		["auth", "login", "example"],
+		["--profile", "Default", "open", "https://example.test"],
+		["batch", "--bail"],
+	]) {
+		// Every fixed allowed native command must preserve its validated argv.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.deepEqual(validateAgentBrowserScriptBrowserParams({ args }).params?.args, args);
 	}
-
-	const sessionName = "piab-script-12345678-1234-4123-8123-123456789abc";
-	const replayableEnvelope = await buildScriptBrowserEnvelope({
-		content: [{ text: "Opened.", type: "text" }],
-		details: {
-			data: { url: "https://example.com" },
-			nextActions: [
-				{ id: "inspect", params: { args: ["--namespace", "", "--session", sessionName, "snapshot", "-i"] }, reason: "Inspect.", tool: "agent_browser" },
-				{ id: "local", params: { args: ["--session", sessionName, "profiles"] }, reason: "Local command.", tool: "agent_browser" },
-				{ id: "lookup", params: { networkSourceLookup: { requestId: "req-1" } }, reason: "Top-level mode.", tool: "agent_browser" },
-				{ artifactPath: "/tmp/example.png", id: "artifact", reason: "Inspect artifact.", tool: "agent_browser" },
-			],
-			resultCategory: "success",
-			successCategory: "completed",
-			summary: "Opened.",
-		},
-	}, ["open", "https://example.com"], sessionName);
-	assert.deepEqual(replayableEnvelope.nextActions?.map((action) => action.id), ["inspect", "artifact"]);
-	assert.deepEqual(replayableEnvelope.nextActions?.[0]?.params?.args, ["snapshot", "-i"]);
-	assert.doesNotMatch(JSON.stringify(replayableEnvelope), /piab-script-/);
-
-	let replayDispatchCount = 0;
-	const replayed = await runAgentBrowserScript({
-		code: `const first = await browser({ args: ["open", "https://example.com"] }); const second = await browser(first.nextActions[0].params); emit(second.ok);`,
-		dispatch: async (params) => {
-			replayDispatchCount += 1;
-			if (replayDispatchCount === 1) return replayableEnvelope;
-			assert.deepEqual(params.args, ["snapshot", "-i"]);
-			return successEnvelope(null);
-		},
+	assert.match(
+		validateAgentBrowserScriptBrowserParams({ args: ["get", "title"], job: {} }).error ?? "",
+		/does not support job/,
+	);
+	const oversize = await runAgentBrowserScript({
+		code: "💥".repeat(AGENT_BROWSER_SCRIPT_CODE_MAX_BYTES / 2),
+		dispatch: async () => ({ success: true, data: {}, resultCategory: "success" as const }),
 	});
-	assert.equal(replayed.ok, true, replayed.error);
-	assert.equal(replayed.data, true);
-	assert.equal(replayed.rejectedCallCount, 0);
-
-	const largeText = "x".repeat(AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES);
-	const boundedEnvelope = await buildScriptBrowserEnvelope({
-		content: [{ text: largeText, type: "text" }],
-		details: { data: largeText, resultCategory: "success", summary: largeText, successCategory: "completed" },
-	}, ["get", "text", "body"]);
-	const serializedBoundedEnvelope = JSON.stringify({ envelope: boundedEnvelope, id: Number.MAX_SAFE_INTEGER, type: "response" });
-	assert.equal(boundedEnvelope.ok, true);
-	assert.ok(Buffer.byteLength(serializedBoundedEnvelope, "utf8") + 1 <= AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES);
-	assert.ok(boundedEnvelope.summary.length <= 1_024);
-	assert.ok(boundedEnvelope.text.length <= 8_192);
-
-	const escapeHeavyEnvelope = await buildScriptBrowserEnvelope({
-		content: [{ text: "oversized", type: "text" }],
-		details: { data: "\0".repeat(AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES), resultCategory: "success", successCategory: "completed" },
-	}, ["get", "text", "body"]);
-	assert.equal(escapeHeavyEnvelope.ok, false);
-	assert.equal(escapeHeavyEnvelope.failureCategory, "upstream-error");
-	assert.match(escapeHeavyEnvelope.error ?? "", /IPC response limit/);
-	assert.ok(Buffer.byteLength(JSON.stringify({ envelope: escapeHeavyEnvelope, id: Number.MAX_SAFE_INTEGER, type: "response" }), "utf8") + 1 <= AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES);
+	assert.equal(oversize.failureCategory, "validation-error");
+	assert.match(oversize.error ?? "", /65536 bytes or less/);
+	assert.deepEqual(
+		bindBrowserCodeCall(
+			{ args: ["--namespace", "", "--session", "chosen", "get", "url"] },
+			{ sessionName: "chosen" },
+		).args,
+		["--namespace", "", "--session", "chosen", "get", "url"],
+	);
+	assert.throws(
+		() => bindBrowserCodeCall({ args: ["batch", "close --all"] }, { sessionName: "chosen" }),
+		/namespace-wide close/,
+	);
 });
 
-test("script sandbox exposes only context-native wrappers and blocks constructor escapes", async () => {
+test("code observations carry failures and exact recoveries without duplicated text/details", async () => {
 	const result = await runAgentBrowserScript({
-		code: `
-const blocked = (fn) => { try { fn(); return false; } catch { return true; } };
-const promise = browser({ args: ["get", "title"] });
-const browserResult = await promise;
-const AsyncFunction = (async function () {}).constructor;
-const GeneratorFunction = (function* () {}).constructor;
-emit({
-  browserPrototypeIsNull: Object.getPrototypeOf(browser) === null,
-  emitPrototypeIsNull: Object.getPrototypeOf(emit) === null,
-  browserConstructorType: typeof browser.constructor,
-  emitConstructorType: typeof emit.constructor,
-  promiseIsNative: promise.constructor === Promise,
-  resultIsNative: Object.getPrototypeOf(browserResult) === Object.prototype,
-  functionBlocked: blocked(() => Function("return globalThis")()),
-  asyncFunctionBlocked: blocked(() => AsyncFunction("return globalThis")()),
-  generatorFunctionBlocked: blocked(() => GeneratorFunction("return globalThis")()),
-  directHostEscapeBlocked: blocked(() => browser.constructor.constructor("return process")()),
-  processType: typeof process,
-  requireType: typeof require,
-  fetchType: typeof fetch,
-  timerType: typeof setTimeout,
-  webSocketType: typeof WebSocket,
-});`,
+		code: `const failed=await browser({args:["click","#missing"]}); emit({success:failed.success,retry:failed.nextActions[0].params,text:typeof failed.text,details:typeof failed.details});`,
+		dispatch: async () => ({
+			success: false,
+			data: null,
+			resultCategory: "failure",
+			failureCategory: "selector-not-found",
+			error: "Missing selector",
+			nextActions: [
+				{
+					id: "inspect",
+					params: { args: ["snapshot", "-i"] },
+					reason: "Inspect the current page",
+					tool: "agent_browser",
+				},
+			],
+		}),
+	});
+	assert.equal(result.ok, true, result.error);
+	assert.deepEqual(result.data, {
+		success: false,
+		retry: { args: ["snapshot", "-i"] },
+		text: "undefined",
+		details: "undefined",
+	});
+	const failure = readRecord(readArray(result.failures)[0]);
+	assert.equal(failure.failureCategory, "selector-not-found");
+	assert.deepEqual(readRecord(readArray(failure.nextActions)[0]).params, {
+		args: ["snapshot", "-i"],
+	});
+	const failedInput = await runAgentBrowserScript({
+		code: `emit(await browser());`,
+		dispatch: async () => assert.fail("invalid input must not dispatch"),
+	});
+	assert.equal(failedInput.rejectedCallCount, 1);
+	assert.equal(failedInput.failures?.[0]?.failureCategory, "validation-error");
+});
+
+test("permissioned fresh contexts expose only native JSON bridge functions", async () => {
+	const result = await runAgentBrowserScript({
+		code: `const blocked=fn=>{try{fn();return false}catch{return true}}; const promise=browser({args:["get","title"]}); const r=await promise;
+emit({nullPrototypes:[browser,emit,emitImage].every(fn=>Object.getPrototypeOf(fn)===null), promise:promise.constructor===Promise, result:Object.getPrototypeOf(r)===Object.prototype,
+functionBlocked:blocked(()=>Function("return globalThis")()), asyncBlocked:blocked(()=>(async function(){}).constructor("return globalThis")()), generatorBlocked:blocked(()=>(function*(){}).constructor("return globalThis")()), escapeBlocked:blocked(()=>browser.constructor.constructor("return process")()),
+host:[typeof process,typeof require,typeof fetch,typeof setTimeout,typeof WebSocket]}); globalThis.previousCell=1;`,
 		dispatch: async () => successEnvelope({ title: "Sandbox" }),
 	});
 	assert.equal(result.ok, true, result.error);
 	assert.deepEqual(result.data, {
-		browserPrototypeIsNull: true,
-		emitPrototypeIsNull: true,
-		browserConstructorType: "undefined",
-		emitConstructorType: "undefined",
-		promiseIsNative: true,
-		resultIsNative: true,
+		nullPrototypes: true,
+		promise: true,
+		result: true,
 		functionBlocked: true,
-		asyncFunctionBlocked: true,
-		generatorFunctionBlocked: true,
-		directHostEscapeBlocked: true,
-		processType: "undefined",
-		requireType: "undefined",
-		fetchType: "undefined",
-		timerType: "undefined",
-		webSocketType: "undefined",
+		asyncBlocked: true,
+		generatorBlocked: true,
+		escapeBlocked: true,
+		host: Array(5).fill("undefined"),
 	});
-
-	const dynamicImport = await runAgentBrowserScript({
-		code: `await import("node:fs"); emit("unreachable");`,
+	const next = await runAgentBrowserScript({
+		code: `emit(typeof previousCell);`,
 		dispatch: async () => successEnvelope(null),
 	});
-	assert.equal(dynamicImport.ok, false);
-	assert.match(dynamicImport.error ?? "", /sandbox exited before completion|dynamic import callback/i);
+	assert.equal(next.data, "undefined");
+	const imported = await runAgentBrowserScript({
+		code: `await import("node:fs");`,
+		dispatch: async () => successEnvelope(null),
+	});
+	assert.equal(imported.ok, false);
+	assert.match(imported.error ?? "", /sandbox exited before completion|dynamic import callback/i);
 });
 
-test("script runner enforces call, output, IPC, timeout, and abort limits", async () => {
-	let dispatchCount = 0;
-	const callLimit = await runAgentBrowserScript({
-		code: `for (let index = 0; index < ${AGENT_BROWSER_SCRIPT_MAX_CALLS + 1}; index += 1) await browser({ args: ["get", String(index)] });`,
+test("code enforces call, output, IPC and time limits and retains partial emissions", async () => {
+	let dispatched = 0;
+	const calls = await runAgentBrowserScript({
+		code: `for(let i=0;i<${AGENT_BROWSER_SCRIPT_MAX_CALLS + 1};i++) await browser({args:["get","title"]});`,
 		dispatch: async () => {
-			dispatchCount += 1;
+			dispatched++;
 			return successEnvelope(null);
 		},
 	});
-	assert.equal(callLimit.ok, false);
-	assert.match(callLimit.error ?? "", /call limit exceeded/);
-	assert.equal(dispatchCount, AGENT_BROWSER_SCRIPT_MAX_CALLS);
-
-	const outputLimit = await runAgentBrowserScript({
+	assert.equal(calls.ok, false);
+	assert.equal(dispatched, AGENT_BROWSER_SCRIPT_MAX_CALLS);
+	assert.match(calls.error ?? "", /call limit exceeded/);
+	const output = await runAgentBrowserScript({
 		code: `emit("x".repeat(${AGENT_BROWSER_SCRIPT_FINAL_OUTPUT_MAX_BYTES + 1}));`,
 		dispatch: async () => successEnvelope(null),
 	});
-	assert.equal(outputLimit.ok, false);
-	assert.match(outputLimit.error ?? "", /Final script output exceeds/);
-
-	const requestLimit = await runAgentBrowserScript({
-		code: `await browser({ args: ["get", "x".repeat(${AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES})] });`,
-		dispatch: async () => {
-			throw new Error("oversized request must not dispatch");
-		},
+	assert.equal(output.ok, false);
+	assert.match(output.error ?? "", /output exceeds/);
+	const request = await runAgentBrowserScript({
+		code: `await browser({args:["get","x".repeat(${AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES})]});`,
+		dispatch: async () => assert.fail("oversized request must not dispatch"),
 	});
-	assert.equal(requestLimit.ok, false);
-	assert.match(requestLimit.error ?? "", /IPC limit exceeded/);
-
-	const responseLimit = await runAgentBrowserScript({
-		code: `await browser({ args: ["get", "title"] });`,
+	assert.equal(request.ok, false);
+	assert.match(request.error ?? "", /IPC limit exceeded/);
+	const response = await runAgentBrowserScript({
+		code: `await browser({args:["get","title"]});`,
 		dispatch: async () => successEnvelope("x".repeat(AGENT_BROWSER_SCRIPT_IPC_MESSAGE_MAX_BYTES)),
 	});
-	assert.equal(responseLimit.ok, false);
-	assert.match(responseLimit.error ?? "", /Unable to return a browser result/);
-
-	const rehydratedSpillSizedResponse = await runAgentBrowserScript({
-		code: `const result = await browser({ args: ["get", "title"] }); emit(result.data.length);`,
-		dispatch: async () => successEnvelope("x".repeat(AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES)),
+	assert.equal(response.ok, false);
+	assert.match(response.error ?? "", /Unable to return a browser result/);
+	const raw = await runAgentBrowserScript({
+		code: `const r=await browser({args:["eval","--stdin"],stdin:"[]"}); emit(r.data.length);`,
+		dispatch: async () => successEnvelope("x".repeat(512 * 1_024)),
 	});
-	assert.equal(rehydratedSpillSizedResponse.ok, true, rehydratedSpillSizedResponse.error);
-	assert.equal(rehydratedSpillSizedResponse.data, AGENT_BROWSER_SCRIPT_SPILL_MAX_BYTES);
-
+	assert.equal(raw.data, 512 * 1_024);
 	const timedOut = await runAgentBrowserScript({
-		code: "while (true) {}",
+		code: `emit("completed prefix"); while(true){}`,
+		timeoutMs: 200,
 		dispatch: async () => successEnvelope(null),
-		timeoutMs: 100,
 	});
-	assert.equal(timedOut.ok, false);
 	assert.equal(timedOut.timedOut, true);
-	assert.equal(timedOut.failureCategory, "timeout");
+	assert.equal(timedOut.data, "completed prefix");
+	for (const code of ["emit(undefined);", "emit(()=>1);"]) {
+		// Finish each serialization attempt before launching the next permissioned child.
+		// oxlint-disable-next-line no-await-in-loop
+		const invalid = await runAgentBrowserScript({
+			code,
+			dispatch: async () => successEnvelope(null),
+		});
+		// Both fixed non-JSON values must fail emission.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.equal(invalid.ok, false);
+		// Both failures must identify serialization rather than another child failure.
+		// oxlint-disable-next-line node-test/no-conditional-assertion
+		assert.match(invalid.error ?? "", /JSON-serializable value/);
+	}
+});
 
+test("abort waits for the dispatched operation and does not start queued siblings", async () => {
 	const controller = new AbortController();
-	let activeCallAborted = false;
 	let started!: () => void;
-	const activeCallStarted = new Promise<void>((resolve) => {
+	const active = new Promise<void>((resolve) => {
 		started = resolve;
 	});
-	let abortedDispatchCount = 0;
-	const abortedPromise = runAgentBrowserScript({
-		code: `await browser({ args: ["get", "slow"] }); await browser({ args: ["get", "late"] });`,
-		dispatch: async (_params, signal) => {
-			abortedDispatchCount += 1;
-			started();
-			return await new Promise<AgentBrowserScriptBrowserEnvelope>((resolve) => {
-				signal.addEventListener("abort", () => {
-					activeCallAborted = true;
-					resolve({ data: null, failureCategory: "aborted", ok: false, resultCategory: "failure", summary: "aborted", text: "aborted" });
-				}, { once: true });
-			});
-		},
+	let drained = false;
+	let calls = 0;
+	const pending = runAgentBrowserScript({
+		code: `await Promise.all([browser({args:["get","slow"]}),browser({args:["get","late"]})]);`,
 		signal: controller.signal,
+		dispatch: async (_params, signal) => {
+			calls++;
+			started();
+			await new Promise<void>((resolve) =>
+				signal.addEventListener(
+					"abort",
+					() => {
+						setTimeout(resolve, 40);
+					},
+					{ once: true },
+				),
+			);
+			drained = true;
+			return {
+				success: false,
+				resultCategory: "failure",
+				failureCategory: "aborted",
+				error: "aborted",
+			};
+		},
 	});
-	await activeCallStarted;
+	await active;
 	controller.abort();
-	const aborted = await abortedPromise;
-	assert.equal(aborted.aborted, true);
-	assert.equal(activeCallAborted, true);
-	assert.equal(abortedDispatchCount, 1, "no browser call should dispatch after abort");
+	const result = await pending;
+	assert.equal(result.aborted, true);
+	assert.equal(drained, true);
+	assert.equal(calls, 1);
+	assert.equal(result.steps.length, 1);
+	assert.equal(result.failures?.[0]?.failureCategory, "aborted");
 });
 
-test("script result rendering stays compact and preserves structured failure accounting", () => {
-	let compactValue: unknown = "leaf";
-	for (let index = 0; index < 1_000; index += 1) compactValue = [compactValue];
-	const compactResult = buildScriptToolResult({
-		innerResults: [],
-		run: { callCount: 0, data: compactValue, emitCount: 1, ok: true, rejectedCallCount: 0, steps: [] },
-	});
-	assert.equal(compactResult.isError, false);
-	const compactText = compactResult.content[0]?.type === "text" ? compactResult.content[0].text : "";
-	assert.ok(Buffer.byteLength(compactText, "utf8") < AGENT_BROWSER_SCRIPT_FINAL_OUTPUT_MAX_BYTES + 200);
-	assert.equal(compactText.split("\n\n", 2)[1], JSON.stringify(compactValue));
-
-	let tooDeep: unknown = "leaf";
-	for (let index = 0; index < 5_000; index += 1) tooDeep = [tooDeep];
-	const deepResult = buildScriptToolResult({
-		innerResults: [],
-		run: { callCount: 0, data: tooDeep, emitCount: 1, ok: true, rejectedCallCount: 0, steps: [] },
-	});
-	assert.equal(deepResult.isError, true);
-	const deepDetails = deepResult.details as { data?: unknown; failureCategory?: string } | undefined;
-	assert.equal(deepDetails?.failureCategory, "validation-error");
-	assert.match(deepResult.content[0]?.type === "text" ? deepResult.content[0].text : "", /could not be safely rendered as bounded JSON/);
-	assert.equal(deepDetails?.data, undefined);
-});
-
-test("script runner reports a missing compiled worker clearly", { concurrency: false }, async () => {
-	const workerPath = join(process.cwd(), "dist", "extensions", "agent-browser", "script-worker.js");
-	const backupPath = `${workerPath}.test-backup`;
-	await rename(workerPath, backupPath);
+test("selected image emission forwards real bytes once and rejects stale or invented handles", async (t) => {
+	const dir = await mkdtemp(join(tmpdir(), "piab-code-image-"));
 	try {
-		const result = await runAgentBrowserScript({ code: `emit("unreachable");`, dispatch: async () => successEnvelope(null) });
-		assert.equal(result.ok, false);
+		const path = join(dir, "capture.png");
+		await writeFile(path, PNG);
+		const output = createBrowserCodeOutput();
+		const observation = await output.observe({
+			content: [],
+			details: {
+				resultCategory: "success",
+				data: { path },
+				imageObservations: [
+					{
+						path,
+						mimeType: "image/png",
+						pixels: { width: 1, height: 1 },
+						capture: "unknown",
+						geometry: { status: "unknown", reason: "Fixture" },
+					},
+				],
+			},
+		});
+		const result = await runAgentBrowserScript({
+			code: `const r=await browser({args:["screenshot"]}); emitImage(r.imageObservations[0]); emitImage(r.imageObservations[0]); emit({visible:true});`,
+			dispatch: async () => observation,
+			emitImage: output.emitImage.bind(output),
+		});
+		assert.equal(result.ok, true, result.error);
+		const final = await output.finish(result, "persistent");
+		assert.equal(final.content.filter((item) => item.type === "image").length, 1);
+		const image = final.content.find((item) => item.type === "image");
+		assert.ok(image?.type === "image");
+		assert.deepEqual(Buffer.from(image.data, "base64"), PNG);
+		const validImage = readRecord(observation.imageObservations?.[0]);
+		const malformedImages = [
+			["pixel width type", { pixels: { width: "1", height: 1 } }],
+			["non-finite pixels", { pixels: { width: 1, height: Infinity } }],
+			["geometry container", { geometry: "measured" }],
+			["geometry status", { geometry: { status: "invented", reason: "Fixture" } }],
+			["geometry reason", { geometry: { status: "unknown", reason: 1 } }],
+			[
+				"partial sample",
+				{ geometry: { status: "measured", reason: "Fixture", before: { dpr: 1 } } },
+			],
+			[
+				"crop dimensions",
+				{
+					geometry: {
+						status: "measured",
+						reason: "Fixture",
+						crop: { x: 0, y: 0, width: "1", height: 1 },
+					},
+				},
+			],
+			[
+				"CSS mapping",
+				{
+					geometry: { status: "measured", reason: "Fixture", pixelsPerCssPixel: { x: "1", y: 1 } },
+				},
+			],
+		] as const;
+		await Promise.all(
+			malformedImages.map(([name, malformed]) =>
+				t.test(`rejects malformed ${name} without publishing an image handle`, async () => {
+					const invalid = createBrowserCodeOutput();
+					await assert.rejects(
+						invalid.observe({
+							content: [],
+							details: {
+								resultCategory: "success",
+								imageObservations: [{ ...validImage, ...malformed }],
+							},
+						}),
+						/invalid image observation geometry/,
+					);
+					await assert.rejects(
+						invalid.emitImage({ id: "image-1", path }),
+						/handle returned by browser/,
+					);
+					const rejected = await invalid.finish(result, "persistent");
+					assert.deepEqual(readRecord(rejected.details).imageObservations, []);
+					assert.equal(
+						rejected.content.some((part) => part.type === "image"),
+						false,
+					);
+				}),
+			),
+		);
+		await t.test(
+			"unknown geometry with absent pixels remains a usable verified handle",
+			async () => {
+				const unknown = createBrowserCodeOutput();
+				const captured = await unknown.observe({
+					content: [],
+					details: {
+						resultCategory: "success",
+						imageObservations: [
+							{
+								path,
+								mimeType: "image/png",
+								capture: "unknown",
+								geometry: { status: "unknown", reason: "No geometry evidence" },
+							},
+						],
+					},
+				});
+				await unknown.emitImage({ id: captured.imageObservations?.[0]?.id });
+				const selected = await unknown.finish(result, "persistent");
+				assert.equal(selected.content.filter((part) => part.type === "image").length, 1);
+				const metadata = readRecord(readArray(readRecord(selected.details).imageObservations)[0]);
+				assert.equal(metadata.pixels, undefined);
+				assert.equal(readRecord(metadata.geometry).status, "unknown");
+				assert.equal(readRecord(metadata.geometry).pixelsPerCssPixel, undefined);
+			},
+		);
+		await assert.rejects(output.emitImage({ id: "not-captured" }), /handle returned by browser/);
+		const staleOutput = createBrowserCodeOutput();
+		const stale = await staleOutput.observe({
+			content: [],
+			details: { imageObservations: observation.imageObservations, resultCategory: "success" },
+		});
+		await writeFile(path, Buffer.concat([PNG, Buffer.from("changed")]));
+		await assert.rejects(
+			staleOutput.emitImage(stale.imageObservations?.[0]),
+			/changed since capture/,
+		);
+	} finally {
+		await rm(dir, { recursive: true, force: true });
+	}
+});
+
+test("missing compiled worker returns a setup failure", { concurrency: false }, async () => {
+	const worker = join(process.cwd(), "dist/extensions/agent-browser/script-worker.js");
+	const backup = `${worker}.test-backup`;
+	await rename(worker, backup);
+	try {
+		const result = await runAgentBrowserScript({
+			code: "emit(1)",
+			dispatch: async () => successEnvelope(null),
+		});
 		assert.equal(result.failureCategory, "missing-binary");
 		assert.match(result.error ?? "", /Compiled script worker is missing/);
 	} finally {
-		await rename(backupPath, workerPath);
+		await rename(backup, worker);
 	}
 });
 
-test("script inner policy rejects identity, lifecycle, batch, local, and persistent launch controls", () => {
-	for (const args of [
-		["--session", "other", "get", "title"],
-		["--namespace", "other", "get", "title"],
-		["close"],
-		["quit"],
-		["connect", "9222"],
-		["attach", "9222"],
-		["batch"],
-		["session", "list"],
-		["state", "save", "saved.json"],
-		["auth", "login", "example"],
-		["--profile", "Default", "open", "https://example.test"],
-		["--config", "fixture.json", "open", "https://example.test"],
-		["open", "https://example.test", "--config", "fixture.json"],
-		["--state", "state.json", "open", "https://example.test"],
-		["--restore", "open", "https://example.test"],
-		["--cdp", "9222", "get", "title"],
-		["--provider", "browserbase", "get", "title"],
-	]) {
-		const result = validateAgentBrowserScriptBrowserParams({ args });
-		assert.equal(result.params, undefined, `unexpected policy success for ${JSON.stringify(args)}`);
-		assert.equal(result.policyBlocked, true);
-	}
-	assert.deepEqual(validateAgentBrowserScriptBrowserParams({ args: ["--allowed-domains", "example.test", "open", "https://example.test"] }).params?.args, ["--allowed-domains", "example.test", "open", "https://example.test"]);
-	assert.match(validateAgentBrowserScriptBrowserParams({ args: ["get", "title"], job: {} }).error ?? "", /does not support job/);
-});
+type CodeHarnessView = Pick<
+	ReturnType<typeof createExtensionHarness>,
+	"ctx" | "getTool" | "tool"
+> & {
+	readonly appendedEntries: readonly Readonly<
+		ReturnType<typeof createExtensionHarness>["appendedEntries"][number]
+	>[];
+};
 
-test("script mode fails closed when Pi session persistence is disabled", async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-no-session-"));
+async function withCodeHarness(
+	run: (harness: CodeHarnessView, logPath: string, dir: string) => Promise<void>,
+) {
+	const dir = await mkdtemp(join(tmpdir(), "piab-code-integration-"));
+	const logPath = join(dir, "calls.jsonl");
+	const statePath = join(dir, "page.json");
+	await writeFakeAgentBrowserBinary(
+		dir,
+		`const fs=require('node:fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(logPath)},JSON.stringify({args})+'\\n');
+let url='about:blank'; try{url=JSON.parse(fs.readFileSync(${JSON.stringify(statePath)},'utf8')).url}catch{}
+const command=args.find(arg=>['open','get','snapshot','eval','close','batch'].includes(arg)); let data;
+if(command==='open'){url=args[args.indexOf('open')+1]; fs.writeFileSync(${JSON.stringify(statePath)},JSON.stringify({url})); data={url,title:'Fixture'};}
+else if(command==='close') data={closed:true};
+else if(command==='snapshot') data={url,refs:{e1:{role:'button',name:'Submit'}},snapshot:'- button "Submit" [ref=e1]'};
+else if(command==='eval') data={result:'x'.repeat(30000)+'END'};
+else if(command==='batch') data=args.slice(args.indexOf('batch')+1).filter(arg=>arg!=='--bail').map(row=>({command:row.split(' '),success:true,result:{}}));
+else data=args.includes('url')?{url}:{title:'Fixture'};
+process.stdout.write(JSON.stringify({success:true,data}));`,
+	);
 	try {
-		const harness = createExtensionHarness({ cwd: tempDir });
-		await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-		const result = await executeRegisteredTool(harness.tool, harness.ctx, { script: "emit('no')" });
-		assert.equal(result.isError, true);
-		assert.equal(result.details?.failureCategory, "validation-error");
-		assert.match(result.content[0]?.text ?? "", /requires a persisted Pi session/);
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("script policy rejections fail the top-level result with disjoint counters", async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-rejection-"));
-	const logPath = join(tempDir, "calls.jsonl");
-	const configPath = join(tempDir, "config.json");
-	await writeFakeAgentBrowserBinary(tempDir, `
-require("node:fs").appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");
-console.log(JSON.stringify({ success: true, data: { title: "Fixture", url: "about:blank" } }));
-`);
-	writeFileSync(configPath, "{}");
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const ordinary = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["--config", configPath, "--session", "ordinary", "get", "title"] });
-			assert.equal(ordinary.isError, false, ordinary.content[0]?.text);
-			const ordinaryCalls = await readInvocationLog(logPath);
-			assert.ok(ordinaryCalls.some((call) => call.args.includes("--config") && call.args.includes(configPath)), "ordinary args still pass native --config through");
-			for (const args of [["close"], ["--config", configPath, "open", "https://example.test"]]) {
-				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-					script: `const rejected = await browser({ args: ${JSON.stringify(args)} }); emit(rejected.error);`,
+		await withPatchedEnv(
+			{
+				PATH: `${dir}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
+				AGENT_BROWSER_SESSION: undefined,
+				AGENT_BROWSER_NAMESPACE: undefined,
+			},
+			async () => {
+				const harness = createExtensionHarness({
+					cwd: dir,
+					sessionFile: join(dir, "session.jsonl"),
 				});
-				assert.deepEqual(await readInvocationLog(logPath), ordinaryCalls, "rejected inner calls must not dispatch");
-				assert.equal(result.isError, true);
-				assert.equal(result.details?.failureCategory, "policy-blocked");
-				assert.match(result.content[0]?.text ?? "", /Script failed: 1 browser call was rejected before dispatch/);
-				assert.deepEqual(result.details?.scriptRun, {
-					aborted: undefined,
-					callCount: 1,
-					emitCount: 1,
-					failedCallCount: 0,
-					preDispatchRejectedCallCount: 1,
-					successfulCallCount: 0,
-					timedOut: undefined,
-				});
-				assert.equal(result.details?.scriptSession, undefined);
-			}
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("session_shutdown aborts and reaps an active sandbox child", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-shutdown-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `if (__piabFakeArgs.includes("--version")) {
-  setTimeout(() => process.stdout.write(${JSON.stringify(`${TARGET_AGENT_BROWSER_VERSION_LABEL}\n`)}), 500);
-}`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_CUSTOM_VERSION: "1" }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const pendingResult = executeRegisteredTool(harness.tool, harness.ctx, { script: "while (true) {}", timeoutMs: 10_000 });
-			await delay(50);
-			await runExtensionEvent(harness.handlers, "session_shutdown", { reason: "quit" }, harness.ctx);
-			const result = await pendingResult;
-			assert.equal(result.isError, true);
-			assert.equal(result.details?.failureCategory, "aborted");
-			assert.equal((result.details?.scriptRun as { aborted?: boolean } | undefined)?.aborted, true);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("session_tree aborts and fully cleans an active browser-bearing script", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-tree-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
-const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
-if (args.includes("session") && args.includes("info")) process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
-else if (args.includes("close")) process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));
-else process.stdout.write(JSON.stringify({ success: true, data: { title: "Tree probe" } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO: "1" }, async () => {
-			let resolveActive!: () => void;
-			const activeLease = new Promise<void>((resolve) => { resolveActive = resolve; });
-			const harness = createExtensionHarness({
-				cwd: tempDir,
-				sessionFile: join(tempDir, "session.jsonl"),
-				onAppendEntry(_customType, data) {
-					if ((data as { cleanup?: string }).cleanup === "active") resolveActive();
-				},
-			});
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const controller = new AbortController();
-			const pendingResult = executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `await browser({ args: ["get", "title"] }); while (true) {}`,
-				timeoutMs: 10_000,
-			}, controller.signal);
-			try {
-				await Promise.race([activeLease, pendingResult.then((result) => assert.fail(`Script settled before its active lease: ${JSON.stringify(result)}`))]);
-				assert.ok(harness.appendedEntries.some((entry) => (entry.data as { cleanup?: string }).cleanup === "active"));
-				for (let index = 0; index < 100; index += 1) {
-					const invocations = await readInvocationLog(logPath);
-					if (invocations.some((entry) => entry.args.includes("get") && entry.args.includes("title"))) break;
-					await delay(10);
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				try {
+					await run(harness, logPath, dir);
+				} finally {
+					await runExtensionEvent(
+						harness.handlers,
+						"session_shutdown",
+						{ reason: "quit" },
+						harness.ctx,
+					);
 				}
-				assert.ok((await readInvocationLog(logPath)).some((entry) => entry.args.includes("get") && entry.args.includes("title")), "browser subprocess should start before branch abort");
-				const startedAt = Date.now();
-				await runExtensionEvent(harness.handlers, "session_tree", { reason: "switch" }, harness.ctx);
-				const result = await pendingResult;
-				assert.ok(Date.now() - startedAt < 2_000, "branch change should abort instead of waiting for the script deadline");
-				assert.equal(result.details?.failureCategory, "aborted");
-				assert.equal((result.details?.scriptSession as { cleanup?: string } | undefined)?.cleanup, "closed");
-				assert.deepEqual(harness.appendedEntries.map((entry) => (entry.data as { cleanup?: string }).cleanup), ["active", "closed"]);
-				const invocations = await readInvocationLog(logPath);
-				assert.equal(invocations.filter((entry) => entry.args.at(-1) === "close").length, 1);
-			} finally {
-				controller.abort();
-				await Promise.allSettled([pendingResult]);
-			}
-		});
+			},
+		);
 	} finally {
-		await rm(tempDir, { force: true, recursive: true });
+		await rm(dir, { recursive: true, force: true });
 	}
-});
-
-test("script inner calls and cleanup clear ambient upstream launch controls", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-env-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	const ambientNames = [
-		"AGENT_BROWSER_ALLOWED_DOMAINS", "AGENT_BROWSER_ARGS", "AGENT_BROWSER_AUTO_CONNECT", "AGENT_BROWSER_CDP",
-		"AGENT_BROWSER_EXECUTABLE_PATH", "AGENT_BROWSER_HEADED", "AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_PROFILE",
-		"AGENT_BROWSER_PROVIDER", "AGENT_BROWSER_RESTORE", "AGENT_BROWSER_SESSION", "AGENT_BROWSER_STATE",
-		"AGENT_BROWSER_USER_AGENT", "AGENT_BROWSER_AUTOSAVE_INTERVAL_MS", "Agent_Browser_Profile", "Agent_Browser_Provider", "HTTPS_PROXY", "https_proxy", "Https_Proxy",
-	];
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
-const args = process.argv.slice(2);
-const names = ${JSON.stringify(ambientNames)};
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, env: Object.fromEntries(names.map(name => [name, process.env[name] ?? null])), config: process.env.AGENT_BROWSER_CONFIG ?? null, configContent: process.env.AGENT_BROWSER_CONFIG ? fs.readFileSync(process.env.AGENT_BROWSER_CONFIG, "utf8") : null }) + "\\n");
-if (args.includes("session") && args.includes("info")) process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
-else if (args.includes("close")) process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));
-else process.stdout.write(JSON.stringify({ success: true, data: { title: "Isolated env", url: "https://example.test" } }));`);
-	try {
-		const ambientEnv = Object.fromEntries(ambientNames.map((name) => [name, name.includes("PROXY") || name === "https_proxy" ? "http://proxy.invalid" : "ambient-control"]));
-		await withPatchedEnv({
-			...ambientEnv,
-			AGENT_BROWSER_CONFIG: join(tempDir, "ambient-agent-browser.json"),
-			PATH: `${tempDir}:${basePath}`,
-			PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO: "1",
-		}, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `const opened = await browser({ args: ["open", "https://example.test"] }); if (!opened.ok) throw new Error(opened.error); const inspected = await browser(opened.nextActions.find(action => action.id === "inspect-opened-page").params); emit(inspected.ok);`,
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(result.details?.data, true);
-			assert.equal((result.details?.scriptRun as { callCount?: number } | undefined)?.callCount, 2);
-			assert.equal(result.details?.attachedBrowserSession, undefined);
-			const sessionName = (result.details?.scriptSession as { sessionName?: string } | undefined)?.sessionName;
-			const invocations = (await readInvocationLog(logPath) as Array<{ args: string[]; config?: string | null; configContent?: string | null; env?: Record<string, string | null> }>).filter((entry) => entry.args.includes(sessionName ?? "missing"));
-			assert.ok(invocations.some((invocation) => invocation.args.includes("snapshot")), "script should replay the policy-compatible next action");
-			for (const invocation of invocations) {
-				for (const name of ambientNames) {
-					const value = invocation.env?.[name];
-					assert.notEqual(value, "ambient-control", `${name} leaked into ${JSON.stringify(invocation.args)}`);
-					assert.notEqual(value, "http://proxy.invalid", `${name} leaked into ${JSON.stringify(invocation.args)}`);
-				}
-				assert.notEqual(invocation.config, join(tempDir, "ambient-agent-browser.json"));
-				assert.equal(invocation.configContent, "{}", "script and cleanup must bypass HOME/project native config");
-			}
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("script cleanup retires its active recording reservation", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-recording-cleanup-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const args = process.argv.slice(2);
-const command = args.find((arg) => ["open", "record", "pdf", "close", "session"].includes(arg));
-const index = args.indexOf(command);
-if (command === "session") process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
-else if (command === "open") process.stdout.write(JSON.stringify({ success: true, data: { title: "Example", url: args[index + 1] } }));
-else if (command === "record") process.stdout.write(JSON.stringify({ success: true, data: { path: args[index + 2] } }));
-else if (command === "pdf") process.stdout.write(JSON.stringify({ success: true, data: { path: args[index + 1] } }));
-else process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO: "1" }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `await browser({ args: ["open", "https://example.test/"] }); emit(await browser({ args: ["record", "start", "script.webm"] }));`,
-			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			const manifest = result.details?.artifactManifest as { entries?: Array<{ subcommand?: string }> } | undefined;
-			assert.equal(manifest?.entries?.some((entry) => entry.subcommand === "start"), false);
-			const reuse = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["pdf", "script.webm"] });
-			assert.doesNotMatch(reuse.content[0]?.text ?? "", /reserved by an active recording/);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension injects an isolated script session, persists its lease before spawn, and closes it", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-extension-"));
-	const logPath = join(tempDir, "invocations.log");
-	const leaseMarkerPath = join(tempDir, "lease-active");
-	const outputPath = join(tempDir, "script-output.json");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
-const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, leasePresent: fs.existsSync(${JSON.stringify(leaseMarkerPath)}) }) + "\\n");
-if (args.includes("session") && args.includes("info")) {
-  process.stdout.write(JSON.stringify({ success: true, data: { active: false, runtime: null } }));
-} else if (args.includes("close")) {
-  process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));
-} else if (args.includes("url")) {
-  process.stdout.write(JSON.stringify({ success: true, data: { result: "https://example.test/", url: "https://example.test/" } }));
-} else {
-  process.stdout.write(JSON.stringify({ success: true, data: { password: "secret-value", result: "Script title", title: "Script title" } }));
-}`);
-
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO: "1" }, async () => {
-			const harness = createExtensionHarness({
-				cwd: tempDir,
-				sessionFile: join(tempDir, "session.jsonl"),
-				onAppendEntry(customType, data) {
-					if (customType === "agent-browser-script-session" && (data as { cleanup?: string }).cleanup === "active") writeFileSync(leaseMarkerPath, "active");
-				},
-			});
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const beforeScript = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["get", "title"] });
-			assert.equal(beforeScript.isError, false);
-			const implicitSessionName = beforeScript.details?.sessionName;
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				outputPath,
-				script: `
-const values = [];
-for (let index = 0; index < 2; index += 1) {
-  const result = await browser({ args: ["get", "title"] });
-  if (result.ok) values.push({ title: result.data.title, password: result.data.password });
 }
-emit(values);`,
+
+test(
+	"code shares the selected persistent browser with direct calls and persists ordered resume state",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness, logPath) => {
+			const code = harness.getTool("agent_browser_code");
+			assert.ok(code);
+			const direct = await executeRegisteredTool(harness.tool, harness.ctx, {
+				args: ["open", "https://fixture.test/start"],
+			});
+			assert.equal(direct.isError, false, JSON.stringify(direct));
+			const first = await executeRegisteredTool(code, harness.ctx, {
+				code: `await browser({args:["open","https://fixture.test/one"]}); await browser({args:["snapshot","-i"]}); emit((await browser({args:["open","https://fixture.test/two"]})).data.url);`,
+			});
+			assert.equal(first.isError, false, JSON.stringify(first));
+			assert.equal(readRecord(first.details).data, "https://fixture.test/two");
+			assert.equal(readRecord(first.details).sessionName, readRecord(direct.details).sessionName);
+			const second = await executeRegisteredTool(code, harness.ctx, {
+				code: `emit((await browser({args:["get","url"]})).data.url);`,
+			});
+			assert.equal(readRecord(second.details).data, "https://fixture.test/two");
+			assert.equal(readRecord(second.details).sessionName, readRecord(first.details).sessionName);
+			assert.equal(
+				(await readInvocationLog(logPath)).some((call) => call.args.includes("close")),
+				false,
+				"code completion must preserve the browser",
+			);
+			const transitions = harness.appendedEntries.filter(
+				(entry) => entry.customType === BROWSER_TRANSITION_ENTRY,
+			);
+			assert.equal(
+				transitions.length,
+				10,
+				"direct and inner commands each persist a begin/finish pair",
+			);
+			assert.ok(
+				transitions.every(
+					(entry) => !("data" in readRecord(readRecord(readRecord(entry.data).event).state)),
+				),
+				"state journal must not copy page output",
+			);
+			const state = SessionPageState.fromBranch(harness.ctx.sessionManager.getBranch());
+			const key = getAgentBrowserSessionIdentityKey(
+				readString(readRecord(first.details).sessionName),
+			);
+			assert.equal(state.get(key).tabTarget?.url, "https://fixture.test/two");
+			const resumed = createExtensionHarness({
+				cwd: harness.ctx.cwd,
+				sessionFile: join(harness.ctx.cwd, "session.jsonl"),
+				branch: harness.ctx.sessionManager.getBranch(),
+			});
+			await runExtensionEvent(resumed.handlers, "session_start", { reason: "resume" }, resumed.ctx);
+			const resumedCode = resumed.getTool("agent_browser_code");
+			assert.ok(resumedCode);
+			const inspected = await executeRegisteredTool(resumedCode, resumed.ctx, {
+				code: `emit((await browser({args:["get","url"]})).data.url);`,
+			});
+			assert.equal(inspected.details?.data, "https://fixture.test/two");
+		});
+	},
+);
+
+test(
+	"code raw data remains available for reduction without presentation spills",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness) => {
+			const code = harness.getTool("agent_browser_code");
+			assert.ok(code);
+			const result = await executeRegisteredTool(code, harness.ctx, {
+				session: "selection",
+				namespace: "code-tests",
+				code: `const r=await browser({args:["eval","--stdin"],stdin:"[]"}); emit({length:r.data.result.length,end:r.data.result.slice(-3)});`,
 			});
 			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.deepEqual(result.details?.data, [
-				{ title: "Script title", password: "[REDACTED]" },
-				{ title: "Script title", password: "[REDACTED]" },
-			]);
-			assert.equal((result.details?.scriptSteps as unknown[])?.length, 2);
-			const scriptSession = result.details?.scriptSession as { cleanup?: string; sessionName?: string } | undefined;
-			assert.equal(scriptSession?.cleanup, "closed");
-			assert.match(scriptSession?.sessionName ?? "", /^piab-script-[0-9a-f-]{36}$/);
-			const closeCommandArgs = ["--namespace", "", "--session", scriptSession?.sessionName, "close"];
-			assert.deepEqual(harness.appendedEntries.map((entry) => entry.data), [
-				{ cleanup: "active", closeCommandArgs, launchAttempted: true, sessionName: scriptSession?.sessionName },
-				{ cleanup: "closed", closeCommandArgs, launchAttempted: true, sessionName: scriptSession?.sessionName },
-			]);
-			assert.deepEqual(scriptSession, { cleanup: "closed", closeCommandArgs, launchAttempted: true, sessionName: scriptSession?.sessionName });
-			const secondResult = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `emit((await browser({ args: ["get", "title"] })).data.title);`,
+			assert.deepEqual(readRecord(result.details).data, { length: 30003, end: "END" });
+			assert.equal(readRecord(result.details).sessionName, "selection");
+			assert.equal(readRecord(result.details).namespace, "code-tests");
+			const entries =
+				readRecord(result.details).artifactManifest === undefined
+					? []
+					: readArray(readRecord(readRecord(result.details).artifactManifest).entries);
+			assert.equal(
+				entries.map(readRecord).some((entry) => entry.kind === "spill"),
+				false,
+			);
+		});
+	},
+);
+
+test(
+	"code cannot silently switch its leased identity or close another session",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness, logPath) => {
+			const code = harness.getTool("agent_browser_code");
+			assert.ok(code);
+			const result = await executeRegisteredTool(code, harness.ctx, {
+				session: "selected",
+				code: `emit(await browser({args:["--session","other","open","https://fixture.test/other"]})); emit(await browser({args:["close","--all"]}));`,
 			});
-			const secondSessionName = (secondResult.details?.scriptSession as { sessionName?: string } | undefined)?.sessionName;
-			assert.notEqual(secondSessionName, scriptSession?.sessionName, "every script call must receive a unique isolated session");
-			const afterScript = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["get", "title"] });
-			assert.equal(afterScript.details?.sessionName, implicitSessionName, "script must not replace the current implicit session");
-			const invocations = await readInvocationLog(logPath) as Array<{ args: string[]; leasePresent?: boolean }>;
-			assert.ok(invocations.length > 0);
-			const scriptInvocations = invocations.filter((entry) => entry.args.includes(scriptSession?.sessionName ?? "missing"));
-			assert.ok(scriptInvocations.every((entry) => entry.leasePresent === true), "lease must exist before every isolated-session fake upstream spawn");
-			const contentInvocations = scriptInvocations.filter((entry) => entry.args.includes("get") && entry.args.includes("title"));
-			assert.ok(contentInvocations.length >= 2);
-			for (const invocation of contentInvocations) {
-				assert.deepEqual(invocation.args.slice(invocation.args.indexOf("--namespace"), invocation.args.indexOf("--namespace") + 4), ["--namespace", "", "--session", scriptSession?.sessionName]);
+			const values = readArray(readRecord(result.details).data).map(readRecord);
+			assert.equal(values[0].success, false);
+			assert.match(readString(values[0].error), /one browser identity/);
+			assert.equal(values[1].success, false);
+			assert.match(readString(values[1].error), /namespace-wide close/);
+			assert.equal(
+				(await readInvocationLog(logPath)).some(
+					(call) => call.args.includes("other") || call.args.includes("close"),
+				),
+				false,
+			);
+			const recovery = readRecord(
+				JSON.parse(result.content.find((item) => item.type === "text")?.text ?? "{}"),
+			);
+			assert.equal(
+				readArray(recovery.failures).length,
+				2,
+				"unemitted errors must still be visible",
+			);
+		});
+	},
+);
+
+test(
+	"a code deadline expires while waiting behind another local code cell",
+	{ concurrency: false, timeout: 10_000 },
+	async () => {
+		await withCodeHarness(async (harness, logPath) => {
+			const tool = harness.getTool("agent_browser_code");
+			assert.ok(tool);
+			const first = executeRegisteredTool(tool, harness.ctx, {
+				code: 'await browser({args:["get","url"]}); const end=Date.now()+1500; while(Date.now()<end) {} emit("first");',
+			});
+			// Poll the receipt until inner dispatch has begun before cancelling.
+			// oxlint-disable-next-line no-await-in-loop
+			while (!(await readInvocationLog(logPath)).some((call) => call.args.includes("get"))) {
+				// The next receipt observation must wait for its retry delay.
+				// oxlint-disable-next-line no-await-in-loop
+				await delay(10);
 			}
-			assert.deepEqual(JSON.parse(await readFile(outputPath, "utf8")), result.details?.data);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension closes its isolated session after a script timeout", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-timeout-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
-const args = process.argv.slice(2);
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
-process.stdout.write(JSON.stringify({ success: true, data: args.includes("close") ? { closed: true } : { title: "ok" } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `await browser({ args: ["get", "title"] }); while (true) {}`,
-				timeoutMs: process.platform === "android" ? 300 : 150,
+			const second = executeRegisteredTool(tool, harness.ctx, {
+				code: 'emit("second");',
+				timeoutMs: 50,
 			});
+			try {
+				const result = await Promise.race([second, delay(500)]);
+				assert.ok(result, "queued code must time out without waiting for the first cell to finish");
+				assert.equal(result.isError, true);
+				assert.equal(readRecord(result.details).failureCategory, "timeout");
+			} finally {
+				await Promise.all([first, second]);
+			}
+		});
+	},
+);
+
+test(
+	"code export failures preserve partial data and render one truthful observation",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness, _log, dir) => {
+			await writeFile(join(dir, "blocked"), "existing file");
+			const tool = harness.getTool("agent_browser_code");
+			assert.ok(tool);
+			const result = await executeRegisteredTool(tool, harness.ctx, {
+				code: "emit({done:true});",
+				outputPath: join(dir, "blocked", "out.json"),
+			});
+			const observation = readRecord(
+				JSON.parse(result.content.find((item) => item.type === "text")?.text ?? "{}"),
+			);
 			assert.equal(result.isError, true);
-			assert.equal(result.details?.failureCategory, "timeout");
-			assert.equal((result.details?.scriptSession as { cleanup?: string } | undefined)?.cleanup, "closed");
-			assert.deepEqual(harness.appendedEntries.map((entry) => (entry.data as { cleanup?: string }).cleanup), ["active", "closed"]);
-			const invocations = await readInvocationLog(logPath);
-			assert.ok(invocations.some((entry) => entry.args.includes("close")));
-
-			const thrown = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `await browser({ args: ["get", "title"] }); throw new Error("intentional cleanup probe");`,
-			});
-			assert.equal(thrown.isError, true);
-			assert.equal(thrown.details?.failureCategory, "script-error");
-			assert.match((thrown.content[0] as { text: string }).text, /Script failed: Error: intentional cleanup probe/);
-			assert.match((thrown.content[0] as { text: string }).text, /Isolated script session closed/);
-			assert.deepEqual(thrown.details?.scriptRun, {
-				aborted: undefined,
-				callCount: 1,
-				emitCount: 0,
-				failedCallCount: 0,
-				preDispatchRejectedCallCount: 0,
-				successfulCallCount: 1,
-				timedOut: undefined,
-			});
-			assert.equal((thrown.details?.scriptSession as { cleanup?: string } | undefined)?.cleanup, "closed");
+			assert.equal(observation.success, false);
+			assert.equal(observation.resultCategory, "failure");
+			assert.equal(observation.failureCategory, "upstream-error");
+			assert.match(readString(observation.error), /ENOTDIR|EEXIST/);
+			assert.deepEqual(observation.data, { done: true });
+			assert.doesNotMatch(readString(observation.summary), /completed/);
 		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+	},
+);
 
-test("agentBrowserExtension rehydrates only its verified compact spill for script logic", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-spill-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const args = process.argv.slice(2);
-if (args.includes("close")) process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));
-else process.stdout.write(JSON.stringify({ success: true, data: Array.from({ length: 700 }, (_, index) => ({ index, text: "row-" + index + "-" + "x".repeat(30) })) }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `const result = await browser({ args: ["eval", "--stdin"], stdin: "() => []" }); emit({ length: result.data.length, last: result.data.at(-1).index });`,
+test(
+	"session_tree joins oversized code observation finalization without publishing A artifacts onto independent B",
+	{ concurrency: false, timeout: 15_000 },
+	async () => {
+		const root = await mkdtemp(join(tmpdir(), "piab-code-finalization-race-"));
+		try {
+			const marker = join(root, "effect-started"),
+				file = join(root, "session.jsonl");
+			await writeFakeAgentBrowserBinary(
+				root,
+				`const fs=require('node:fs'), args=process.argv.slice(2);
+if(args.includes('eval')) {fs.writeFileSync(${JSON.stringify(marker)},'started'); setInterval(()=>{},1000);}
+else process.stdout.write(JSON.stringify({success:true,data:{url:'https://fixture.test/'}}));`,
+			);
+			await withPatchedEnv(
+				{
+					PATH: `${root}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`,
+					AGENT_BROWSER_SESSION: undefined,
+					AGENT_BROWSER_NAMESPACE: undefined,
+				},
+				async () => {
+					const branch = (id: string) => [
+						{
+							type: "message",
+							id,
+							parentId: null,
+							message: { role: "user", content: [{ type: "text", text: `Branch ${id}` }] },
+						},
+					];
+					const harness = createExtensionHarness({
+						cwd: root,
+						sessionFile: file,
+						branch: branch("a"),
+					});
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+					const tool = harness.getTool("agent_browser_code");
+					assert.ok(tool);
+					const pending = executeRegisteredTool(tool, harness.ctx, {
+						session: "finalization-race",
+						code: 'emit("x".repeat(24000)); await browser({args:["eval","--stdin"],stdin:"1"});',
+					});
+					const deadline = Date.now() + 10_000;
+					while (true) {
+						try {
+							// Observe the real child effect before triggering branch navigation.
+							// oxlint-disable-next-line no-await-in-loop
+							await readFile(marker);
+							break;
+						} catch {
+							// Missing markers must stay within the deadline; a successful read ends polling.
+							// oxlint-disable-next-line node-test/no-conditional-assertion
+							assert.ok(
+								Date.now() < deadline,
+								"code must reach the real fake-upstream effect before tree navigation",
+							);
+							// Wait between missing-marker observations rather than overlapping reads.
+							// oxlint-disable-next-line no-await-in-loop
+							await delay(10);
+						}
+					}
+					harness.setBranch(branch("b"));
+					await runExtensionEvent(
+						harness.handlers,
+						"session_tree",
+						{ newLeafId: "b", oldLeafId: "a" },
+						harness.ctx,
+					);
+					const result = await pending;
+					assert.equal(result.isError, true);
+					assert.equal(readRecord(readRecord(result.details).codeRun).aborted, true);
+					assert.equal(
+						readRecord(result.details).data,
+						"x".repeat(24000),
+						"the caller retains complete selected output after interruption",
+					);
+					const observation = readRecord(
+						JSON.parse(result.content.find((part) => part.type === "text")?.text ?? "{}"),
+					);
+					assert.equal(
+						readRecord(JSON.parse(await readFile(readString(observation.observationPath), "utf8")))
+							.data,
+						"x".repeat(24000),
+					);
+					assert.deepEqual(
+						harness.ctx.sessionManager.getBranch().map((entry) => readRecord(entry).id),
+						["b"],
+						"outer finalization cannot append A's artifact state beneath B",
+					);
+					const all = (await readFile(file, "utf8"))
+						.trim()
+						.split("\n")
+						.map((line) => {
+							const value: unknown = JSON.parse(line);
+							return value;
+						});
+					const begins = all
+						.map(getBrowserRecord)
+						.filter((record) => record?.event.phase === "begin");
+					assert.equal(begins.length, 1);
+					assert.equal(
+						SessionPageState.fromBranch(all).get("finalization-race").tabTargetUnknown,
+						true,
+						"the unfinished effect remains uncertain",
+					);
+					await runExtensionEvent(
+						harness.handlers,
+						"session_shutdown",
+						{ reason: "quit" },
+						harness.ctx,
+					);
+				},
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	},
+);
+
+test(
+	"raw batch credentials are absent from code intent and completion journals",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness, logPath) => {
+			const rows = [
+				"cookies set session synthetic-cookie-value",
+				"storage local set token synthetic-storage-value",
+				"clipboard write synthetic-clipboard-value",
+			];
+			const tool = harness.getTool("agent_browser_code");
+			assert.ok(tool);
+			const result = await executeRegisteredTool(tool, harness.ctx, {
+				code: `await browser({args:["batch","--bail",...${JSON.stringify(rows)}]}); emit("done");`,
 			});
 			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.deepEqual(result.details?.data, { length: 700, last: 699 });
-			assert.ok((result.details?.artifactManifest as { entries?: Array<{ kind?: string }> } | undefined)?.entries?.some((entry) => entry.kind === "spill"));
-			await runExtensionEvent(harness.handlers, "session_shutdown", { reason: "quit" }, harness.ctx);
+			const journal = JSON.stringify(
+				harness.appendedEntries.filter((entry) => entry.customType === BROWSER_TRANSITION_ENTRY),
+			);
+			assert.doesNotMatch(journal, /synthetic-(?:cookie|storage|clipboard)-value/);
+			assert.match(journal, /REDACTED/);
+			const invocation = (await readInvocationLog(logPath)).find((call) =>
+				call.args.includes("batch"),
+			);
+			assert.deepEqual(invocation?.args.slice(-3), rows, "execution argv remains unchanged");
 		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
+	},
+);
+
+test("pending inner transitions restore unknown target after interruption", () => {
+	const key = getAgentBrowserSessionIdentityKey("selected");
+	const state = SessionPageState.fromBranch(
+		convertBrowserEntries([
+			{
+				type: "custom",
+				customType: BROWSER_TRANSITION_ENTRY,
+				data: {
+					isError: false,
+					details: {
+						args: ["snapshot", "-i"],
+						sessionName: "selected",
+						sessionTabTarget: { url: "https://fixture.test/old" },
+						refSnapshot: { refIds: ["e1"] },
+					},
+				},
+			},
+			{
+				type: "custom",
+				customType: BROWSER_TRANSITION_ENTRY,
+				data: {
+					isError: true,
+					details: {
+						args: ["click", "@e1"],
+						sessionName: "selected",
+						sessionTabTargetUnknown: true,
+					},
+				},
+			},
+		]),
+	);
+	assert.equal(state.get(key).tabTargetUnknown, true);
+	assert.equal(state.get(key).refSnapshot, undefined);
 });
 
-test("script still runs fail-closed cleanup when the main browser command never starts", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-preflight-"));
-	const logPath = join(tempDir, "invocations.log");
-	const socketDir = join(tempDir, "a".repeat(80));
-	const basePath = process.env.PATH ?? "";
-	await mkdir(socketDir, { recursive: true });
-	await chmod(socketDir, 0o700);
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");
-process.stdout.write(JSON.stringify({ success: true, data: { title: "should not run" } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_SOCKET_DIR: socketDir }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				script: `emit(await browser({ args: ["open", "https://example.test/"] }));`,
+test(
+	"pre-0.7 script cleanup leases remain recoverable after upgrade",
+	{ concurrency: false },
+	async () => {
+		await withCodeHarness(async (harness, logPath) => {
+			const sessionName = "piab-script-12345678-1234-4123-8123-123456789abc";
+			const legacy = [
+				{
+					type: "custom",
+					customType: "agent-browser-script-session",
+					data: {
+						cleanup: "failed",
+						closeCommandArgs: ["--namespace", "", "--session", sessionName, "close"],
+						launchAttempted: true,
+						sessionName,
+					},
+				},
+			];
+			const canonical = convertBrowserEntries(legacy, harness.ctx.sessionManager.getSessionId());
+			const fork = createExtensionHarness({
+				cwd: harness.ctx.cwd,
+				sessionId: "ordinary-fork",
+				branch: canonical,
 			});
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal((result.details?.data as { ok?: boolean } | undefined)?.ok, false);
-			assert.equal((result.details?.data as { failureCategory?: string } | undefined)?.failureCategory, "validation-error");
-			assert.match((result.details?.data as { error?: string } | undefined)?.error ?? "", /Unix socket path would be/);
-			assert.equal((result.details?.scriptSession as { cleanup?: string } | undefined)?.cleanup, "closed");
-			assert.deepEqual(harness.appendedEntries.map((entry) => (entry.data as { cleanup?: string }).cleanup), ["active", "closed"]);
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("open")), false);
-			assert.ok(invocations.some((entry) => entry.args.includes("close")), "cleanup must close helpers that could have started the isolated browser");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("script cleanup failure is durable and exposes the exact close action", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-cleanup-fail-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(tempDir, `const args = process.argv.slice(2);
-if (args.includes("close")) { process.stderr.write("close failed"); process.exit(1); }
-process.stdout.write(JSON.stringify({ success: true, data: { title: "ok" } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionFile: join(tempDir, "session.jsonl") });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, { script: `emit((await browser({ args: ["get", "title"] })).data.title);` });
-			assert.equal(result.isError, true);
-			assert.equal(result.details?.failureCategory, "cleanup-failed");
-			const scriptSession = result.details?.scriptSession as { cleanup?: string; sessionName?: string } | undefined;
-			assert.equal(scriptSession?.cleanup, "failed");
-			const closeAction = (result.details?.nextActions as Array<{ id?: string; params?: { args?: string[] } }>)[0];
-			assert.equal(closeAction?.id, "close-script-session-after-cleanup-failure");
-			assert.deepEqual(closeAction?.params?.args, ["--namespace", "", "--session", scriptSession?.sessionName, "close"]);
-			assert.equal((harness.appendedEntries.at(-1)?.data as { cleanup?: string }).cleanup, "failed");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("session_start restores failed script leases and retries close in a new extension process", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-script-restore-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	const sessionName = "piab-script-12345678-1234-4123-8123-123456789abc";
-	await writeFakeAgentBrowserBinary(tempDir, `const fs = require("node:fs"); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n"); process.stdout.write(JSON.stringify({ success: true, data: { closed: true } }));`);
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({
-				branch: [
-					{ type: "custom", customType: "agent-browser-script-session", data: { cleanup: "failed", closeCommandArgs: ["--namespace", "", "--session", sessionName, "close"], launchAttempted: true, sessionName } },
-					{ type: "custom", customType: "agent-browser-script-session", data: { cleanup: "active", closeCommandArgs: ["--session", "other", "close"], launchAttempted: true, sessionName } },
-					{ type: "custom", customType: "agent-browser-script-session", data: { sessionName: "piab-script-not-a-uuid", cleanup: "active", args: ["secret"] } },
-				],
-				cwd: tempDir,
-				sessionFile: join(tempDir, "session.jsonl"),
+			await runExtensionEvent(fork.handlers, "session_start", { reason: "fork" }, fork.ctx);
+			await runExtensionEvent(fork.handlers, "session_shutdown", { reason: "quit" }, fork.ctx);
+			assert.equal(
+				(await readInvocationLog(logPath)).some(
+					(call) => call.args.includes(sessionName) && call.args.includes("close"),
+				),
+				false,
+				"a new Pi UUID never inherits the parent's cleanup lease",
+			);
+			const resumed = createExtensionHarness({
+				cwd: harness.ctx.cwd,
+				sessionFile: join(harness.ctx.cwd, "session.jsonl"),
+				branch: canonical,
 			});
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "resume" }, harness.ctx);
-			assert.deepEqual(harness.appendedEntries.map((entry) => entry.data), [{ cleanup: "closed", closeCommandArgs: ["--namespace", "", "--session", sessionName, "close"], launchAttempted: true, sessionName }]);
-			const invocations = await readInvocationLog(logPath);
-			assert.ok(invocations.some((entry) => entry.args.includes("close") && entry.args.includes(sessionName)));
-			assert.equal(invocations.some((entry) => entry.args.includes("piab-script-not-a-uuid")), false);
+			await runExtensionEvent(resumed.handlers, "session_start", { reason: "resume" }, resumed.ctx);
+			assert.ok(
+				(await readInvocationLog(logPath)).some(
+					(call) => call.args.includes(sessionName) && call.args.includes("close"),
+				),
+			);
+			assert.equal(
+				readRecord(
+					readRecord(readRecord(readRecord(resumed.appendedEntries.at(-1)?.data).event).state)
+						.scriptLease,
+				).cleanup,
+				"closed",
+			);
 		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+	},
+);

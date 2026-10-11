@@ -7,15 +7,12 @@
  */
 
 import assert from "node:assert/strict";
-import { createServer, type Server } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import {
-	cleanupSecureTempArtifacts,
-} from "../extensions/agent-browser/lib/temp.js";
+import { cleanupSecureTempArtifacts } from "../extensions/agent-browser/lib/temp.js";
 import {
 	createExtensionHarness,
 	createToolBranchEntry,
@@ -25,233 +22,118 @@ import {
 	withPatchedEnv,
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
+import { readRecord, readArray, readString } from "./helpers/assertions.js";
 
-async function listenOnLoopback(server: Server): Promise<number> {
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(0, "127.0.0.1", () => {
-			server.off("error", reject);
-			resolve();
-		});
-	});
-	const address = server.address();
-	assert.ok(address && typeof address === "object");
-	return address.port;
+test("agentBrowserExtension leaves download execution upstream-owned on local and remote pages", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-native-download-"));
+	const logPath = join(tempDir, "invocations.log");
+	await writeFakeAgentBrowserBinary(
+		tempDir,
+		`
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
+if (args.includes("download")) {
+  const path = args.at(-1);
+  fs.writeFileSync(path, "native-download");
+  console.log(JSON.stringify({ success: true, data: { path } }));
+} else {
+  console.log(JSON.stringify({ success: true, data: { url: process.env.PI_AGENT_BROWSER_TEST_PAGE_URL } }));
 }
-
-test("agentBrowserExtension saves simple anchor downloads directly to the requested path", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-anchor-download-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	const server = createServer((req, res) => {
-		if (req.url === "/fixture.txt") {
-			res.writeHead(200, { "content-type": "text/plain" });
-			res.end("fixture-download-ok");
-			return;
+`,
+	);
+	try {
+		for (const url of ["http://127.0.0.1:12345/", "https://fixture.test/"]) {
+			// The next fixture operation depends on completion of this shared lifecycle transition.
+			// oxlint-disable-next-line no-await-in-loop
+			await withPatchedEnv(
+				{ PATH: `${tempDir}:${process.env.PATH ?? ""}`, PI_AGENT_BROWSER_TEST_PAGE_URL: url },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					const path = join(tempDir, "downloads", "report.csv");
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["download", "#export", path],
+					});
+					// The nonempty url fixture matrix exhaustively verifies each case; any failed assertion fails the test.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(result.isError, false, result.content[0].text);
+					// The nonempty url fixture matrix exhaustively verifies each case; any failed assertion fails the test.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(await readFile(path, "utf8"), "native-download");
+					// The nonempty url fixture matrix exhaustively verifies each case; any failed assertion fails the test.
+					// oxlint-disable-next-line node-test/no-conditional-assertion
+					assert.equal(readRecord(result.details?.artifactVerification).verified, true);
+				},
+			);
 		}
-		res.writeHead(404);
-		res.end("missing");
-	});
-	const port = await listenOnLoopback(server);
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
-const args = process.argv.slice(2);
-let stdin = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { stdin += chunk; });
-process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
-  if (args.includes("eval")) {
-    process.stdout.write(JSON.stringify({ success: true, data: { result: { bodyBase64: Buffer.from("fixture-download-ok").toString("base64"), contentType: "text/plain", status: "fetched-anchor", href: "http://127.0.0.1:${port}/fixture.txt", pageUrl: "http://127.0.0.1:${port}/", responseUrl: "http://127.0.0.1:${port}/fixture.txt", sizeBytes: Buffer.byteLength("fixture-download-ok"), download: "fixture.txt" } } }));
-    return;
-  }
-  if (args.includes("download")) {
-    process.stdout.write(JSON.stringify({ success: false, error: "download command should not run for simple anchors" }));
-    process.exit(1);
-    return;
-  }
-  process.stdout.write(JSON.stringify({ success: true, data: { title: "Fixture", url: "http://127.0.0.1:${port}/" } }));
-});`,
-	);
-
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const open = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["open", `http://127.0.0.1:${port}/`] });
-			assert.equal(open.isError, false);
-			const requestedPath = join(tempDir, "downloads", "fixture.txt");
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["download", "#download", requestedPath] });
-
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(await readFile(requestedPath, "utf8"), "fixture-download-ok");
-			assert.equal(result.details?.savedFilePath, requestedPath);
-			assert.equal((result.details?.artifactManifest as { entries?: Array<{ path?: string; storageScope?: string }>; liveCount?: number } | undefined)?.liveCount, 1);
-			assert.equal((result.details?.artifactManifest as { entries?: Array<{ path?: string; storageScope?: string }> } | undefined)?.entries?.[0]?.storageScope, "explicit-path");
-			assert.equal((result.details?.artifactManifest as { entries?: Array<{ path?: string; storageScope?: string }> } | undefined)?.entries?.[0]?.path, requestedPath);
-			assert.equal((result.details?.artifactVerification as { verified?: boolean } | undefined)?.verified, true);
-			assert.equal((result.details?.downloadRecovery as { method?: string } | undefined)?.method, "direct-anchor-fetch");
-			const invocations = await readInvocationLog(logPath);
-			assert.equal(invocations.some((entry) => entry.args.includes("download")), false);
-			assert.ok(invocations.some((entry) => entry.args.includes("eval")));
-		});
+		const invocations = await readInvocationLog(logPath);
+		assert.equal(invocations.filter((call) => call.args.includes("download")).length, 2);
+		assert.equal(
+			invocations.some((call) => call.args.includes("eval")),
+			false,
+			"download must not be replaced with an in-page fetch",
+		);
 	} finally {
-		server.close();
-		await rm(tempDir, { force: true, recursive: true });
+		await rm(tempDir, { recursive: true, force: true });
 	}
 });
 
-test("agentBrowserExtension falls back when a non-loopback page points at loopback", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-anchor-download-remote-page-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
-const path = require("node:path");
-const args = process.argv.slice(2);
-let stdin = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { stdin += chunk; });
-process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
-  if (args.includes("eval")) {
-    process.stdout.write(JSON.stringify({ success: true, data: { result: { bodyBase64: Buffer.from("unsafe-host-fetch").toString("base64"), contentType: "text/plain", status: "fetched-anchor", href: "http://127.0.0.1:12345/secret.txt", pageUrl: "https://remote.example/", responseUrl: "http://127.0.0.1:12345/secret.txt", sizeBytes: Buffer.byteLength("unsafe-host-fetch"), download: "secret.txt" } } }));
-    return;
-  }
-  if (args.includes("download")) {
-    const outputPath = args.at(-1);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, "upstream-fallback-ok");
-    process.stdout.write(JSON.stringify({ success: true, data: { path: outputPath } }));
-    return;
-  }
-  process.stdout.write(JSON.stringify({ success: true, data: { title: "Remote", url: "https://remote.example/" } }));
-});`,
-	);
-
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const open = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["open", "https://remote.example/"] });
-			assert.equal(open.isError, false);
-			const requestedPath = join(tempDir, "downloads", "remote.txt");
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["download", "#download", requestedPath] });
-
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(await readFile(requestedPath, "utf8"), "upstream-fallback-ok");
-			assert.equal((result.details?.downloadRecovery as { method?: string } | undefined)?.method, undefined);
-			const invocations = await readInvocationLog(logPath);
-			const evalInvocation = invocations.find((entry) => entry.args.includes("eval"));
-			assert.ok(evalInvocation);
-			assert.ok((evalInvocation.stdin ?? "").indexOf("not-loopback-page") < (evalInvocation.stdin ?? "").indexOf("fetch(anchorUrl.href"));
-			assert.ok(invocations.some((entry) => entry.args.includes("download")));
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension falls back to upstream download on anchor redirects", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-anchor-download-redirect-"));
-	const logPath = join(tempDir, "invocations.log");
-	const basePath = process.env.PATH ?? "";
-	const server = createServer((req, res) => {
-		if (req.url === "/redirect.txt") {
-			res.writeHead(302, { location: "https://example.com/fixture.txt" });
-			res.end();
-			return;
-		}
-		res.writeHead(404);
-		res.end("missing");
-	});
-	const port = await listenOnLoopback(server);
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
-const path = require("node:path");
-const args = process.argv.slice(2);
-let stdin = "";
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => { stdin += chunk; });
-process.stdin.on("end", () => {
-  fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args, stdin }) + "\\n");
-  if (args.includes("eval")) {
-    process.stdout.write(JSON.stringify({ success: true, data: { result: { status: "not-same-origin", href: "http://127.0.0.1:${port}/redirect.txt", pageUrl: "http://127.0.0.1:${port}/", download: "fixture.txt" } } }));
-    return;
-  }
-  if (args.includes("download")) {
-    const outputPath = args.at(-1);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, "upstream-fallback-ok");
-    process.stdout.write(JSON.stringify({ success: true, data: { path: outputPath } }));
-    return;
-  }
-  process.stdout.write(JSON.stringify({ success: true, data: { title: "Fixture", url: "http://127.0.0.1:${port}/" } }));
-});`,
-	);
-
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-			const open = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["open", `http://127.0.0.1:${port}/`] });
-			assert.equal(open.isError, false);
-			const requestedPath = join(tempDir, "downloads", "redirect.txt");
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, { args: ["download", "#download", requestedPath] });
-
-			assert.equal(result.isError, false, JSON.stringify(result));
-			assert.equal(await readFile(requestedPath, "utf8"), "upstream-fallback-ok");
-			assert.equal((result.details?.downloadRecovery as { method?: string } | undefined)?.method, undefined);
-			const invocations = await readInvocationLog(logPath);
-			const evalInvocation = invocations.find((entry) => entry.args.includes("eval"));
-			assert.ok(evalInvocation);
-			assert.match(evalInvocation.stdin ?? "", /redirect: "manual"/);
-			assert.ok(invocations.some((entry) => entry.args.includes("download")));
-		});
-	} finally {
-		server.close();
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension returns retry next actions for failed direct download verification", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-direct-download-failure-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write(JSON.stringify({ success: false, error: "Download not verified: file missing at /tmp/export.csv" }));
+test(
+	"agentBrowserExtension returns retry next actions for failed direct download verification",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-direct-download-failure-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write(JSON.stringify({ success: false, error: "Download not verified: file missing at /tmp/export.csv" }));
 process.exit(1);`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv(
+				{ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.test/" },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["download", "@e1", "/tmp/export.csv"],
-			});
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["download", "@e1", "/tmp/export.csv"],
+					});
 
-			assert.equal(result.isError, true);
-			assert.equal(result.details?.resultCategory, "failure");
-			assert.equal(result.details?.failureCategory, "download-not-verified");
-			const nextActions = result.details?.nextActions as Array<{ params?: { args: string[] } }> | undefined;
-			assert.deepEqual(nextActions?.[0]?.params?.args, ["--session", result.details?.sessionName, "wait", "--download", "/tmp/export.csv"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+					assert.equal(result.isError, true);
+					assert.equal(result.details?.resultCategory, "failure");
+					assert.equal(result.details.failureCategory, "download-not-verified");
+					const nextActions = readArray(result.details.nextActions).map(readRecord);
+					assert.deepEqual(readRecord(nextActions[0].params).args, [
+						"--session",
+						result.details.sessionName,
+						"wait",
+						"--download",
+						"/tmp/export.csv",
+					]);
+				},
+			);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-test("agentBrowserExtension keeps stale-ref guidance after same-tab verification", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-ref-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const fs = require("node:fs");
+test(
+	"agentBrowserExtension keeps stale-ref guidance after same-tab verification",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-ref-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const fs = require("node:fs");
 const args = process.argv.slice(2);
 if (args.includes("get") && args.includes("url")) {
   process.stdout.write(JSON.stringify({ success: true, data: { url: "https://example.com/" } }));
@@ -264,50 +146,59 @@ process.stdout.write(JSON.stringify({ success: true, data: { tabs: [
   { tabId: "t1", title: "Example Domain", url: "https://example.com/", active: true },
   { tabId: "t2", title: "Other", url: "https://other.example/", active: false }
 ] } }));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					harness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					harness.ctx,
+				);
+
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "click", "@e4"],
+				});
+
+				assert.equal(result.isError, true);
+				assert.equal(result.content[0].type, "text");
+				const text = readString(readRecord(result.content[0]).text);
+				assert.match(readString(text), /Could not locate element/);
+				assert.match(readString(text), /(?:@ref may be stale|ref may be stale)/);
+				assert.match(readString(text), /snapshot/);
+				assert.equal(result.details?.resultCategory, "failure");
+				assert.equal(result.details.failureCategory, "stale-ref");
 			});
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "resume" }, harness.ctx);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--session", "named", "click", "@e4"],
-			});
-
-			assert.equal(result.isError, true);
-			assert.equal(result.content[0]?.type, "text");
-			const text = (result.content[0] as { text: string }).text;
-			assert.match(text, /Could not locate element/);
-			assert.match(text, /(?:@ref may be stale|ref may be stale)/);
-			assert.match(text, /snapshot/);
-			assert.equal(result.details?.resultCategory, "failure");
-			assert.equal(result.details?.failureCategory, "stale-ref");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension keeps per-step stale-ref guidance for a verified user batch", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-batch-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`const args = process.argv.slice(2);
+test(
+	"agentBrowserExtension keeps per-step stale-ref guidance for a verified user batch",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-stale-batch-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`const args = process.argv.slice(2);
 if (args.includes("get") && args.includes("url")) {
   process.stdout.write(JSON.stringify({ success: true, data: { url: "https://example.com/" } }));
   process.exit(0);
@@ -321,187 +212,277 @@ process.stdout.write(JSON.stringify({ success: true, data: { tabs: [
   { tabId: "t1", title: "Example Domain", url: "https://example.com/", active: true },
   { tabId: "t2", title: "Other", url: "https://other.example/", active: false }
 ] } }));`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({
-				branch: [
-					createToolBranchEntry({
-						details: {
-							args: ["--session", "named", "open", "https://example.com"],
-							command: "open",
-							sessionName: "named",
-							sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
-						},
-						isError: false,
-					}),
-				],
-				cwd: tempDir,
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({
+					branch: [
+						createToolBranchEntry({
+							details: {
+								args: ["--session", "named", "open", "https://example.com"],
+								command: "open",
+								sessionName: "named",
+								sessionTabTarget: { title: "Example Domain", url: "https://example.com/" },
+							},
+							isError: false,
+						}),
+					],
+					cwd: tempDir,
+				});
+				await runExtensionEvent(
+					harness.handlers,
+					"session_start",
+					{ reason: "resume" },
+					harness.ctx,
+				);
+
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "named", "batch"],
+					stdin: JSON.stringify([["click", "@e4"]]),
+				});
+
+				assert.equal(result.isError, true);
+				assert.equal(result.content[0].type, "text");
+				const text = readString(readRecord(result.content[0]).text);
+				assert.match(readString(text), /Could not locate element/);
+				assert.match(readString(text), /refresh-interactive-refs/);
+				assert.match(readString(text), /snapshot/);
+				assert.equal(
+					readArray(result.details?.batchSteps).map(readRecord)[0].failureCategory,
+					"stale-ref",
+				);
 			});
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "resume" }, harness.ctx);
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--session", "named", "batch"],
-				stdin: JSON.stringify([["click", "@e4"]]),
-			});
-
-			assert.equal(result.isError, true);
-			assert.equal(result.content[0]?.type, "text");
-			const text = (result.content[0] as { text: string }).text;
-			assert.match(text, /Could not locate element/);
-			assert.match(text, /refresh-interactive-refs/);
-			assert.match(text, /snapshot/);
-			assert.equal((result.details?.batchSteps as Array<{ failureCategory: string }>)[0].failureCategory, "stale-ref");
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension reports direct fallback failures with the effective invocation", { concurrency: false }, async () => {
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const basePath = process.env.PATH ?? "";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write(JSON.stringify({ success: false, data: { title: "Wrong page" } }));
+test(
+	"agentBrowserExtension reports direct fallback failures with the effective invocation",
+	{ concurrency: false },
+	async () => {
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const basePath = process.env.PATH ?? "";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write(JSON.stringify({ success: false, data: { title: "Wrong page" } }));
 process.exit(1);`,
-	);
+		);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["open", "https://example.com"],
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["open", "https://example.com"],
+				});
+
+				assert.equal(result.isError, true);
+				assert.equal(result.content[0].type, "text");
+				const text = readString(readRecord(result.content[0]).text);
+				assert.match(
+					readString(text),
+					/^agent-browser --args --no-startup-window --json --session \S+ open https:\/\/example\.com\/? reported failure \(exit code 1\)\.$/m,
+				);
+				assert.match(readString(text), /inspect-page-after-navigation-error/);
+				assert.deepEqual(readArray(result.details?.effectiveArgs).map(readString).slice(0, 5), [
+					"--args",
+					"--no-startup-window",
+					"--json",
+					"--session",
+					result.details?.sessionName,
+				]);
+				assert.deepEqual(readArray(result.details?.effectiveArgs).map(readString).slice(-2), [
+					"open",
+					"https://example.com",
+				]);
+				assert.equal(result.details?.resultCategory, "failure");
+				assert.equal(result.details.failureCategory, "upstream-error");
+				const implicitAction = readArray(result.details.nextActions)
+					.map(readRecord)
+					.find((action) => action.id === "inspect-page-after-navigation-error");
+				assert.deepEqual(readRecord(implicitAction?.params).args, [
+					"--session",
+					result.details.sessionName,
+					"get",
+					"url",
+				]);
+
+				const namedResult = await withPatchedEnv({ AGENT_BROWSER_NAMESPACE: "prod" }, async () =>
+					executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["--namespace", "", "--session", "named", "open", "https://example.com"],
+					}),
+				);
+				const namedAction = readArray(namedResult.details?.nextActions)
+					.map(readRecord)
+					.find((action) => action.id === "inspect-page-after-navigation-error");
+				assert.equal(namedResult.details?.namespace, "");
+				assert.deepEqual(namedResult.details.effectiveArgs, [
+					"--args",
+					"--no-startup-window",
+					"--json",
+					"--namespace",
+					"",
+					"--session",
+					"named",
+					"open",
+					"https://example.com",
+				]);
+				assert.deepEqual(readRecord(namedAction?.params).args, [
+					"--namespace",
+					"",
+					"--session",
+					"named",
+					"get",
+					"url",
+				]);
 			});
+		} finally {
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			assert.equal(result.isError, true);
-			assert.equal(result.content[0]?.type, "text");
-			const text = (result.content[0] as { text: string }).text;
-			assert.match(text, /^agent-browser --json --session \S+ open https:\/\/example\.com\/? reported failure \(exit code 1\)\.$/m);
-			assert.match(text, /inspect-page-after-navigation-error/);
-			assert.deepEqual((result.details?.effectiveArgs as string[] | undefined)?.slice(0, 3), ["--json", "--session", result.details?.sessionName]);
-			assert.deepEqual((result.details?.effectiveArgs as string[] | undefined)?.slice(-2), ["open", "https://example.com/"]);
-			assert.equal(result.details?.resultCategory, "failure");
-			assert.equal(result.details?.failureCategory, "upstream-error");
-			const implicitAction = (result.details?.nextActions as Array<{ id?: string; params?: { args?: string[] } }> | undefined)?.find((action) => action.id === "inspect-page-after-navigation-error");
-			assert.deepEqual(implicitAction?.params?.args, ["--session", result.details?.sessionName, "get", "url"]);
-
-			const namedResult = await withPatchedEnv({ AGENT_BROWSER_NAMESPACE: "prod" }, async () => executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["--namespace", "", "--session", "named", "open", "https://example.com"],
-			}));
-			const namedAction = (namedResult.details?.nextActions as Array<{ id?: string; params?: { args?: string[] } }> | undefined)?.find((action) => action.id === "inspect-page-after-navigation-error");
-			assert.equal(namedResult.details?.namespace, "");
-			assert.deepEqual(namedResult.details?.effectiveArgs, ["--json", "--namespace", "", "--session", "named", "open", "https://example.com/"]);
-			assert.deepEqual(namedAction?.params?.args, ["--namespace", "", "--session", "named", "get", "url"]);
-		});
-	} finally {
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
-
-test("agentBrowserExtension discards oversized malformed output instead of persisting browser secrets", { concurrency: false }, async () => {
-	await cleanupSecureTempArtifacts();
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const sessionDir = await mkdtemp(join(tmpdir(), "pi-session-dir-"));
-	const sessionFile = join(sessionDir, "session.jsonl");
-	const basePath = process.env.PATH ?? "";
-	const sentinel = "RQ-0006-parse-failure-sentinel";
-	const restoreKey = `piab-r2-${"a".repeat(32)}`;
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write("x".repeat(600000) + ${JSON.stringify(restoreKey + sentinel)});`,
-	);
-
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionDir, sessionFile });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
-
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["state", "show", "caller-owned.json"],
-			});
-
-			assert.equal(result.isError, true);
-			assert.match(String(result.details?.parseError ?? ""), /invalid JSON/i);
-			assert.equal(result.details?.fullOutputPath, undefined);
-			assert.match(String(result.details?.fullOutputUnavailable ?? ""), /discarded because it may contain sensitive browser data/);
-			assert.equal(result.details?.artifactManifest, undefined);
-			assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
-			assert.doesNotMatch(JSON.stringify(result), /piab-r2-[a-f\d]{32}/);
-			await runExtensionEvent(harness.handlers, "session_shutdown");
-		});
-	} finally {
+test(
+	"agentBrowserExtension discards oversized malformed output instead of persisting browser secrets",
+	{ concurrency: false },
+	async () => {
 		await cleanupSecureTempArtifacts();
-		await rm(tempDir, { force: true, recursive: true });
-		await rm(sessionDir, { force: true, recursive: true });
-	}
-});
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const sessionDir = await mkdtemp(join(tmpdir(), "pi-session-dir-"));
+		const sessionFile = join(sessionDir, "session.jsonl");
+		const basePath = process.env.PATH ?? "";
+		const sentinel = "RQ-0006-parse-failure-sentinel";
+		const restoreKey = `piab-r2-${"a".repeat(32)}`;
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write("x".repeat(600000) + ${JSON.stringify(restoreKey + sentinel)});`,
+		);
 
-test("agentBrowserExtension discards malformed spills when only a session directory is available", { concurrency: false }, async () => {
-	await cleanupSecureTempArtifacts();
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const sessionDir = await mkdtemp(join(tmpdir(), "pi-session-dir-only-"));
-	const basePath = process.env.PATH ?? "";
-	const sentinel = "RQ-0006-session-dir-only-sentinel";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write("x".repeat(600000) + ${JSON.stringify(sentinel)});`,
-	);
+		try {
+			await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
+				const harness = createExtensionHarness({ cwd: tempDir, sessionDir, sessionFile });
+				await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir, sessionDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["state", "show", "caller-owned.json"],
+				});
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["snapshot", "-i"],
+				assert.equal(result.isError, true);
+				assert.match(readString(result.details?.parseError ?? ""), /invalid JSON/i);
+				assert.equal(result.details?.fullOutputPath, undefined);
+				assert.match(
+					readString(result.details?.fullOutputUnavailable ?? ""),
+					/discarded because it may contain sensitive browser data/,
+				);
+				assert.equal(result.details?.artifactManifest, undefined);
+				assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
+				assert.doesNotMatch(JSON.stringify(result), /piab-r2-[a-f\d]{32}/);
+				await runExtensionEvent(harness.handlers, "session_shutdown");
 			});
+		} finally {
+			await cleanupSecureTempArtifacts();
+			await rm(tempDir, { force: true, recursive: true });
+			await rm(sessionDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			assert.equal(result.isError, true);
-			assert.equal(result.details?.fullOutputPath, undefined);
-			assert.match(String(result.details?.fullOutputUnavailable ?? ""), /discarded because it may contain sensitive browser data/);
-			assert.equal(result.details?.artifactManifest, undefined);
-			assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
-		});
-	} finally {
+test(
+	"agentBrowserExtension discards malformed spills when only a session directory is available",
+	{ concurrency: false },
+	async () => {
 		await cleanupSecureTempArtifacts();
-		await rm(tempDir, { force: true, recursive: true });
-		await rm(sessionDir, { force: true, recursive: true });
-	}
-});
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const sessionDir = await mkdtemp(join(tmpdir(), "pi-session-dir-only-"));
+		const basePath = process.env.PATH ?? "";
+		const sentinel = "RQ-0006-session-dir-only-sentinel";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write("x".repeat(600000) + ${JSON.stringify(sentinel)});`,
+		);
 
-test("agentBrowserExtension discards malformed spills without session artifacts", { concurrency: false }, async () => {
-	await cleanupSecureTempArtifacts();
-	const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
-	const basePath = process.env.PATH ?? "";
-	const sentinel = "RQ-0006-temp-parse-failure-sentinel";
-	await writeFakeAgentBrowserBinary(
-		tempDir,
-		`process.stdout.write("x".repeat(600000) + ${JSON.stringify(sentinel)});`,
-	);
+		try {
+			await withPatchedEnv(
+				{ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.test/" },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir, sessionDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
 
-	try {
-		await withPatchedEnv({ PATH: `${tempDir}:${basePath}` }, async () => {
-			const harness = createExtensionHarness({ cwd: tempDir });
-			await runExtensionEvent(harness.handlers, "session_start", { reason: "new" }, harness.ctx);
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["snapshot", "-i"],
+					});
 
-			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
-				args: ["eval", "--stdin"],
-				stdin: "document.body.innerText",
-			});
+					assert.equal(result.isError, true);
+					assert.equal(result.details?.fullOutputPath, undefined);
+					assert.match(
+						readString(result.details?.fullOutputUnavailable ?? ""),
+						/discarded because it may contain sensitive browser data/,
+					);
+					assert.equal(result.details?.artifactManifest, undefined);
+					assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
+				},
+			);
+		} finally {
+			await cleanupSecureTempArtifacts();
+			await rm(tempDir, { force: true, recursive: true });
+			await rm(sessionDir, { force: true, recursive: true });
+		}
+	},
+);
 
-			assert.equal(result.isError, true);
-			assert.match(String(result.details?.parseError ?? ""), /invalid JSON/i);
-			assert.equal(result.details?.fullOutputPath, undefined);
-			assert.match(String(result.details?.fullOutputUnavailable ?? ""), /discarded because it may contain sensitive browser data/);
-			assert.equal(result.details?.artifactManifest, undefined);
-			assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
-		});
-	} finally {
+test(
+	"agentBrowserExtension discards malformed spills without session artifacts",
+	{ concurrency: false },
+	async () => {
 		await cleanupSecureTempArtifacts();
-		await rm(tempDir, { force: true, recursive: true });
-	}
-});
+		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-test-"));
+		const basePath = process.env.PATH ?? "";
+		const sentinel = "RQ-0006-temp-parse-failure-sentinel";
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			`process.stdout.write("x".repeat(600000) + ${JSON.stringify(sentinel)});`,
+		);
+
+		try {
+			await withPatchedEnv(
+				{ PATH: `${tempDir}:${basePath}`, PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.test/" },
+				async () => {
+					const harness = createExtensionHarness({ cwd: tempDir });
+					await runExtensionEvent(
+						harness.handlers,
+						"session_start",
+						{ reason: "new" },
+						harness.ctx,
+					);
+
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["eval", "--stdin"],
+						stdin: "document.body.innerText",
+					});
+
+					assert.equal(result.isError, true);
+					assert.match(readString(result.details?.parseError ?? ""), /invalid JSON/i);
+					assert.equal(result.details?.fullOutputPath, undefined);
+					assert.match(
+						readString(result.details?.fullOutputUnavailable ?? ""),
+						/discarded because it may contain sensitive browser data/,
+					);
+					assert.equal(result.details?.artifactManifest, undefined);
+					assert.doesNotMatch(JSON.stringify(result), new RegExp(sentinel));
+				},
+			);
+		} finally {
+			await cleanupSecureTempArtifacts();
+			await rm(tempDir, { force: true, recursive: true });
+		}
+	},
+);

@@ -2,107 +2,124 @@ import { readFile } from "node:fs/promises";
 
 import { isRecord } from "../parsing.js";
 import { detectConfirmationRequired } from "./confirmation.js";
-import type { AgentBrowserBatchResult, AgentBrowserEnvelope } from "./contracts.js";
+import type { AgentBrowserEnvelope } from "./contracts.js";
+import { decodeAgentBrowserEnvelope, type EnvelopeParseResult } from "./envelope-decoding.js";
 import { stringifyUnknown } from "./text.js";
 
-function hasStructuredBatchStepFailure(data: unknown): data is AgentBrowserBatchResult[] {
+function hasStructuredBatchStepFailure(data: unknown): boolean {
 	return Array.isArray(data) && data.some((item) => isRecord(item) && item.success === false);
 }
 
-async function readEnvelopeSource(options: { stdout: string; stdoutPath?: string }): Promise<string> {
-	if (!options.stdoutPath) {
+async function readEnvelopeSource(options: {
+	readonly stdout: string;
+	readonly stdoutPath?: string;
+}): Promise<string> {
+	if (options.stdoutPath === undefined || options.stdoutPath.length === 0) {
 		return options.stdout;
 	}
 
 	try {
 		return await readFile(options.stdoutPath, "utf8");
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		throw new Error(`agent-browser output spill file could not be read: ${message}`);
+		const message = error instanceof Error ? error.message : stringifyUnknown(error);
+		throw new Error(`agent-browser output spill file could not be read: ${message}`, {
+			cause: error,
+		});
 	}
 }
 
 export function extractEnvelopeErrorText(error: unknown): string | undefined {
 	if (typeof error === "string") {
-		return error.trim() || undefined;
+		const trimmed = error.trim();
+		return trimmed.length > 0 ? trimmed : undefined;
 	}
 	if (typeof error === "number" || typeof error === "boolean") {
 		return String(error);
 	}
 	if (Array.isArray(error)) {
-		const parts = error.map((item) => extractEnvelopeErrorText(item) ?? stringifyUnknown(item)).filter((item) => item.length > 0);
+		const parts = error
+			.map((item) => extractEnvelopeErrorText(item) ?? stringifyUnknown(item))
+			.filter((item) => item.length > 0);
 		return parts.length > 0 ? parts.join("\n") : undefined;
 	}
 	if (!isRecord(error)) {
-		return error == null ? undefined : stringifyUnknown(error);
+		return error === null || error === undefined ? undefined : stringifyUnknown(error);
 	}
 
+	return extractStructuredEnvelopeErrorText(error);
+}
+
+function extractStructuredEnvelopeErrorText(
+	error: Readonly<Record<string, unknown>>,
+): string | undefined {
 	for (const key of ["message", "error", "details", "cause", "stderr"] as const) {
 		const value = extractEnvelopeErrorText(error[key]);
-		if (value) return value;
+		if ((value ?? "") !== "") {
+			return value;
+		}
 	}
 
 	const fallback = stringifyUnknown(error).trim();
 	return fallback.length > 0 && fallback !== "{}" ? fallback : undefined;
 }
 
-export async function parseAgentBrowserEnvelope(options: string | { stdout: string; stdoutPath?: string; plainText?: boolean }): Promise<{
-	envelope?: AgentBrowserEnvelope;
-	parseError?: string;
-}> {
+type EnvelopeSourceOptions = {
+	readonly stdout: string;
+	readonly stdoutPath?: string;
+	readonly plainText?: boolean;
+	readonly textOutput?: boolean;
+};
+
+function getEnvelopeOutputMode(options: string | EnvelopeSourceOptions): {
+	readonly plainText: boolean;
+	readonly textOutput: boolean;
+} {
+	return typeof options === "string"
+		? { plainText: false, textOutput: false }
+		: { plainText: options.plainText === true, textOutput: options.textOutput === true };
+}
+
+export async function parseAgentBrowserEnvelope(
+	options: string | EnvelopeSourceOptions,
+): Promise<EnvelopeParseResult> {
 	let stdout: string;
 	try {
 		stdout = typeof options === "string" ? options : await readEnvelopeSource(options);
 	} catch (error) {
-		return { parseError: error instanceof Error ? error.message : String(error) };
+		return { parseError: error instanceof Error ? error.message : stringifyUnknown(error) };
 	}
 
+	// ponytail: native text has no machine receipts; use JSON mode for structured evidence.
+	// JSON-looking page text must never become an envelope, confirmation, or batch row.
+	const { plainText, textOutput } = getEnvelopeOutputMode(options);
+	if (textOutput) {
+		return { envelope: { success: true, data: stdout } };
+	}
 	const trimmed = stdout.trim();
-	const plainText = typeof options !== "string" && options.plainText === true;
 	if (trimmed.length === 0 && !plainText) {
 		return { parseError: "agent-browser returned no JSON output." };
 	}
 
 	try {
-		const parsed = JSON.parse(trimmed) as AgentBrowserEnvelope | AgentBrowserBatchResult[];
-		if (Array.isArray(parsed)) {
-			return { envelope: { success: parsed.every((item) => !isRecord(item) || item.success !== false), data: parsed } };
-		}
-		if (!isRecord(parsed)) {
-			return { parseError: "agent-browser returned JSON, but it was not an object envelope." };
-		}
-		const keys = Object.keys(parsed);
-		if (keys.length === 1 && keys[0] === "plugins" && Array.isArray(parsed.plugins)) {
-			return { envelope: { success: true, data: { plugins: parsed.plugins } } };
-		}
-		if (keys.length === 1 && keys[0] === "plugin" && isRecord(parsed.plugin) && !Array.isArray(parsed.plugin)) {
-			return { envelope: { success: true, data: { plugin: parsed.plugin } } };
-		}
-		if (!("success" in parsed)) {
-			return { parseError: "agent-browser returned an invalid JSON envelope: missing boolean success field." };
-		}
-		if (typeof parsed.success !== "boolean") {
-			return { parseError: "agent-browser returned an invalid JSON envelope: success field must be boolean." };
-		}
-		if (!Object.hasOwn(parsed, "data")) {
-			const { success, error, ...topLevelData } = parsed;
-			if (Object.keys(topLevelData).length > 0) {
-				return { envelope: { error, success, data: topLevelData } as AgentBrowserEnvelope };
-			}
-		}
-		return { envelope: parsed as AgentBrowserEnvelope };
+		const parsed: unknown = JSON.parse(trimmed);
+		return decodeAgentBrowserEnvelope(parsed);
 	} catch (error) {
-		if (plainText) return { envelope: { success: true, data: trimmed } };
-		const message = error instanceof Error ? error.message : String(error);
+		if (plainText) {
+			return { envelope: { success: true, data: trimmed } };
+		}
+		const message = error instanceof Error ? error.message : stringifyUnknown(error);
 		return { parseError: `agent-browser returned invalid JSON: ${message}` };
 	}
 }
 
-function buildInvocationLabel(options: { command?: string; effectiveArgs?: string[] }): string {
+function buildInvocationLabel(options: {
+	readonly command?: string;
+	readonly effectiveArgs?: readonly string[];
+}): string {
 	if (options.effectiveArgs && options.effectiveArgs.length > 0) {
 		return `agent-browser ${options.effectiveArgs.join(" ")}`;
 	}
-	if (options.command && options.command.trim().length > 0) {
+	if (options.command !== undefined && options.command.trim().length > 0) {
 		return `agent-browser ${options.command.trim()}`;
 	}
 	return "agent-browser";
@@ -110,25 +127,45 @@ function buildInvocationLabel(options: { command?: string; effectiveArgs?: strin
 
 function appendWrapperRecoveryHint(message: string, wrapperRecoveryHint?: string): string {
 	const hint = wrapperRecoveryHint?.trim();
-	return hint ? `${message}\n${hint}` : message;
+	return hint !== undefined && hint.length > 0 ? `${message}\n${hint}` : message;
 }
 
-function buildFailureFallback(options: { command?: string; effectiveArgs?: string[]; exitCode: number; wrapperRecoveryHint?: string }): string {
+function buildFailureFallback(options: {
+	readonly command?: string;
+	readonly effectiveArgs?: readonly string[];
+	readonly exitCode: number;
+	readonly wrapperRecoveryHint?: string;
+}): string {
 	const invocation = buildInvocationLabel(options);
 	const exitSuffix = options.exitCode !== 0 ? ` (exit code ${options.exitCode})` : "";
-	return appendWrapperRecoveryHint(`${invocation} reported failure${exitSuffix}.`, options.wrapperRecoveryHint);
+	return appendWrapperRecoveryHint(
+		`${invocation} reported failure${exitSuffix}.`,
+		options.wrapperRecoveryHint,
+	);
 }
 
-function buildExitCodeFallback(options: { command?: string; effectiveArgs?: string[]; exitCode: number; wrapperRecoveryHint?: string }): string {
+function buildExitCodeFallback(options: {
+	readonly command?: string;
+	readonly effectiveArgs?: readonly string[];
+	readonly exitCode: number;
+	readonly wrapperRecoveryHint?: string;
+}): string {
 	const invocation = buildInvocationLabel(options);
-	return appendWrapperRecoveryHint(`${invocation} exited with code ${options.exitCode}.`, options.wrapperRecoveryHint);
+	return appendWrapperRecoveryHint(
+		`${invocation} exited with code ${options.exitCode}.`,
+		options.wrapperRecoveryHint,
+	);
 }
 
-function buildWatchdogTimeoutMessage(options: { timeoutMs?: number }): string {
-	const timeoutText = options.timeoutMs === undefined ? "the wrapper watchdog" : `the ${options.timeoutMs}ms wrapper watchdog`;
-	const ipcTiming = options.timeoutMs !== undefined && options.timeoutMs <= 30_000
-		? "before the upstream CLI entered its 30s IPC retry path"
-		: "after waiting beyond the upstream CLI's 30s IPC retry window";
+function buildWatchdogTimeoutMessage(options: { readonly timeoutMs?: number }): string {
+	const timeoutText =
+		options.timeoutMs === undefined
+			? "the wrapper watchdog"
+			: `the ${options.timeoutMs}ms wrapper watchdog`;
+	const ipcTiming =
+		options.timeoutMs !== undefined && options.timeoutMs <= 30_000
+			? "before the upstream CLI entered its 30s IPC retry path"
+			: "after waiting beyond the upstream CLI's 30s IPC retry window";
 	return [
 		`agent-browser exceeded ${timeoutText} and was stopped ${ipcTiming}.`,
 		"Prefer a condition wait or split long work into shorter calls; for legitimately long opens or captures, pass agent_browser timeoutMs with a bounded higher value and inspect details.timeoutPartialProgress before retrying.",
@@ -136,63 +173,116 @@ function buildWatchdogTimeoutMessage(options: { timeoutMs?: number }): string {
 }
 
 function isUpstreamIpcReadTimeoutMessage(message: string): boolean {
-	return /Failed to read: Resource temporarily unavailable(?: \(os error \d+\))?.*daemon may be busy or unresponsive/i.test(message);
+	return /Failed to read: Resource temporarily unavailable(?: \(os error \d+\))?.*daemon may be busy or unresponsive/i.test(
+		message,
+	);
 }
 
 function buildUpstreamIpcReadTimeoutMessage(): string {
 	return [
 		"agent-browser hit the upstream CLI 30s IPC read timeout while waiting for the daemon response.",
-		"The daemon may still be alive; do not blindly retry a non-idempotent command. Prefer a shorter command, split long waits, or retry with sessionMode: \"fresh\" after checking tab list.",
+		'The daemon may still be alive; do not blindly retry a non-idempotent command. Prefer a shorter command, split long waits, or retry with sessionMode: "fresh" after checking tab list.',
 	].join(" ");
 }
 
-function maybeAppendStaleRefHint(message: string, args?: string[]): string {
+function maybeAppendStaleRefHint(message: string, args?: readonly string[]): string {
 	const usedRef = args?.some((arg) => /^@e\d+\b/.test(arg)) ?? false;
 	if (!usedRef || !/could not locate element|element not found|no element/i.test(message)) {
 		return message;
 	}
 	return [
 		message,
-		"This @ref may be stale after navigation, scrolling, or a DOM update. Run `agent_browser` with `{ \"args\": [\"snapshot\", \"-i\"] }` again and retry with a current ref, or use a stable `find` locator.",
+		'This @ref may be stale after navigation, scrolling, or a DOM update. Run `agent_browser` with `{ "args": ["snapshot", "-i"] }` again and retry with a current ref, or use a stable `find` locator.',
 	].join("\n");
 }
 
-export function getAgentBrowserErrorText(options: {
-	aborted: boolean;
-	command?: string;
-	effectiveArgs?: string[];
-	envelope?: AgentBrowserEnvelope;
-	exitCode: number;
-	parseError?: string;
-	plainTextInspection: boolean;
-	spawnError?: Error;
-	staleRefArgs?: string[];
-	stderr: string;
-	timedOut?: boolean;
-	timeoutMs?: number;
-	wrapperRecoveryHint?: string;
-}): string | undefined {
-	const { aborted, envelope, exitCode, parseError, plainTextInspection, spawnError, stderr, timedOut } = options;
-	if (plainTextInspection) return undefined;
-	if (timedOut) return buildWatchdogTimeoutMessage(options);
-	if (aborted) return "agent-browser was aborted.";
-	if (spawnError) return spawnError.message;
-	if (parseError) return parseError;
-	if (envelope?.success === false) {
-		const explicitErrorText = extractEnvelopeErrorText(envelope.error);
-		if ((hasStructuredBatchStepFailure(envelope.data) || detectConfirmationRequired(envelope.data)) && explicitErrorText === undefined) {
-			return undefined;
-		}
-		const envelopeErrorText = explicitErrorText
-			?? extractEnvelopeErrorText(typeof envelope.data === "string" ? envelope.data : isRecord(envelope.data) ? envelope.data.error : undefined);
-		if (envelopeErrorText && isUpstreamIpcReadTimeoutMessage(envelopeErrorText)) {
-			return buildUpstreamIpcReadTimeoutMessage();
-		}
-		const fallback = envelopeErrorText ?? (stderr.trim() || buildFailureFallback(options));
-		return maybeAppendStaleRefHint(fallback, options.staleRefArgs ?? options.effectiveArgs);
+interface AgentBrowserErrorOptions {
+	readonly aborted: boolean;
+	readonly command?: string;
+	readonly effectiveArgs?: readonly string[];
+	readonly envelope?: Readonly<AgentBrowserEnvelope>;
+	readonly exitCode: number;
+	readonly parseError?: string;
+	readonly plainTextInspection: boolean;
+	readonly spawnError?: Error;
+	readonly staleRefArgs?: readonly string[];
+	readonly stderr: string;
+	readonly timedOut?: boolean;
+	readonly timeoutMs?: number;
+	readonly wrapperRecoveryHint?: string;
+}
+
+function getTransportErrorText(options: AgentBrowserErrorOptions): string | undefined {
+	if (options.timedOut === true) {
+		return buildWatchdogTimeoutMessage(options);
 	}
-	if (exitCode !== 0) {
-		return stderr.trim() || buildExitCodeFallback(options);
+	if (options.aborted) {
+		return "agent-browser was aborted.";
+	}
+	if (options.spawnError) {
+		return options.spawnError.message;
+	}
+	if ((options.parseError ?? "") !== "") {
+		return options.exitCode !== 0 && options.stderr.trim().length > 0
+			? options.stderr.trim()
+			: options.parseError;
+	}
+	return undefined;
+}
+
+function getEnvelopeDataError(data: unknown): unknown {
+	if (typeof data === "string") {
+		return data;
+	}
+	return isRecord(data) ? data.error : undefined;
+}
+
+function getFailedEnvelopeFallback(
+	options: AgentBrowserErrorOptions,
+	errorText: string | undefined,
+): string {
+	const stderr = options.stderr.trim();
+	return errorText ?? (stderr.length > 0 ? stderr : buildFailureFallback(options));
+}
+
+function getFailedEnvelopeErrorText(
+	options: AgentBrowserErrorOptions,
+	envelope: Readonly<AgentBrowserEnvelope>,
+): string | undefined {
+	const explicitErrorText = extractEnvelopeErrorText(envelope.error);
+	if (
+		(hasStructuredBatchStepFailure(envelope.data) || detectConfirmationRequired(envelope.data)) &&
+		explicitErrorText === undefined
+	) {
+		return undefined;
+	}
+	const envelopeErrorText =
+		explicitErrorText ?? extractEnvelopeErrorText(getEnvelopeDataError(envelope.data));
+	if (
+		envelopeErrorText !== undefined &&
+		envelopeErrorText.length > 0 &&
+		isUpstreamIpcReadTimeoutMessage(envelopeErrorText)
+	) {
+		return buildUpstreamIpcReadTimeoutMessage();
+	}
+	const fallback = getFailedEnvelopeFallback(options, envelopeErrorText);
+	return maybeAppendStaleRefHint(fallback, options.staleRefArgs ?? options.effectiveArgs);
+}
+
+export function getAgentBrowserErrorText(options: AgentBrowserErrorOptions): string | undefined {
+	if (options.plainTextInspection) {
+		return undefined;
+	}
+	const transportErrorText = getTransportErrorText(options);
+	if (transportErrorText !== undefined) {
+		return transportErrorText;
+	}
+	if (options.envelope?.success === false) {
+		return getFailedEnvelopeErrorText(options, options.envelope);
+	}
+	if (options.exitCode !== 0) {
+		const stderr = options.stderr.trim();
+		return stderr.length > 0 ? stderr : buildExitCodeFallback(options);
 	}
 	return undefined;
 }

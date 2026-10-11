@@ -2,25 +2,39 @@ import type { TSchema, TSchemaOptions, TUnsafe } from "typebox";
 
 const OPTIONAL_SCHEMA = Symbol("pi-agent-browser-optional-schema");
 
-type SchemaObject = TSchema & { [OPTIONAL_SCHEMA]?: true };
-type SchemaProperties = Record<string, TSchema>;
+type SchemaProperties = Readonly<Record<string, TSchema>>;
 
-function withOptions(schema: Record<string, unknown>, options?: TSchemaOptions): TSchema {
-	return { ...schema, ...(options ?? {}) } as TSchema;
+function withOptions(schema: TSchema, options?: TSchemaOptions): TSchema {
+	return { ...schema, ...options };
 }
 
 function literalType(value: unknown): "boolean" | "number" | "string" | undefined {
 	const valueType = typeof value;
-	return valueType === "string" || valueType === "number" || valueType === "boolean" ? valueType : undefined;
+	return valueType === "string" || valueType === "number" || valueType === "boolean"
+		? valueType
+		: undefined;
 }
 
 function propertySchema(schema: TSchema): TSchema {
-	const clone = { ...(schema as SchemaObject & Record<PropertyKey, unknown>) };
-	delete clone[OPTIONAL_SCHEMA];
-	return clone as TSchema;
+	const clone = { ...schema };
+	if (OPTIONAL_SCHEMA in clone) {
+		delete clone[OPTIONAL_SCHEMA];
+	}
+	return clone;
 }
 
-export const JsonSchema = {
+function isOptional(schema: TSchema): boolean {
+	return OPTIONAL_SCHEMA in schema && schema[OPTIONAL_SCHEMA] === true;
+}
+
+// TUnsafe's value type is a caller-owned schema assertion, not a runtime value.
+// Preserve the lightweight JSON shape; native Pi validates the supplied schema.
+function unsafeSchema<Value>(schema: TSchema): TUnsafe<Value>;
+function unsafeSchema(schema: TSchema): TSchema {
+	return schema;
+}
+
+const nativeJsonSchemaBuilder = {
 	Array(items: TSchema, options?: TSchemaOptions): TSchema {
 		return withOptions({ type: "array", items }, options);
 	},
@@ -32,36 +46,41 @@ export const JsonSchema = {
 	},
 	Literal(value: unknown, options?: TSchemaOptions): TSchema {
 		const type = literalType(value);
-		return withOptions(type ? { type, const: value } : { const: value }, options);
+		return withOptions(type !== undefined ? { type, const: value } : { const: value }, options);
 	},
 	Number(options?: TSchemaOptions): TSchema {
 		return withOptions({ type: "number" }, options);
 	},
 	Object(properties: SchemaProperties, options?: TSchemaOptions): TSchema {
 		const required = globalThis.Object.entries(properties)
-			.filter(([, schema]) => (schema as SchemaObject)[OPTIONAL_SCHEMA] !== true)
+			.filter(([, schema]) => !isOptional(schema))
 			.map(([key]) => key);
-		return withOptions({
-			type: "object",
-			properties: globalThis.Object.fromEntries(
-				globalThis.Object.entries(properties).map(([key, schema]) => [key, propertySchema(schema)]),
-			),
-			...(required.length > 0 ? { required } : {}),
-		}, options);
+		return withOptions(
+			{
+				type: "object",
+				properties: globalThis.Object.fromEntries(
+					globalThis.Object.entries(properties).map(([key, schema]) => [
+						key,
+						propertySchema(schema),
+					]),
+				),
+				...(required.length > 0 ? { required } : {}),
+			},
+			options,
+		);
 	},
 	Optional(schema: TSchema): TSchema {
-		return { ...(schema as SchemaObject), [OPTIONAL_SCHEMA]: true } as TSchema;
+		return { ...schema, [OPTIONAL_SCHEMA]: true };
 	},
 	String(options?: TSchemaOptions): TSchema {
 		return withOptions({ type: "string" }, options);
 	},
-	Union(types: TSchema[], options?: TSchemaOptions): TSchema {
+	Union(types: readonly TSchema[], options?: TSchemaOptions): TSchema {
 		return withOptions({ anyOf: types }, options);
 	},
-	Unsafe<Value>(schema: TSchema): TUnsafe<Value> {
-		return schema as TUnsafe<Value>;
-	},
+	Unsafe: unsafeSchema,
 };
 
+export const JsonSchema: Readonly<typeof nativeJsonSchemaBuilder> = nativeJsonSchemaBuilder;
 export type JsonSchemaBuilder = typeof JsonSchema;
 export type { TSchema, TSchemaOptions, TUnsafe };
