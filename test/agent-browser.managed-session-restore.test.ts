@@ -5,6 +5,7 @@
  */
 
 import assert from "node:assert/strict";
+import { isolateFixturePermissions } from "./helpers/fixture-permissions.js";
 import { readArray, readString } from "./helpers/assertions.js";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -51,6 +52,8 @@ import {
 	buildExecutionPlan,
 	restoreManagedSessionStateFromBranch,
 } from "../extensions/agent-browser/lib/runtime.js";
+
+isolateFixturePermissions();
 
 // Native fixtures use an isolated home and the upstream 256-bit key format.
 const restoreHomeEnv = (home: string): NodeJS.ProcessEnv => ({

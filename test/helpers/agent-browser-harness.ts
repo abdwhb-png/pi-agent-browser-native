@@ -3,10 +3,11 @@
  * Responsibilities: Build fake pi extension contexts, run registered extension events/tools, patch process env safely, create fake agent-browser binaries, read invocation logs, and manage child-process fixtures.
  * Scope: Test-only utilities for `test/agent-browser.*.test.ts`; production code must not import this module.
  * Usage: Import focused helpers from `./helpers/agent-browser-harness.js` inside Node test-runner suites.
- * Invariants/Assumptions: Helpers preserve caller-owned cleanup responsibilities and restore patched environment variables after each run. `writeFakeAgentBrowserBinary` installs a Unix shell-script launcher or a Windows `agent-browser.cmd`; its default virtual daemon retains launch/close and process-generation metadata. Stateful daemon tests set `PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO=1`; pass `platform: "win32"` to assert Windows launcher layout from non-Windows hosts (spawn/PATHEXT behavior still needs a real Windows runner).
+ * Invariants/Assumptions: Outer environment scopes isolate native browser configuration in a temporary home; explicit patches and nested scopes retain their requested configuration. Helpers preserve caller-owned cleanup responsibilities and restore patched environment variables after each run. `writeFakeAgentBrowserBinary` installs a Unix shell-script launcher or a Windows `agent-browser.cmd`; its default virtual daemon retains launch/close and process-generation metadata. Stateful daemon tests set `PI_AGENT_BROWSER_TEST_CUSTOM_SESSION_INFO=1`; pass `platform: "win32"` to assert Windows launcher layout from non-Windows hosts (spawn/PATHEXT behavior still needs a real Windows runner).
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { isolateFixturePermissions } from "./fixture-permissions.js";
 import assert from "node:assert/strict";
 import type { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -36,6 +37,7 @@ import { hasErrorCode } from "./assertions.js";
 export const TEST_SESSION_ID = "12345678-1234-5678-9abc-def012345678";
 export const DOWNLOAD_FIXTURE_CONTENT = "download contract fixture report\n";
 export const DOWNLOAD_FIXTURE_FILENAME = "pi-agent-browser-wait-download-contract.txt";
+isolateFixturePermissions();
 const journalFixtures = mkdtempSync(join(tmpdir(), "piab-journal-fixtures-"));
 process.once("exit", () => rmSync(journalFixtures, { recursive: true, force: true }));
 
@@ -1008,7 +1010,22 @@ export async function withPatchedEnv<T>(
 	}
 
 	const queuedRun = patchedEnvQueue.then(() =>
-		patchedEnvScope.run(true, () => runWithPatchedEnv(patch, run)),
+		patchedEnvScope.run(true, async () => {
+			const isolatedHome = mkdtempSync(join(journalFixtures, "home-"));
+			try {
+				return await runWithPatchedEnv(
+					{
+						HOME: isolatedHome,
+						USERPROFILE: patch.HOME ?? isolatedHome,
+						AGENT_BROWSER_CONFIG: undefined,
+						...patch,
+					},
+					run,
+				);
+			} finally {
+				rmSync(isolatedHome, { recursive: true, force: true });
+			}
+		}),
 	);
 	patchedEnvQueue = queuedRun.then(
 		() => {

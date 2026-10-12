@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import test from "node:test";
-import { readInvocationLog } from "./agent-browser-harness.js";
+import {
+	createExtensionHarness,
+	executeRegisteredTool,
+	readInvocationLog,
+	runExtensionEvent,
+	withPatchedEnv,
+	writeFakeAgentBrowserBinary,
+} from "./agent-browser-harness.js";
 import {
 	readArray,
 	readBoolean,
@@ -67,4 +74,79 @@ await test("fixture readers reject malformed shapes instead of asserting uncheck
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
+});
+
+await test("browser fixtures isolate inherited native configuration and restore the environment", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "piab-fixture-env-"));
+	const inherited = new Map(
+		["HOME", "USERPROFILE", "AGENT_BROWSER_CONFIG"].map((name) => [name, process.env[name]]),
+	);
+	t.after(async () => {
+		for (const [name, value] of inherited) {
+			if (value === undefined) {
+				delete process.env[name];
+			} else {
+				process.env[name] = value;
+			}
+		}
+		await rm(root, { recursive: true, force: true });
+	});
+	const config = join(root, ".agent-browser", "config.json");
+	const cwd = join(root, "project");
+	await mkdir(join(root, ".agent-browser"));
+	await mkdir(cwd);
+	await writeFile(config, '{"caCert":"fixture-cert.pem"}\n');
+	await writeFakeAgentBrowserBinary(
+		root,
+		'process.stdout.write(JSON.stringify({ success: true, data: { url: "https://fixture.test/", title: "Isolated fixture page" } }));',
+	);
+	process.env.HOME = root;
+	process.env.USERPROFILE = root;
+	process.env.AGENT_BROWSER_CONFIG = config;
+	let isolatedHome = "";
+	await withPatchedEnv({ PATH: `${root}${delimiter}${process.env.PATH ?? ""}` }, async () => {
+		isolatedHome = homedir();
+		const harness = createExtensionHarness({ cwd });
+		try {
+			const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+				args: ["open", "https://fixture.test/"],
+			});
+			assert.equal(result.isError, false, result.content[0]?.text);
+			assert.match(JSON.stringify(result.content), /Isolated fixture page/);
+			assert.notEqual(isolatedHome, root);
+			assert.equal(process.env.AGENT_BROWSER_CONFIG, undefined);
+		} finally {
+			await runExtensionEvent(
+				harness.handlers,
+				"session_shutdown",
+				{ reason: "quit" },
+				harness.ctx,
+			);
+		}
+	});
+	assert.equal(homedir(), root);
+	assert.equal(process.env.AGENT_BROWSER_CONFIG, config);
+	assert.equal(await readFile(config, "utf8"), '{"caCert":"fixture-cert.pem"}\n');
+	await assert.rejects(stat(isolatedHome), { code: "ENOENT" });
+});
+
+await test("nested fixture environments preserve explicit configuration and restore after rejection", async (t) => {
+	const root = await mkdtemp(join(tmpdir(), "piab-fixture-env-"));
+	t.after(async () => await rm(root, { recursive: true, force: true }));
+	const previousHome = homedir();
+	const previousConfig = process.env.AGENT_BROWSER_CONFIG;
+	const config = join(root, "explicit.json");
+	const failure = new Error("fixture failure");
+	await assert.rejects(
+		withPatchedEnv({ HOME: root, USERPROFILE: root, AGENT_BROWSER_CONFIG: config }, async () => {
+			await withPatchedEnv({ PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.test" }, async () => {
+				assert.equal(homedir(), root);
+				assert.equal(process.env.AGENT_BROWSER_CONFIG, config);
+				throw failure;
+			});
+		}),
+		(error: unknown) => error === failure,
+	);
+	assert.equal(homedir(), previousHome);
+	assert.equal(process.env.AGENT_BROWSER_CONFIG, previousConfig);
 });
