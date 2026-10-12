@@ -73,7 +73,13 @@ process.stdout.write(JSON.stringify({ success: true, data: "should not run" }));
 				assert.equal(readRecord(unsupportedRoleName.details).failureCategory, "validation-error");
 
 				const mismatchedRoleValue = await executeRegisteredTool(harness.tool, harness.ctx, {
-					semanticAction: { action: "click", locator: "role", role: "button", value: "link", name: "Conflicting explicit name" },
+					semanticAction: {
+						action: "click",
+						locator: "role",
+						role: "button",
+						value: "link",
+						name: "Conflicting explicit name",
+					},
 				});
 				assert.equal(mismatchedRoleValue.isError, true);
 				assert.match(

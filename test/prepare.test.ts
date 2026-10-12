@@ -18,17 +18,26 @@ const buildModules = [
 	"@earendil-works/pi-coding-agent",
 	"@earendil-works/pi-tui",
 ];
+const compilerBin = process.platform === "win32" ? "tsc.cmd" : "tsc";
 
 for (const [description, missingPath] of [
 	["builds without installing when import-only dependencies exist", undefined],
 	["installs before building when a dependency is missing", "node_modules/typescript"],
 	["installs before building when the bundler is missing", "node_modules/esbuild"],
 	[
+		"installs before building when modules resolve but the checkout compiler is missing",
+		`node_modules/.bin/${compilerBin}`,
+	],
+	[
 		"installs before building when an exported target is missing",
 		"node_modules/@earendil-works/pi-coding-agent/index.js",
 	],
 ] as const) {
 	test(`prepare ${description}`, async (t) => {
+		if (process.platform === "android" && missingPath === `node_modules/.bin/${compilerBin}`) {
+			t.skip("Android uses the native tsgo compiler on PATH");
+			return;
+		}
 		const tempDir = await mkdtemp(join(tmpdir(), "pi-agent-browser-prepare-"));
 		t.after(() => rm(tempDir, { force: true, recursive: true }));
 		await mkdir(join(tempDir, "scripts"));
@@ -43,6 +52,8 @@ for (const [description, missingPath] of [
 				devDependencies: Object.fromEntries(buildModules.map((name) => [name, "1.0.0"])),
 			}),
 		);
+		await mkdir(join(tempDir, "node_modules", ".bin"), { recursive: true });
+		await writeFile(join(tempDir, "node_modules", ".bin", compilerBin), "");
 		for (const name of buildModules) {
 			const moduleDir = join(tempDir, "node_modules", name);
 			// Fixture transitions and their assertions run in order against this test's shared state.

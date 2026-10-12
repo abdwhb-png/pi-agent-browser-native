@@ -22,6 +22,14 @@ const REQUIRED_SOURCE_BUILD_MODULES = [
 ];
 
 function canResolveBuildDependencies() {
+	// build.mjs invokes the checkout's compiler; resolving a parent package is insufficient.
+	const compilerBin = process.platform === "win32" ? "tsc.cmd" : "tsc";
+	if (
+		process.platform !== "android" &&
+		!existsSync(join(process.cwd(), "node_modules", ".bin", compilerBin))
+	) {
+		return false;
+	}
 	return REQUIRED_SOURCE_BUILD_MODULES.every((moduleName) => {
 		try {
 			return existsSync(new URL(import.meta.resolve(moduleName)));

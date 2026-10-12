@@ -30,7 +30,7 @@ test("Lightpanda captures stay attached as text-rendered images without coordina
 		dir,
 		`
 const args = process.argv.slice(2);
-if (args.includes('screenshot') || args.includes('batch')) require('node:fs').writeFileSync(${JSON.stringify(path)}, Buffer.from(${JSON.stringify(imageBytes.toString('base64'))}, 'base64'));
+if (args.includes('screenshot') || args.includes('batch')) require('node:fs').writeFileSync(${JSON.stringify(path)}, Buffer.from(${JSON.stringify(imageBytes.toString("base64"))}, 'base64'));
 const engine = process.env.PIAB_FIXTURE_ENGINE ?? 'lightpanda';
 const lifecycle = { effectiveLaunch: { browserLaunched: true, ...(engine === 'absent' ? {} : {engine}) } };
 const sample = { ...(process.env.PIAB_FIXTURE_RENDERING === 'text' ? {rendering:'text'} : {}), url:'https://fixture.test/', frame:'main', childFrameCount:0, viewport:{width:1,height:1}, document:{width:1,height:1}, scroll:{x:0,y:0}, dpr:1, visualViewport:{x:0,y:0,scale:1} };
