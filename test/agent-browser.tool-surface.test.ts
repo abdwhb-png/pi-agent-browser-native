@@ -329,8 +329,22 @@ test("native Pi registration keeps advanced tools discoverable and activation ad
 });
 
 test("native defaultTools survives startup and initial resume restoration is additive", async () => {
-	const managerWithRestored = (tool: "action" | "qa"): SessionManager => {
+	const managerWithRestored = (
+		tool: "action" | "qa",
+		initialTools: readonly string[] = baseTools,
+	): SessionManager => {
 		const manager = SessionManager.inMemory();
+		// A resumed native transcript declares the initial loadout before later tool deltas.
+		manager.appendMessage({
+			role: "system",
+			content: "",
+			timestamp: 0,
+			toolsAdded: initialTools.map((name) => ({
+				name,
+				description: "Fixture active tool",
+				parameters: JsonSchema.Object({}),
+			})),
+		});
 		manager.appendMessage({
 			role: "system",
 			content: "",
@@ -356,7 +370,7 @@ test("native defaultTools survives startup and initial resume restoration is add
 			label: "default tools with a transcript-restored action",
 			options: {
 				defaultTools: ["agent_browser", "agent_browser_qa"],
-				sessionManager: managerWithRestored("action"),
+				sessionManager: managerWithRestored("action", [...baseTools, "agent_browser_qa"]),
 			},
 			restoredTool: "agent_browser_action",
 		},
