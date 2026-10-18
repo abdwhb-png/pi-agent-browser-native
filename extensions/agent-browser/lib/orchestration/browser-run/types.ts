@@ -15,6 +15,7 @@ import type {
 	CompiledAgentBrowserSourceLookup,
 } from "../../input-modes/types.js";
 import type { runAgentBrowserProcess } from "../../process.js";
+import type { PersistentSessionArtifactStore } from "../../temp.js";
 import type {
 	AgentBrowserEnvelope,
 	AgentBrowserResultCategoryDetails,
@@ -134,6 +135,7 @@ export interface BrowserRunStatePatch {
 }
 
 export type BrowserRunOptions = Readonly<{
+	artifactStore?: PersistentSessionArtifactStore;
 	modelVisible?: boolean;
 	operationCwd?: string;
 	daemonInactive?: boolean;

@@ -5,7 +5,7 @@ import { parsePositiveInteger } from "./parsing.js";
 const DEFAULT_MAX_BYTES = 32 * 1_024 * 1_024;
 export interface PersistentSessionArtifactStore {
 	readonly protectedPaths?: readonly string[];
-	readonly sessionDir: string;
+	readonly rootDir: string;
 	readonly sessionId: string;
 }
 export interface PersistentSessionArtifactEviction {

@@ -22,6 +22,7 @@ export interface NativeOutputPhase {
 			ProcessBrowserOutputInput,
 			| "artifactRunStartedAtMs"
 			| "ctx"
+			| "artifactStore"
 			| "cwd"
 			| "modelVisible"
 			| "processResult"

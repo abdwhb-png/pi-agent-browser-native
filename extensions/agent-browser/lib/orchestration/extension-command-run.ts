@@ -264,6 +264,7 @@ async function dispatchBrowserCommand(
 ): Promise<AgentBrowserToolResult> {
 	try {
 		return await runAgentBrowserTool({
+			artifactStore: call.artifactStore,
 			daemonInactive: dispatch.daemonInactive,
 			ctx: call.ctx,
 			cwd: call.browserCwd,

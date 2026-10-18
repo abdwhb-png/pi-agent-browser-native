@@ -41,7 +41,7 @@ const mutations = [
 	{
 		name: "allowance-isolation",
 		file: ".oxlintrc.json",
-		stage: /\/tsx(?:\.cmd)? --test --test-concurrency=1 test\/\*\*\/\*\.test\.ts$/u,
+		stage: /--import tsx --test --test-name-pattern .+ test\/code-quality\.test\.ts$/u,
 		diagnostic:
 			/^(?:not ok \d+ - |✖ )qualified registration allowance cannot exempt shadows, other declarations or ordinary work(?: \([\d.]+ms\))?$/mu,
 		evidencePath: "test/code-quality.test.ts",
@@ -52,17 +52,18 @@ function runNode(directory, args) {
 	const result = spawnSync(process.execPath, args, {
 		cwd: directory,
 		encoding: "utf8",
-		timeout: 1_200_000,
+		// The CI job owns the complete gate deadline; a nested cap truncated progressing suites.
 		maxBuffer: 64 * 1024 * 1024,
 	});
 	if (result.error !== undefined || result.signal !== null || result.status === null) {
 		console.error(stripVTControlCharacters(`${result.stdout ?? ""}\n${result.stderr ?? ""}`));
 		throw result.error ?? new Error(`Quality child did not complete: ${result.signal}`);
 	}
+	const command = `> ${process.execPath} ${args.join(" ")}\n`;
 	return {
 		status: result.status,
-		stdout: stripVTControlCharacters(result.stdout),
-		output: stripVTControlCharacters(`${result.stdout}\n${result.stderr}`),
+		stdout: command + stripVTControlCharacters(result.stdout),
+		output: command + stripVTControlCharacters(`${result.stdout}\n${result.stderr}`),
 	};
 }
 
@@ -118,7 +119,19 @@ function verifyMutation(mutation) {
 		});
 		symlinkSync(path.join(root, "node_modules"), path.join(directory, "node_modules"), "junction");
 		applyMutation(directory, mutation);
-		const result = acceptance(directory);
+		// The clean gate already ran every test. Reuse its actual origin-isolation probe
+		// for this checker mutation instead of replaying the unrelated browser matrix.
+		const result =
+			mutation.name === "allowance-isolation"
+				? runNode(directory, [
+						"--import",
+						"tsx",
+						"--test",
+						"--test-name-pattern",
+						"^qualified registration allowance cannot exempt shadows, other declarations or ordinary work$",
+						"test/code-quality.test.ts",
+					])
+				: acceptance(directory);
 		verifyRejection(result, mutation);
 		console.log(`${mutation.name}: real acceptance rejected the mutation`);
 	} finally {
@@ -131,7 +144,8 @@ function main(args) {
 		console.log(`Usage: node scripts/verify-quality-mutations.mjs
 
 Copy the checkout into disposable directories and prove the real quality acceptance
-fails for syntax, semantic, compiler, formatting and allowance-isolation mutations.
+rejects syntax, semantic, compiler and formatting mutations through the full gate,
+and allowance-isolation through its real focused origin probe after clean acceptance.
 Requires a passing clean npm run quality baseline. Original files are never changed.
 Exit codes: 0 all controls verified/help; 1 baseline or mutation failure.`);
 		return;

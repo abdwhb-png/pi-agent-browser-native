@@ -28,12 +28,9 @@ export {
 async function ensurePersistentSessionArtifactDir(
 	store: PersistentSessionArtifactStore,
 ): Promise<string> {
-	const rootDir = join(store.sessionDir, ".pi-agent-browser-artifacts");
+	const rootDir = store.rootDir;
 	const sessionDir = join(rootDir, store.sessionId);
 	await mkdir(rootDir, { recursive: true, mode: 0o700 });
-	await chmod(rootDir, 0o700).catch(() => {
-		/* Native creation may already enforce the mode. */
-	});
 	await mkdir(sessionDir, { recursive: true, mode: 0o700 });
 	await chmod(sessionDir, 0o700).catch(() => {
 		/* Native creation may already enforce the mode. */

@@ -1,4 +1,5 @@
 import type { BrowserBranch } from "../browser-journal.js";
+import type { PersistentSessionArtifactStore } from "../temp.js";
 import type { withNativeSessionDefaults } from "./native-session-defaults.js";
 import type { buildPromptPolicy } from "../prompt-policy.js";
 import type { CompiledAgentBrowserElectron } from "../input-modes/types.js";
@@ -11,6 +12,7 @@ export type NativeLaunchDefaultsRunner = NonNullable<
 >;
 
 export interface BrowserInvocationInput {
+	readonly artifactStore?: PersistentSessionArtifactStore;
 	readonly toolCallId: string;
 	readonly params: AgentBrowserExecuteParams;
 	readonly signal: Parameters<AgentBrowserExecutor>[2];

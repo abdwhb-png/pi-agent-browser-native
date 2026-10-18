@@ -24,6 +24,7 @@ const {
 	AGENT_BROWSER_CONFIG_ENV,
 	BRAVE_API_KEY_ENV,
 	DEFAULT_WEB_SEARCH_PROVIDER,
+	DEFAULT_ARTIFACT_DIRECTORY,
 	EXA_API_KEY_ENV,
 	WEB_SEARCH_PROVIDERS,
 	formatBrowserExecutableStatus,
@@ -35,6 +36,8 @@ const {
 	getWebSearchProviderLabel,
 	isWebSearchProvider,
 	loadAgentBrowserConfigStateSync,
+	resolveArtifactDirectory,
+	validateAgentBrowserConfig,
 	summarizeConfigFiles,
 } = await loadConfigPolicyModule();
 
@@ -53,6 +56,9 @@ function usage() {
 Usage through npm exec:
   npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config paths
   npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config show
+  npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config artifacts directory status
+  npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config artifacts directory set <directory> [--global|--project]
+  npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config artifacts directory clear [--global|--project]
   npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config web-search status
   npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config web-search set-key --stdin --provider <exa|brave> [--global|--project]
   npm exec --yes --package pi-agent-browser-native@latest -- pi-agent-browser-config web-search set-env <ENV_VAR> [--provider brave|exa] [--global|--project]
@@ -219,6 +225,11 @@ function printStatus() {
 	}
 	console.log(`  browser.defaultProfile: ${formatBrowserProfileStatus(state)}`);
 	console.log(`  browser.executablePath: ${formatBrowserExecutableStatus(state)}`);
+	const artifacts = { directory: DEFAULT_ARTIFACT_DIRECTORY, ...state.config.artifacts };
+	console.log(`  artifacts.directory: ${artifacts.directory}`);
+	console.log(
+		`  artifacts.resolvedDirectory: ${resolveArtifactDirectory(state.config, process.cwd())}`,
+	);
 	if (state.layers.length === 0) {
 		console.log("  layers: none");
 	}
@@ -436,6 +447,45 @@ function handleBrowser(args, flags) {
 	throw new UsageError(`Unsupported browser action: ${target ?? ""}`);
 }
 
+function handleArtifacts(args, flags) {
+	if (args[0] !== "directory") {
+		throw new UsageError("Expected artifacts directory.");
+	}
+	const action = args[1];
+	if (action === "status") {
+		return printStatus();
+	}
+	if (action !== "set" && action !== "clear") {
+		throw new UsageError("Expected artifacts directory set, clear, or status.");
+	}
+	const errors = [];
+	const selected =
+		action === "set"
+			? validateAgentBrowserConfig(
+					{ artifacts: { directory: args.slice(2).join(" ") } },
+					"config",
+					errors,
+					[],
+				)?.artifacts
+			: undefined;
+	if (errors.length > 0) {
+		throw new UsageError(errors.join(" "));
+	}
+	const { path, scope } = selectWritePath(flags);
+	mutateConfig(path, (config) => {
+		const artifacts = { ...config.artifacts };
+		if (action === "set") {
+			artifacts.directory = selected.directory;
+		} else {
+			delete artifacts.directory;
+		}
+		return { ...config, artifacts };
+	});
+	console.log(
+		`${action === "set" ? "Saved" : "Cleared"} artifact directory in ${scope} config: ${path}`,
+	);
+}
+
 export async function main(argv = process.argv.slice(2)) {
 	const { flags, positional } = parseArgs(argv);
 	if (flags.get("--help") || positional.length === 0) {
@@ -457,6 +507,10 @@ export async function main(argv = process.argv.slice(2)) {
 	}
 	if (command === "browser") {
 		handleBrowser(positional.slice(1), flags);
+		return 0;
+	}
+	if (command === "artifacts") {
+		handleArtifacts(positional.slice(1), flags);
 		return 0;
 	}
 	throw new UsageError(`Unknown command: ${command}`);

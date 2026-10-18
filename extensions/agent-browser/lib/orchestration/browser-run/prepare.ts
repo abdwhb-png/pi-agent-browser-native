@@ -255,6 +255,7 @@ function preparationControls(
 			| "preserveAttachedBrowserSession"
 			| "establishAttachedBrowserSession"
 			| "ctx"
+			| "artifactStore"
 		>
 	>,
 ): PreparationControls {
@@ -267,7 +268,7 @@ function preparationControls(
 		promptPolicy: options.promptPolicy,
 		preserveAttachedBrowserSession: options.preserveAttachedBrowserSession,
 		establishAttachedBrowserSession: options.establishAttachedBrowserSession,
-		artifactStore: getPersistentSessionArtifactStore(options.ctx),
+		artifactStore: options.artifactStore ?? getPersistentSessionArtifactStore(options.ctx),
 	};
 }
 

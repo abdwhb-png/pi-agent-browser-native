@@ -17,6 +17,37 @@ const DOCUMENTED_CONFIG_HELPER_PREFIX =
 const LOCAL_PACKAGE_SPEC = process.cwd();
 const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 
+test("artifact directory CLI sets, reports, and clears only the selected setting", async () => {
+	const fixture = await createFixture();
+	await mkdir(dirname(fixture.globalPath), { recursive: true });
+	await writeFile(
+		fixture.globalPath,
+		JSON.stringify({ version: 1, browser: { executablePath: "/fixture/browser" } }),
+	);
+	await runConfig(["artifacts", "directory", "set", "artifacts with spaces", "--global"], fixture);
+	const saved = readRecord(JSON.parse(await readFile(fixture.globalPath, "utf8")));
+	assert.deepEqual(saved.artifacts, { directory: "artifacts with spaces" });
+	assert.deepEqual(saved.browser, { executablePath: "/fixture/browser" });
+	const status = await runConfig(["artifacts", "directory", "status"], fixture);
+	assert.match(status.stdout, /artifacts with spaces/);
+	assert.ok(status.stdout.includes(join(fixture.cwd, "artifacts with spaces")));
+	await runConfig(["artifacts", "directory", "set", "project-artifacts", "--project"], fixture);
+	const projectStatus = await runConfig(["artifacts", "directory", "status"], fixture);
+	assert.ok(projectStatus.stdout.includes(join(fixture.cwd, "project-artifacts")));
+	await runConfig(["artifacts", "directory", "clear", "--project"], fixture);
+	const beforeInvalid = await readFile(fixture.globalPath, "utf8");
+	await assert.rejects(runConfig(["artifacts", "directory", "set", "   ", "--global"], fixture), {
+		code: 2,
+	});
+	assert.equal(await readFile(fixture.globalPath, "utf8"), beforeInvalid);
+	await runConfig(["artifacts", "directory", "clear", "--global"], fixture);
+	const cleared = readRecord(JSON.parse(await readFile(fixture.globalPath, "utf8")));
+	assert.deepEqual(cleared.browser, saved.browser);
+	assert.equal(readRecord(cleared.artifacts).directory, undefined);
+	const defaults = await runConfig(["artifacts", "directory", "status"], fixture);
+	assert.ok(defaults.stdout.includes(join(fixture.cwd, ".pi", "artifacts", "agent-browser")));
+});
+
 async function runProcess(
 	command: string,
 	args: readonly string[],

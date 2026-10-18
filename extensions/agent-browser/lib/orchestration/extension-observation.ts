@@ -17,6 +17,7 @@ import { mergeBrowserRunArtifactManifest } from "./browser-run/artifact-merge.js
 import type { AgentBrowserCodeParams } from "../input-modes/params.js";
 import type { AgentBrowserToolResult } from "./browser-run/types.js";
 import { getPersistentSessionArtifactStore } from "./browser-run/session-state.js";
+import type { PersistentSessionArtifactStore } from "../temp.js";
 import type { AgentBrowserExecuteParams } from "./input-plan.js";
 import { isSessionArtifactManifest } from "../results/artifact-manifest.js";
 import { renderAgentBrowserObservation } from "../results/presentation/large-output.js";
@@ -32,6 +33,7 @@ interface Observation {
 	readonly renderedManifest: SessionArtifactManifest | undefined;
 }
 interface ObservationContext {
+	readonly artifactStore?: PersistentSessionArtifactStore;
 	readonly ctx: ExtensionContext;
 	readonly branch: Readonly<BrowserBranch>;
 }
@@ -77,7 +79,7 @@ class ObservationPublication {
 			json: "code" in params || isBooleanFlagEnabled([...(params.args ?? [])], "--json"),
 			succeeded: result.isError !== true,
 			persistentArtifactStore: this.context.branch.isCurrent()
-				? getPersistentSessionArtifactStore(this.context.ctx)
+				? (this.context.artifactStore ?? getPersistentSessionArtifactStore(this.context.ctx))
 				: undefined,
 			withArtifactWrite: <T>(write: () => Promise<T>) =>
 				this.resources.queue.run(() => {

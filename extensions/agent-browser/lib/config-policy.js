@@ -25,6 +25,7 @@ export {
 /** @typedef {import("./config-validation.js").BrowserDefaultProfilePolicy} BrowserDefaultProfilePolicy */
 /** @typedef {import("./config-validation.js").BrowserDefaultProfileConfig} BrowserDefaultProfileConfig */
 /** @typedef {import("./config-validation.js").BrowserConfig} BrowserConfig */
+/** @typedef {import("./config-validation.js").ArtifactsConfig} ArtifactsConfig */
 /** @typedef {import("./config-validation.js").WebSearchConfig} WebSearchConfig */
 /** @typedef {import("./config-validation.js").ConfigLayerScope} ConfigLayerScope */
 /** @typedef {import("./config-validation.js").AgentBrowserConfig} AgentBrowserConfig */
@@ -38,6 +39,19 @@ export {
 /** @typedef {{ readonly scope: string; readonly path: string; readonly exists: boolean }} ConfigFileSummary */
 
 const CONFIG_DIR_NAME = ".pi";
+export const DEFAULT_ARTIFACT_DIRECTORY = ".pi/artifacts/agent-browser";
+
+/** @param {AgentBrowserConfig} config
+ * @param {string} cwd
+ * @param {string} [home]
+ * @returns {string} */
+export function resolveArtifactDirectory(config, cwd, home = homedir()) {
+	const directory = config.artifacts?.directory ?? DEFAULT_ARTIFACT_DIRECTORY;
+	if (directory === "~") {
+		return home;
+	}
+	return directory.startsWith("~/") ? resolve(home, directory.slice(2)) : resolve(cwd, directory);
+}
 
 export const AGENT_BROWSER_CONFIG_ENV = "PI_AGENT_BROWSER_CONFIG";
 
@@ -92,6 +106,9 @@ export function mergeAgentBrowserConfig(base, override) {
 	return {
 		...base,
 		...override,
+		...(base.artifacts !== undefined || override.artifacts !== undefined
+			? { artifacts: { ...base.artifacts, ...override.artifacts } }
+			: {}),
 		browser: {
 			...base.browser,
 			...override.browser,
