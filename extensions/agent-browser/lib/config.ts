@@ -18,6 +18,7 @@ export {
 	BRAVE_API_KEY_ENV,
 	CONFIG_RELATIVE_PATH,
 	DEFAULT_WEB_SEARCH_PROVIDER,
+	DEFAULT_ARTIFACT_DIRECTORY,
 	EXA_API_KEY_ENV,
 	EXA_SEARCH_TYPES,
 	GLOBAL_CONFIG_RELATIVE_PATH,
@@ -48,12 +49,14 @@ export {
 	mergeAgentBrowserConfig,
 	parseAgentBrowserConfigLayer,
 	resolveEnvInterpolations,
+	resolveArtifactDirectory,
 	summarizeConfigFiles,
 	validateAgentBrowserConfig,
 	validateWebSearchProvider,
 } from "./config-policy.js";
 export type {
 	AgentBrowserConfig,
+	ArtifactsConfig,
 	AgentBrowserConfigLoadOptions,
 	AgentBrowserConfigScope,
 	AgentBrowserConfigState,

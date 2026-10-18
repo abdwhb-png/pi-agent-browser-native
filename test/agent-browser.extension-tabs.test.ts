@@ -8,9 +8,9 @@
 
 import assert from "node:assert/strict";
 import { readArray, readNumber, readRecord, readString } from "./helpers/assertions.js";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import { cleanupSecureTempArtifacts } from "../extensions/agent-browser/lib/temp.js";
@@ -23,6 +23,39 @@ import {
 	withPatchedEnv,
 	writeFakeAgentBrowserBinary,
 } from "./helpers/agent-browser-harness.js";
+
+test(
+	"invalid artifact configuration stops before a browser process is dispatched",
+	{ concurrency: false },
+	async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-artifact-invalid-config-"));
+		try {
+			const config = join(root, "config.json");
+			const log = join(root, "calls.jsonl");
+			await writeFile(config, JSON.stringify({ artifacts: { directory: 42 } }));
+			await writeFakeAgentBrowserBinary(
+				root,
+				`require("node:fs").appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv) + "\\n"); process.stdout.write(JSON.stringify({success:true,data:{title:"Fixture"}}));`,
+			);
+			await withPatchedEnv(
+				{ PATH: `${root}${delimiter}${process.env.PATH ?? ""}`, PI_AGENT_BROWSER_CONFIG: config },
+				async () => {
+					const harness = createExtensionHarness({ cwd: root });
+					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+						args: ["get", "title"],
+					});
+					assert.equal(result.isError, true);
+					assert.equal(result.details?.failureCategory, "validation-error");
+					assert.match(readString(readRecord(result.content[0]).text), /not dispatched/);
+					assert.deepEqual(await readInvocationLog(log), []);
+				},
+			);
+		} finally {
+			await cleanupSecureTempArtifacts();
+			await rm(root, { recursive: true, force: true });
+		}
+	},
+);
 
 test(
 	"agentBrowserExtension persists compact snapshot spill files for persisted sessions across shutdown cleanup",
@@ -49,7 +82,7 @@ test(
 		).join("\n");
 		await writeFakeAgentBrowserBinary(
 			tempDir,
-			`process.stdout.write(JSON.stringify({ success: true, data: ${JSON.stringify({ origin: "https://example.com/persisted-extension", refs, snapshot })} }));`,
+			`require("node:fs").writeFileSync(${JSON.stringify(join(tempDir, "browser-config.json"))}, JSON.stringify({ artifacts: { directory: "changed-during-call" } })); process.stdout.write(JSON.stringify({ success: true, data: ${JSON.stringify({ origin: "https://example.com/persisted-extension", refs, snapshot })} }));`,
 		);
 
 		try {
@@ -57,8 +90,14 @@ test(
 				{
 					PATH: `${tempDir}:${basePath}`,
 					PI_AGENT_BROWSER_TEST_PAGE_URL: "https://example.com/persisted-extension",
+					PI_AGENT_BROWSER_CONFIG: join(tempDir, "browser-config.json"),
 				},
 				async () => {
+					const configPath = join(tempDir, "browser-config.json");
+					await writeFile(
+						configPath,
+						JSON.stringify({ artifacts: { directory: "custom-artifacts" } }),
+					);
 					const harness = createExtensionHarness({ cwd: tempDir, sessionDir, sessionFile });
 					await runExtensionEvent(
 						harness.handlers,
@@ -69,11 +108,11 @@ test(
 					const result = await executeRegisteredTool(harness.tool, harness.ctx, {
 						args: ["snapshot", "-i"],
 					});
-					assert.equal(result.isError, false);
+					assert.equal(result.isError, false, JSON.stringify(result));
 					const spillPath = readString(result.details?.fullOutputPath);
 					assert.equal(typeof spillPath, "string");
 					assert.equal(
-						spillPath.startsWith(join(sessionDir, ".pi-agent-browser-artifacts", TEST_SESSION_ID)),
+						spillPath.startsWith(join(tempDir, "custom-artifacts", TEST_SESSION_ID)),
 						true,
 					);
 					const manifest = readRecord(result.details?.artifactManifest);
@@ -87,6 +126,54 @@ test(
 					assert.match(readString(result.details?.artifactRetentionSummary), /1 live, 0 evicted/);
 					await runExtensionEvent(harness.handlers, "session_shutdown");
 					assert.match(await readFile(spillPath, "utf8"), /Extension persisted snapshot row 120/);
+					const resumed = createExtensionHarness({
+						cwd: tempDir,
+						sessionDir,
+						sessionFile,
+						branch: harness.ctx.sessionManager.getBranch(),
+					});
+					await runExtensionEvent(
+						resumed.handlers,
+						"session_start",
+						{ reason: "resume" },
+						resumed.ctx,
+					);
+					const next = await executeRegisteredTool(resumed.tool, resumed.ctx, {
+						args: ["--session", "artifact-after-resume", "snapshot", "-i"],
+						outputPath: "explicit-export.json",
+					});
+					assert.equal(next.isError, false, JSON.stringify(next));
+					assert.ok(
+						readString(next.details?.fullOutputPath).startsWith(
+							join(tempDir, "changed-during-call", TEST_SESSION_ID),
+						),
+					);
+					assert.notEqual(next.details?.fullOutputPath, spillPath);
+					assert.match(await readFile(spillPath, "utf8"), /Extension persisted snapshot row 120/);
+					assert.match(
+						await readFile(join(tempDir, "explicit-export.json"), "utf8"),
+						/Extension persisted snapshot row 120/,
+					);
+					const codeTool = resumed.getTool("agent_browser_code");
+					assert.ok(codeTool);
+					const codeResult = await executeRegisteredTool(codeTool, resumed.ctx, {
+						code: 'emit({ payload: "x".repeat(40000) });',
+					});
+					assert.equal(codeResult.isError, false, JSON.stringify(codeResult));
+					const observationPath = readString(
+						readRecord(codeResult.structuredContent).observationPath,
+					);
+					assert.ok(
+						observationPath.startsWith(join(tempDir, "changed-during-call", TEST_SESSION_ID)),
+					);
+					assert.equal(
+						readString(
+							readRecord(readRecord(JSON.parse(await readFile(observationPath, "utf8"))).data)
+								.payload,
+						).length,
+						40000,
+					);
+					await runExtensionEvent(resumed.handlers, "session_shutdown");
 				},
 			);
 		} finally {

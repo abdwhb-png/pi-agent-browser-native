@@ -200,7 +200,7 @@ console.log(JSON.stringify({ success: true, data }));
 				assert.equal(snapshot.isError, false, snapshot.content[0].text);
 				assert.ok(
 					readString(snapshotDetails.fullOutputPath).startsWith(
-						join(root, "sessions", ".pi-agent-browser-artifacts"),
+						join(a, ".pi", "artifacts", "agent-browser"),
 					),
 				);
 				const calls = readArray(await readInvocationLog(log)).map((value) => readRecord(value));

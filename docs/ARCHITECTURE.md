@@ -138,6 +138,8 @@ The default extension factory optionally accepts `{ beforeExecute }`. `orchestra
 
 ## Session model
 
+Automatic observation storage is owned by the existing artifact store. `artifacts.directory` selects its root, defaulting to `.pi/artifacts/agent-browser` relative to the Pi project, with session-specific directories and unique file names. The outer tool boundary captures the resolved root once and carries it through native preparation, batch/code work and final observation. Retention, redaction and cleanup remain with their existing owners; the sandbox receives no additional grants.
+
 The optional `pi-change-working-dir` event protocol supplies one invocation execution cwd for file operands and workspace scans. It never mutates native `ctx.cwd`. Native config/CLI cwd stays at the project or managed launch anchor; explicit fresh/config choices use the invocation root. Managed launch roots persist in `details.managedSessionCwd`; selection runs inside the existing managed queue so an earlier fresh launch determines the next browser target without changing admitted file paths. Code calls retain the outer snapshot. Existing recordings and cached artifact stores keep their original ownership. If a launch root is deleted, validation reports that boundary rather than spawning under another project's config. Public tool/command source manifests identify legacy owners; no private directory journal or process-global cwd is involved.
 
 ### Default

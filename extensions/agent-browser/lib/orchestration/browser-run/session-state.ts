@@ -1,6 +1,7 @@
 import { isCloseCommand } from "../../command-taxonomy.js";
 import { getSessionPageStateKey } from "../../session-page-state.js";
 import type { PersistentSessionArtifactStore } from "../../temp.js";
+import { resolveArtifactDirectory } from "../../config.js";
 import type {
 	BrowserRunContext,
 	BrowserRunState,
@@ -213,16 +214,8 @@ export function updateTraceOwnerState(
 
 export function getPersistentSessionArtifactStore(
 	ctx: BrowserRunContext,
+	rootDir = resolveArtifactDirectory({}, ctx.cwd),
 ): PersistentSessionArtifactStore | undefined {
-	const sessionDir =
-		typeof ctx.sessionManager.getSessionDir === "function"
-			? ctx.sessionManager.getSessionDir()
-			: undefined;
 	const sessionId = ctx.sessionManager.getSessionId();
-	return sessionDir !== undefined &&
-		sessionDir.length > 0 &&
-		sessionId !== undefined &&
-		sessionId.length > 0
-		? { sessionDir, sessionId }
-		: undefined;
+	return sessionId !== undefined && sessionId.length > 0 ? { rootDir, sessionId } : undefined;
 }

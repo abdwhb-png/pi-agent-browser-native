@@ -14,7 +14,8 @@ import {
 /** @typedef {{ readonly name: string; readonly policy?: BrowserDefaultProfilePolicy }} BrowserDefaultProfileConfig */
 /** @typedef {{ readonly enabled?: boolean; readonly preferredProvider?: WebSearchProvider; readonly defaultSearchType?: ExaSearchType; readonly braveApiKey?: string; readonly exaApiKey?: string }} WebSearchConfig */
 /** @typedef {{ readonly defaultProfile?: BrowserDefaultProfileConfig; readonly executablePath?: string }} BrowserConfig */
-/** @typedef {{ readonly version?: 1; readonly webSearch?: WebSearchConfig; readonly browser?: BrowserConfig }} AgentBrowserConfig */
+/** @typedef {{ readonly directory?: string }} ArtifactsConfig */
+/** @typedef {{ readonly version?: 1; readonly webSearch?: WebSearchConfig; readonly browser?: BrowserConfig; readonly artifacts?: ArtifactsConfig }} AgentBrowserConfig */
 /** @typedef {{ readonly config: AgentBrowserConfig; readonly path: string; readonly scope: ConfigLayerScope }} ConfigLayer */
 /** Validation deliberately appends diagnostics to the caller's collectors.
  * @typedef {string[]} ConfigDiagnostics */
@@ -200,8 +201,9 @@ export function validateAgentBrowserConfig(value, path, errors, warnings) {
 	}
 	const webSearch = validateWebSearchConfig(value.webSearch, `${path}.webSearch`, errors);
 	const browser = validateBrowserConfig(value.browser, `${path}.browser`, errors);
+	const artifacts = validateArtifactsConfig(value.artifacts, `${path}.artifacts`, errors);
 	for (const key of Object.keys(value)) {
-		if (!["version", "webSearch", "browser"].includes(key)) {
+		if (!["version", "webSearch", "browser", "artifacts"].includes(key)) {
 			warnings.push(
 				`${path}.${key} is not a recognized pi-agent-browser-native config field and was ignored.`,
 			);
@@ -211,7 +213,34 @@ export function validateAgentBrowserConfig(value, path, errors, warnings) {
 		...(value.version === 1 ? { version: 1 } : {}),
 		...(webSearch !== undefined ? { webSearch } : {}),
 		...(browser !== undefined ? { browser } : {}),
+		...(artifacts !== undefined ? { artifacts } : {}),
 	};
+}
+
+/** @param {unknown} value
+ * @param {string} path
+ * @param {ConfigDiagnostics} errors
+ * @returns {ArtifactsConfig | undefined} */
+function validateArtifactsConfig(value, path, errors) {
+	if (value === undefined) {
+		return;
+	}
+	if (!isRecord(value)) {
+		errors.push(`${path} must be an object.`);
+		return;
+	}
+	if (value.directory === undefined) {
+		return {};
+	}
+	const directory = validateString(value.directory, `${path}.directory`, errors)?.trim();
+	if (directory === undefined) {
+		return;
+	}
+	if (directory.length === 0 || directory.includes("\0")) {
+		errors.push(`${path}.directory must be a non-empty path without null bytes.`);
+		return;
+	}
+	return { directory };
 }
 
 /** @param {string} raw

@@ -1,5 +1,6 @@
 import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentBrowserCodeExecutor } from "../tool-surface.js";
+import type { PersistentSessionArtifactStore } from "../temp.js";
 import { type BrowserBranch, requirePublishedBrowserJournal } from "../browser-journal.js";
 import { buildExecutionPlan } from "../runtime.js";
 import { extractExplicitSessionName, getAgentBrowserSessionIdentityKey } from "../argv-grammar.js";
@@ -40,6 +41,7 @@ import { executeBrowserInvocation } from "./extension-command-admission.js";
 import { createBrowserInvocation } from "./extension-invocation.js";
 
 export interface BrowserCodeInvocation {
+	readonly artifactStore?: PersistentSessionArtifactStore;
 	readonly toolCallId: string;
 	readonly params: Readonly<AgentBrowserCodeParams>;
 	readonly signal: AbortSignal | undefined;
@@ -249,6 +251,7 @@ class BrowserCodeExecution {
 				executeBrowserInvocation(
 					this.runtime,
 					createBrowserInvocation({
+						artifactStore: this.invocation.artifactStore,
 						toolCallId,
 						params: {
 							args,

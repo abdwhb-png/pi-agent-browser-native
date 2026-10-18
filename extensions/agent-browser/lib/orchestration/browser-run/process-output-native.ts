@@ -33,7 +33,13 @@ type ParseNativeOutputInput = Readonly<Pick<NativeOutputPhase, "artifactManifest
 		readonly input: Readonly<
 			Pick<
 				ProcessBrowserOutputInput,
-				"artifactRunStartedAtMs" | "ctx" | "cwd" | "modelVisible" | "processResult" | "signal"
+				| "artifactRunStartedAtMs"
+				| "ctx"
+				| "artifactStore"
+				| "cwd"
+				| "modelVisible"
+				| "processResult"
+				| "signal"
 			>
 		> & {
 			readonly prepared: Readonly<
@@ -63,7 +69,8 @@ type ResolveDispatchedCommandsInput = Readonly<Pick<NativeOutputPhase, "presenta
 	};
 
 export async function parseNativeOutput(draft: ParseNativeOutputInput): Promise<void> {
-	draft.persistentArtifactStore = getPersistentSessionArtifactStore(draft.input.ctx);
+	draft.persistentArtifactStore =
+		draft.input.artifactStore ?? getPersistentSessionArtifactStore(draft.input.ctx);
 	draft.plainTextUpgrade =
 		!draft.input.prepared.executionPlan.plainTextInspection &&
 		draft.input.prepared.executionPlan.commandInfo.command === "upgrade" &&

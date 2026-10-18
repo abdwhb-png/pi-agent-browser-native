@@ -73,11 +73,33 @@ test("persistent session artifact budget accepts zero without changing bounded d
 });
 
 test(
+	"persistent artifacts preserve an existing configured root's permissions",
+	{ skip: process.platform === "win32" },
+	async () => {
+		const rootDir = await mkdtemp(join(tmpdir(), "pi-artifact-root-permissions-"));
+		try {
+			await chmod(rootDir, 0o750);
+			const artifact = await writePersistentSessionArtifactFile({
+				store: { rootDir, sessionId: TEST_SESSION_ID },
+				prefix: "private-output",
+				suffix: ".txt",
+				content: "private artifact",
+			});
+			assert.equal((await stat(rootDir)).mode & 0o777, 0o750);
+			assert.equal((await stat(dirname(artifact.path))).mode & 0o777, 0o700);
+			assert.equal((await stat(artifact.path)).mode & 0o777, 0o600);
+		} finally {
+			await rm(rootDir, { recursive: true, force: true });
+		}
+	},
+);
+
+test(
 	"writePersistentSessionArtifactFile preserves earlier files with a zero budget",
 	{ concurrency: false },
 	async () => {
 		const sessionDir = await mkdtemp(join(tmpdir(), "pi-session-unlimited-"));
-		const store = { sessionDir, sessionId: TEST_SESSION_ID };
+		const store = { rootDir: sessionDir, sessionId: TEST_SESSION_ID };
 		try {
 			await withPatchedEnv({ PI_AGENT_BROWSER_SESSION_ARTIFACT_MAX_BYTES: "0" }, async () => {
 				const earlier = await writePersistentSessionArtifactFile({

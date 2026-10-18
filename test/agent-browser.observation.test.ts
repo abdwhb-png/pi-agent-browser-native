@@ -182,7 +182,7 @@ test("oversized JSON and prose spill complete redacted recovery and data to a re
 				},
 				json,
 				succeeded: false,
-				persistentArtifactStore: { sessionDir: dir, sessionId: "bounded" },
+				persistentArtifactStore: { rootDir: dir, sessionId: "bounded" },
 			});
 			const text =
 				rendered.content[0].type === "text" ? readString(readRecord(rendered.content[0]).text) : "";
@@ -244,7 +244,7 @@ test("oversized JSON and prose spill complete redacted recovery and data to a re
 			details: { data: "x".repeat(50_000), nextActions: actions },
 			json: true,
 			succeeded: true,
-			persistentArtifactStore: { sessionDir: file, sessionId: "failed" },
+			persistentArtifactStore: { rootDir: file, sessionId: "failed" },
 		});
 		const failure = readRecord(
 			JSON.parse(
@@ -603,7 +603,7 @@ test("compaction keeps an inline diagnostic when summary is deduped against a la
 			details,
 			json: false,
 			succeeded: false,
-			persistentArtifactStore: { sessionDir: dir, sessionId: "dedupe" },
+			persistentArtifactStore: { rootDir: dir, sessionId: "dedupe" },
 		});
 		const compact = readRecord(compacted.structuredContent);
 		assert.equal(compact.compacted, true);
@@ -627,7 +627,7 @@ test("compaction keeps an inline diagnostic when summary is deduped against a la
 			json: false,
 			succeeded: false,
 			preserveContent: true,
-			persistentArtifactStore: { sessionDir: dir, sessionId: "preserve" },
+			persistentArtifactStore: { rootDir: dir, sessionId: "preserve" },
 		});
 		const preservedText =
 			preserved.content[0].type === "text" ? readString(readRecord(preserved.content[0]).text) : "";

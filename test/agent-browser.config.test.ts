@@ -21,12 +21,14 @@ import {
 	getCredentialSourceSummary,
 	loadAgentBrowserConfigSync,
 	resolveWebSearchCredential,
+	resolveArtifactDirectory,
 } from "../extensions/agent-browser/lib/config.js";
 import {
 	createExtensionHarness,
 	getBrowserInstructions,
 	withPatchedEnv,
 } from "./helpers/agent-browser-harness.js";
+import { captureArtifactStore } from "../extensions/agent-browser/lib/orchestration/extension-artifacts.js";
 
 async function pathExists(path: string): Promise<boolean> {
 	return await stat(path).then(
@@ -69,6 +71,81 @@ test("shared config policy exposes canonical web-search provider descriptors", (
 	assert.equal(getWebSearchProviderConfigKey("brave"), "braveApiKey");
 	assert.equal(getWebSearchProviderEnvVar("exa"), EXA_API_KEY_ENV);
 	assert.equal(getWebSearchProviderEnvVar("brave"), BRAVE_API_KEY_ENV);
+});
+
+test("artifact directories follow config precedence and project inclusion", async () => {
+	const fixture = await createConfigFixture();
+	await writeJson(fixture.globalPath, { artifacts: { directory: "global-artifacts" } });
+	await writeJson(fixture.projectPath, { artifacts: { directory: "project-artifacts" } });
+	const options = { cwd: fixture.cwd, env: fixture.env };
+	assert.deepEqual(loadAgentBrowserConfigSync(options).config.artifacts, {
+		directory: "project-artifacts",
+	});
+	assert.deepEqual(
+		loadAgentBrowserConfigSync({ ...options, includeProjectConfig: false }).config.artifacts,
+		{
+			directory: "global-artifacts",
+		},
+	);
+	const override = join(fixture.root, "override.json");
+	await writeJson(override, { artifacts: { directory: "override-artifacts" } });
+	assert.deepEqual(
+		loadAgentBrowserConfigSync({
+			...options,
+			env: { ...fixture.env, [AGENT_BROWSER_CONFIG_ENV]: override },
+		}).config.artifacts,
+		{ directory: "override-artifacts" },
+	);
+});
+
+for (const directory of ["", "   ", 42, null]) {
+	test(`artifact directory validation rejects ${JSON.stringify(directory)}`, async () => {
+		const fixture = await createConfigFixture();
+		await writeJson(fixture.globalPath, { artifacts: { directory } });
+		const state = loadAgentBrowserConfigSync({ cwd: fixture.cwd, env: fixture.env });
+		assert.ok(state.errors.some((error) => error.includes("artifacts.directory")));
+	});
+}
+
+test("artifact directories resolve against the Pi project or the explicit home", () => {
+	const project = join(tmpdir(), "artifact-project");
+	const home = join(tmpdir(), "artifact-home");
+	const absolute = join(tmpdir(), "absolute-artifacts");
+	assert.equal(
+		resolveArtifactDirectory({}, project, home),
+		join(project, ".pi", "artifacts", "agent-browser"),
+	);
+	assert.equal(
+		resolveArtifactDirectory({ artifacts: { directory: "relative" } }, project, home),
+		join(project, "relative"),
+	);
+	assert.equal(
+		resolveArtifactDirectory({ artifacts: { directory: absolute } }, project, home),
+		absolute,
+	);
+	assert.equal(
+		resolveArtifactDirectory({ artifacts: { directory: "~/outputs" } }, project, home),
+		join(home, "outputs"),
+	);
+	assert.equal(resolveArtifactDirectory({ artifacts: { directory: "~" } }, project, home), home);
+});
+
+test("artifact capture leaves guarded SDK context properties untouched", async () => {
+	const fixture = await createConfigFixture();
+	await withPatchedEnv(fixture.env, async () => {
+		const ctx = Object.freeze({
+			cwd: fixture.cwd,
+			sessionManager: Object.freeze({ getSessionId: () => "artifact-session" }),
+			isProjectTrusted: () => false,
+			get ui(): never {
+				throw new Error("The artifact owner must not snapshot unrelated SDK getters");
+			},
+		});
+		assert.deepEqual(captureArtifactStore(ctx), {
+			rootDir: join(fixture.cwd, ".pi", "artifacts", "agent-browser"),
+			sessionId: "artifact-session",
+		});
+	});
 });
 
 test("loads Pi-scoped global config and env fallback without leaking secret summaries", async () => {

@@ -166,15 +166,12 @@ test(
 						snapshot,
 					},
 				},
-				persistentArtifactStore: { sessionDir, sessionId: TEST_SESSION_ID },
+				persistentArtifactStore: { rootDir: sessionDir, sessionId: TEST_SESSION_ID },
 			});
 
 			const spillPath = presentation.fullOutputPath;
 			assert.equal(typeof spillPath, "string");
-			assert.equal(
-				spillPath?.startsWith(join(sessionDir, ".pi-agent-browser-artifacts", TEST_SESSION_ID)),
-				true,
-			);
+			assert.equal(spillPath?.startsWith(join(sessionDir, TEST_SESSION_ID)), true);
 			await cleanupSecureTempArtifacts();
 			assert.match(await readFile(spillPath, "utf8"), /Persisted snapshot row 120/);
 			const spillStats = await lstat(spillPath);
@@ -237,14 +234,14 @@ test(
 						commandInfo: { command: "snapshot" },
 						cwd: process.cwd(),
 						envelope: { success: true, data: firstData },
-						persistentArtifactStore: { sessionDir, sessionId: TEST_SESSION_ID },
+						persistentArtifactStore: { rootDir: sessionDir, sessionId: TEST_SESSION_ID },
 					});
 					const secondPresentation = await buildToolPresentation({
 						artifactManifest: firstPresentation.artifactManifest,
 						commandInfo: { command: "snapshot" },
 						cwd: process.cwd(),
 						envelope: { success: true, data: secondData },
-						persistentArtifactStore: { sessionDir, sessionId: TEST_SESSION_ID },
+						persistentArtifactStore: { rootDir: sessionDir, sessionId: TEST_SESSION_ID },
 					});
 
 					assert.equal(typeof firstPresentation.fullOutputPath, "string");
@@ -333,7 +330,7 @@ test(
 								{ command: ["snapshot", "-i"], result: secondData, success: true },
 							],
 						},
-						persistentArtifactStore: { sessionDir, sessionId: TEST_SESSION_ID },
+						persistentArtifactStore: { rootDir: sessionDir, sessionId: TEST_SESSION_ID },
 					});
 					const firstPath = presentation.batchSteps?.[0]?.fullOutputPath;
 					const secondPath = presentation.batchSteps?.[1]?.fullOutputPath;

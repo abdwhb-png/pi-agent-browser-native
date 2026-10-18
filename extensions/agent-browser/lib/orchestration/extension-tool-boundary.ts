@@ -10,8 +10,9 @@ import { executeCode } from "./extension-code.js";
 import type { BrowserRuntime } from "./extension-runtime.js";
 import { executeBrowserInvocation } from "./extension-command-admission.js";
 import { createBrowserInvocation } from "./extension-invocation.js";
+import { captureArtifactStore } from "./extension-artifacts.js";
 
-export function registerBrowserTools(runtime: BrowserRuntime): void {
+function browserToolRenderers() {
 	const renderResult: NonNullable<ToolDefinition["renderResult"]> = (
 		result,
 		options,
@@ -25,7 +26,7 @@ export function registerBrowserTools(runtime: BrowserRuntime): void {
 		component.setResult(result, options, theme, context.isError);
 		return component;
 	};
-	const renderers = {
+	return {
 		renderCall: (args, theme, context) => {
 			const text =
 				context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
@@ -34,10 +35,25 @@ export function registerBrowserTools(runtime: BrowserRuntime): void {
 		},
 		renderResult,
 	} satisfies Pick<ToolDefinition<typeof AGENT_BROWSER_PARAMS>, "renderCall" | "renderResult">;
+}
+
+export function registerBrowserTools(runtime: BrowserRuntime): void {
+	const renderers = browserToolRenderers();
 	registerAgentBrowserToolSurface(runtime.pi, {
 		async execute(id, params, signal, onUpdate, ctx) {
 			const branch = runtime.branch.capture(ctx);
 			let result: AgentBrowserToolResult;
+			let artifactStore: ReturnType<typeof captureArtifactStore>;
+			try {
+				artifactStore = captureArtifactStore(ctx);
+			} catch (error) {
+				return finalizeObservation(
+					runtime.artifacts,
+					browserExecutionFailure(error, signal, "validation-error"),
+					params,
+					{ ctx, branch },
+				);
+			}
 			try {
 				result = await executeBrowserInvocation(
 					runtime,
@@ -47,13 +63,18 @@ export function registerBrowserTools(runtime: BrowserRuntime): void {
 						signal,
 						onUpdate,
 						ctx,
+						artifactStore,
 						selectedBranch: branch,
 					}),
 				);
 			} catch (error) {
 				result = browserExecutionFailure(error, signal);
 			}
-			return finalizeObservation(runtime.artifacts, result, params, { ctx, branch });
+			return finalizeObservation(runtime.artifacts, result, params, {
+				ctx,
+				artifactStore,
+				branch,
+			});
 		},
 		async executeCode(id, params, signal, _onUpdate, ctx) {
 			const branch = runtime.branch.capture(ctx);
@@ -61,8 +82,30 @@ export function registerBrowserTools(runtime: BrowserRuntime): void {
 			const { promise: execution, resolve: finish } = completion;
 			runtime.code.executions.add(execution);
 			try {
-				const result = await executeCode(runtime, { toolCallId: id, params, signal, ctx, branch });
-				return await finalizeObservation(runtime.artifacts, result, params, { ctx, branch });
+				let artifactStore: ReturnType<typeof captureArtifactStore>;
+				try {
+					artifactStore = captureArtifactStore(ctx);
+				} catch (error) {
+					return await finalizeObservation(
+						runtime.artifacts,
+						browserExecutionFailure(error, signal, "validation-error"),
+						params,
+						{ ctx, branch },
+					);
+				}
+				const result = await executeCode(runtime, {
+					toolCallId: id,
+					params,
+					signal,
+					ctx,
+					artifactStore,
+					branch,
+				});
+				return await finalizeObservation(runtime.artifacts, result, params, {
+					ctx,
+					artifactStore,
+					branch,
+				});
 			} finally {
 				runtime.code.executions.delete(execution);
 				finish();
