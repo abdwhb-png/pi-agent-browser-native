@@ -26,7 +26,7 @@ relaxations require concrete evidence and explicit approval.
 | `npm run quality:policy`           | Validate language coverage and parsed suppression comments; emit the current exception inventory                                                                                                       |
 | `npm run quality:scope -- --write` | Regenerate the final exact unchecked-JavaScript override after an intentional scope/tool change                                                                                                        |
 | `npm run quality:probes`           | Run the focused `node:test` real-CLI regression suite                                                                                                                                                  |
-| `npm run quality:mutations`        | Require clean acceptance, then prove the real workflow rejects syntax, semantic, compiler, formatting, and allowance-isolation mutations in disposable copies                                          |
+| `npm run quality:mutations`        | Require full clean acceptance, then reject syntax, semantic, compiler and formatting mutations through the real gate, and allowance-isolation through its focused origin probe in disposable copies    |
 
 Review fixes before committing; dangerous fixes and suggestion fixes are not part of
 `lint:fix`. Run formatting after reviewed lint fixes and rerun acceptance. Failures
@@ -240,3 +240,5 @@ suppression, allowance, typecheck, test, build, generation, and formatting gates
 all passing on the exact integrated revision. Major refactors also require review
 of their resulting responsibilities, ownership, API surface, asynchronous phases,
 and before/after change locality. Green checks do not substitute for that review.
+
+The CI job owns the complete quality deadline (45 minutes). The mutation runner does not impose a second deadline on a progressing full gate. It runs the complete clean gate once, then reuses the actual origin-isolation test for the allowance mutation instead of replaying unrelated browser tests. Rejection still requires the expected failing command, diagnostic and evidence file.
