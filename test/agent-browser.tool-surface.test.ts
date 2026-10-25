@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { readArray, readRecord, readString } from "./helpers/assertions.js";
+import { readArray, readRecord } from "./helpers/assertions.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { gunzipSync } from "node:zlib";
 import {
 	InMemoryCredentialStore,
 	normalizeContext,
@@ -225,7 +226,12 @@ test("registered browser code serializes for Anthropic while Pi still rejects in
 				apiKey: "test-key",
 				maxRetries: 0,
 				async fetch(_url, init) {
-					payload = JSON.parse(readString(init?.body));
+					const bytes = new Uint8Array(await new Response(init?.body).arrayBuffer());
+					payload = JSON.parse(
+						new Headers(init?.headers).get("content-encoding") === "gzip"
+							? gunzipSync(bytes).toString("utf8")
+							: new TextDecoder().decode(bytes),
+					);
 					return new Response(
 						'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}\n\nevent: message_stop\ndata: {"type":"message_stop"}\n\n',
 						{
