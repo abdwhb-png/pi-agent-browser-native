@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { readRecord, readString, readArray } from "./helpers/assertions.js";
+import { readRecord, readString, readArray, readFunction } from "./helpers/assertions.js";
 import { existsSync } from "node:fs";
 import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -49,7 +49,7 @@ import {
 	createRenderContext,
 } from "./helpers/extension-validation-fixtures.js";
 
-test("agentBrowserExtension keeps full browser guidance and installed doc pointers in its prompt section", async () => {
+test("agentBrowserExtension keeps full browser guidance in its normal skill with active runtime doc pointers", async () => {
 	const isolatedHome = await mkdtemp(join(tmpdir(), "pi-agent-browser-guidance-test-"));
 	await withPatchedEnv(
 		{
@@ -63,6 +63,7 @@ test("agentBrowserExtension keeps full browser guidance and installed doc pointe
 			assert.deepEqual([...harness.handlers.keys()].sort(), [
 				"before_agent_start",
 				"message_end",
+				"resources_discover",
 				"session_shutdown",
 				"session_start",
 				"session_tree",
@@ -103,12 +104,7 @@ test("agentBrowserExtension keeps full browser guidance and installed doc pointe
 			const webSearchTool = harness.getTool("agent_browser_web_search");
 			assert.ok(webSearchTool, "web search tool should register from BRAVE_API_KEY");
 			assert.equal(guidelineText.includes(WEB_SEARCH_PROMPT_GUIDELINE), true);
-			assert.equal(
-				guidelineText.includes(
-					"Prefer agent_browser_web_search for facts; agent_browser for pages.",
-				),
-				true,
-			);
+
 			const requiredGuidelines = [
 				docsGuideline,
 				...RUNTIME_PROMPT_GUIDELINES,
@@ -216,17 +212,22 @@ test("agentBrowserExtension keeps full browser guidance and installed doc pointe
 				{
 					prompt: "Please review the repository architecture.",
 					systemPrompt: "Base system prompt",
-					systemPromptOptions: { sections: {} },
+					systemPromptOptions: { sections: {}, skills: [], toolGuidelines: {} },
 				},
 				harness.ctx,
 			);
 			assert.equal(genericTurn, undefined);
 
 			const sections: Record<string, string> = {};
+			const toolGuidelines: Record<string, string[]> = {};
 			const browserTurn = {
 				prompt: "Open https://example.com and take a snapshot.",
 				systemPrompt: "Base system prompt",
-				systemPromptOptions: { sections },
+				systemPromptOptions: {
+					sections,
+					skills: [],
+					toolGuidelines,
+				},
 			};
 			const overrides = await runExtensionEventResults(
 				harness.handlers,
@@ -240,13 +241,10 @@ test("agentBrowserExtension keeps full browser guidance and installed doc pointe
 				"native section composition must not force a full prompt replacement",
 			);
 			assert.equal(browserTurn.systemPrompt, "Base system prompt");
+			assert.equal(browserTurn.systemPromptOptions.sections.agent_browser, undefined);
 			assert.match(
-				browserTurn.systemPromptOptions.sections.agent_browser,
-				/Project rule: when browser automation is needed/,
-			);
-			assert.doesNotMatch(
-				browserTurn.systemPromptOptions.sections.agent_browser,
-				/Quick start:|Browser operating playbook:/,
+				browserTurn.systemPromptOptions.toolGuidelines.agent_browser.join("\n"),
+				/COMMAND_REFERENCE/,
 			);
 		},
 	);
@@ -259,46 +257,30 @@ test(
 		const extension: unknown = await import(
 			pathToFileURL(resolve("dist/extensions/agent-browser/index.js")).href
 		);
-		let beforeStart: ((event: unknown, ctx: unknown) => Promise<void>) | undefined;
+		const handlers = new Map<string, unknown>();
 		const pi = {
-			events: {
-				on: () => () => {
-					/* No event bus listeners are exercised by prompt composition. */
-				},
-			},
-			on: (name: string, handler: typeof beforeStart) => {
-				if (name === "before_agent_start") {
-					beforeStart = handler;
-				}
+			on: (name: string, handler: unknown) => {
+				handlers.set(name, handler);
 			},
 			registerTool: () => {
-				/* This fixture exercises prompt hooks, not tool registration. */
+				/* Tool registration is outside this resource-path assertion. */
 			},
 		};
-		const factory = readRecord(extension).default;
-		assert.ok(typeof factory === "function");
-		Reflect.apply(factory, undefined, [pi]);
-
-		const sections: Record<string, string> = {};
-		const event = { systemPromptOptions: { sections } };
-		assert.ok(beforeStart);
-		await beforeStart(event, { cwd: process.cwd(), isProjectTrusted: () => true });
-		const guideline = event.systemPromptOptions.sections.agent_browser
-			.split("\n")
-			.find((line) => line.includes("COMMAND_REFERENCE.md"));
-		assert.ok(guideline !== undefined && guideline !== "");
-		assert.doesNotMatch(guideline, /\/dist\/docs\//);
-		for (const docsPath of [
-			resolve("README.md"),
-			resolve("docs/COMMAND_REFERENCE.md"),
-			resolve("docs/TOOL_CONTRACT.md"),
+		const factory = readFunction(readRecord(extension).default);
+		factory(pi);
+		const discover = readFunction(handlers.get("resources_discover"));
+		const result = readRecord(discover());
+		const skillPath = readString(readArray(result.skillPaths)[0]);
+		assert.equal(skillPath, resolve("resources/skills/pi-browser-tool/SKILL.md"));
+		const skill = await readFile(skillPath, "utf8");
+		for (const relative of [
+			"../../../README.md",
+			"../../../docs/COMMAND_REFERENCE.md",
+			"../../../docs/TOOL_CONTRACT.md",
 		]) {
-			// Both fixed documentation links must appear in the prompt.
+			// Every bundled documentation link must be readable from the native skill directory.
 			// oxlint-disable-next-line node-test/no-conditional-assertion
-			assert.match(guideline, new RegExp(docsPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-			// Both fixed documentation links must also resolve on disk.
-			// oxlint-disable-next-line node-test/no-conditional-assertion
-			assert.equal(existsSync(docsPath), true, `missing docs path ${docsPath}`);
+			assert.ok(skill.includes(relative) && existsSync(resolve(dirname(skillPath), relative)));
 		}
 	},
 );
@@ -385,15 +367,23 @@ test("agentBrowserExtension uses project browser launch guidance when project co
 				assert.doesNotMatch(staticGuidelineText, /\/tmp\/project-browser/);
 				assert.equal(staticGuidelineText, "", "no eager configuration guidelines");
 				const sections: Record<string, string> = {};
+				const toolGuidelines: Record<string, string[]> = {};
 				const browserTurn = {
 					prompt: "Open https://example.com in the signed-in browser.",
 					systemPrompt: "Base system prompt",
-					systemPromptOptions: { sections },
+					systemPromptOptions: {
+						sections,
+						skills: [],
+						toolGuidelines,
+					},
 				};
 				await runExtensionEvent(harness.handlers, "before_agent_start", browserTurn, harness.ctx);
-				assert.match(browserTurn.systemPromptOptions.sections.agent_browser, /Project Profile/);
 				assert.match(
-					browserTurn.systemPromptOptions.sections.agent_browser,
+					browserTurn.systemPromptOptions.toolGuidelines.agent_browser.join("\n"),
+					/Project Profile/,
+				);
+				assert.match(
+					browserTurn.systemPromptOptions.toolGuidelines.agent_browser.join("\n"),
 					/\/tmp\/project-browser/,
 				);
 				const guidelineText = await getBrowserInstructions(harness);

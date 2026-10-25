@@ -10,6 +10,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { validateRuntimeArgv } from "../extensions/agent-browser/lib/orchestration/dynamic-argv-validation.js";
 
 import {
 	createExtensionHarness,
@@ -28,6 +29,20 @@ Global Options:
   --json  Output as JSON
   --session <name>  Use specific session
   --namespace <name>  Use namespace
+`;
+
+const SCREENSHOT_HELP = `agent-browser screenshot - Take a screenshot
+
+Usage: agent-browser screenshot [selector] [path]
+
+Options:
+  --full, -f  Capture full page
+
+Global Options:
+  --session <name>  Use specific session
+
+Examples:
+  Do not invent --full-page or --output from examples.
 `;
 
 const CONSOLE_HELP = `agent-browser console - View console logs
@@ -51,6 +66,8 @@ fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ args }) + "\\n");
 if (args.includes("--help")) {
   const command = args.find(arg => !arg.startsWith("-"));
   const help = command === "console" ? ${JSON.stringify(CONSOLE_HELP)}
+    : command === "screenshot" ? ${JSON.stringify(SCREENSHOT_HELP)}
+    : command === "open" ? "agent-browser open\\n\\nUsage: agent-browser open [url]\\n\\nGlobal Options:\\n  --session <name>  Use specific session\\n"
     : command === "fill" ? "agent-browser fill\\n\\nUsage: agent-browser fill <selector> <text>\\n\\nGlobal Options:\\n  --json  Output as JSON\\n  --session <name>  Use specific session\\n"
 	: command === "type" ? "agent-browser type\\n\\nUsage: agent-browser type <selector> <text>\\n\\nGlobal Options:\\n  --json  Output as JSON\\n  --session <name>  Use specific session\\n"
     : command === "wait" ? "agent-browser wait\\n\\nUsage: agent-browser wait <selector|ms> [--text <text>]\\n\\nOptions:\\n  --text <text>  Wait for text\\n"
@@ -59,9 +76,149 @@ if (args.includes("--help")) {
   process.stdout.write(help);
   process.exit(0);
 }
+
 process.stdout.write(JSON.stringify({ success: true, data: { messages: [] } }));
 `;
 }
+test("screenshot rejects unsupported flags before they can become optional selectors", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-screenshot-argv-"));
+	const logPath = join(tempDir, "invocations.jsonl");
+	try {
+		await writeFakeAgentBrowserBinary(tempDir, helpAwareFakeBody(logPath));
+		await withPatchedEnv(
+			{
+				PATH: `${tempDir}:${process.env.PATH ?? ""}`,
+				PI_AGENT_BROWSER_TEST_CUSTOM_HELP: "1",
+				PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.example/",
+			},
+			async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "fixture", "get", "url"],
+				});
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["--session", "fixture", "screenshot", "--full-page", "--output", "landing.png"],
+				});
+				assert.equal(result.isError, true);
+				assert.equal(result.details?.failureCategory, "validation-error");
+				assert.deepEqual(readRecord(readRecord(result.details).argvValidation).unsupportedFlags, [
+					"--full-page",
+					"--output",
+				]);
+				assert.doesNotMatch(result.content[0]?.text ?? "", /refresh-interactive-refs/);
+				assert.deepEqual(readRecord(readArray(readRecord(result.details).nextActions)[0]).params, {
+					args: ["screenshot", "--help"],
+				});
+				assert.equal(
+					(await readInvocationLog(logPath)).some(
+						({ args }) => args.includes("screenshot") && !args.includes("--help"),
+					),
+					false,
+				);
+			},
+		);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("documented global flags verify without a command-local Options section", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-open-argv-"));
+	const logPath = join(tempDir, "invocations.jsonl");
+	try {
+		await writeFakeAgentBrowserBinary(tempDir, helpAwareFakeBody(logPath));
+		await withPatchedEnv(
+			{
+				PATH: `${tempDir}:${process.env.PATH ?? ""}`,
+				PI_AGENT_BROWSER_TEST_CUSTOM_HELP: "1",
+				PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.example/",
+			},
+			async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["open", "https://fixture.example/", "--json"],
+				});
+				assert.equal(result.isError, false, JSON.stringify(result));
+				const validation = await validateRuntimeArgv(
+					{},
+					{
+						args: ["open", "https://fixture.example/", "--session", "fixture"],
+						cwd: tempDir,
+						path: join(tempDir, "agent-browser"),
+					},
+				);
+				assert.equal(validation.details.status, "verified");
+				assert.doesNotMatch(result.content[0]?.text ?? "", /not verified|could not be inspected/i);
+			},
+		);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("generic root help cannot verify an unknown command", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-generic-help-"));
+	const logPath = join(tempDir, "invocations.jsonl");
+	try {
+		await writeFakeAgentBrowserBinary(tempDir, helpAwareFakeBody(logPath));
+		await withPatchedEnv(
+			{
+				PATH: `${tempDir}:${process.env.PATH ?? ""}`,
+				PI_AGENT_BROWSER_TEST_CUSTOM_HELP: "1",
+				PI_AGENT_BROWSER_TEST_PAGE_URL: "https://fixture.example/",
+			},
+			async () => {
+				const harness = createExtensionHarness({ cwd: tempDir });
+				await executeRegisteredTool(harness.tool, harness.ctx, { args: ["get", "url"] });
+				const result = await executeRegisteredTool(harness.tool, harness.ctx, {
+					args: ["qa", "https://fixture.example/", "--screenshot", "landing.png"],
+				});
+				assert.equal(result.isError, false, JSON.stringify(result));
+				assert.equal(readRecord(result.details?.argvValidation).status, "unavailable");
+				assert.match(result.content[0]?.text ?? "", /Usage|command-specific/i);
+			},
+		);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("screenshot validation preserves bare dash operands and documented flags", async () => {
+	const tempDir = await mkdtemp(join(tmpdir(), "piab-screenshot-values-"));
+	try {
+		await writeFakeAgentBrowserBinary(
+			tempDir,
+			helpAwareFakeBody(join(tempDir, "invocations.jsonl")),
+		);
+		await withPatchedEnv(
+			{ PATH: `${tempDir}:${process.env.PATH ?? ""}`, PI_AGENT_BROWSER_TEST_CUSTOM_HELP: "1" },
+			async () => {
+				const literal = await validateRuntimeArgv(
+					{},
+					{
+						args: ["screenshot", "--", "capture.png"],
+						cwd: tempDir,
+						path: join(tempDir, "agent-browser"),
+					},
+				);
+				assert.equal(literal.rejection, undefined);
+				assert.equal(literal.details.status, "verified");
+				const full = await validateRuntimeArgv(
+					{},
+					{
+						args: ["screenshot", "--full", "capture.png"],
+						cwd: tempDir,
+						path: join(tempDir, "agent-browser"),
+					},
+				);
+				assert.equal(full.rejection, undefined);
+				assert.equal(full.details.status, "verified");
+			},
+		);
+	} finally {
+		await rm(tempDir, { recursive: true, force: true });
+	}
+});
 
 test(
 	"agentBrowserExtension rejects console --level from installed help before dispatch",
@@ -235,7 +392,7 @@ process.stdout.write(JSON.stringify({ success: true, data: { messages: [] } }));
 						args: ["console", "--level", "error"],
 					});
 					assert.equal(result.isError, false, result.content[0]?.text);
-					assert.match(result.content[0]?.text ?? "", /could not be inspected.*not verified/i);
+					assert.match(result.content[0]?.text ?? "", /Usage.*not verified/is);
 					assert.equal(readRecord(readRecord(result.details).argvValidation).status, "unavailable");
 					assert.ok(
 						(await readInvocationLog(logPath)).some(
@@ -272,7 +429,7 @@ test(
 						args: ["type", "#name", "Curie", "--clear", "--delay", "1"],
 					});
 					assert.equal(result.isError, false, result.content[0]?.text);
-					assert.match(result.content[0]?.text ?? "", /could not be inspected.*not verified/i);
+					assert.match(result.content[0]?.text ?? "", /does not document.*not verified/is);
 					assert.ok(
 						(await readInvocationLog(logPath)).some(
 							({ args }) => args.includes("type") && !args.includes("--help"),

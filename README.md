@@ -46,7 +46,7 @@ The agent gets a native tool, not a bash workaround:
 { "args": ["find", "text", "Learn React", "click"] }
 ```
 
-Use native commands for individual actions, `batch --bail` for fixed sequences, and `agent_browser_code` for loops or branches. Specialized tools are available through `agent_browser_tools`; see [common calls](#common-agent-calls). On hosts supporting instruction groups, enable `browser` through `discover_tools` first to receive the complete browser guidance and reveal selected declarations. This does not grant callable permissions or activate advanced tools. The extension owns group membership and one full instruction source; official Pi receives that same guidance eagerly and keeps the ordinary direct/code/loader surface.
+Use native commands for individual actions, `batch --bail` for fixed sequences, and `agent_browser_code` for loops or branches. Specialized tools are available through `agent_browser_tools`; see [common calls](#common-agent-calls). The extension registers its bundled `pi-browser-tool` skill through Pi's native `resources_discover` API. Pi advertises the normal skill only while at least one browser tool is active, then loads its full instructions on demand. Manual `/skill:pi-browser-tool` invocation remains available when tools are inactive; activation and execution permissions remain the host's responsibility. This catalogue update requires no reload. Remove an older user-level `pi-browser-tool` copy to avoid a name collision. In Pi, exclude the separate global CLI skill with `"skills": ["!agent-browser"]`, preserving any existing settings entries and the shared skill files used by other harnesses.
 
 The result is optimized for agent work:
 

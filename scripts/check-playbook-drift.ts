@@ -13,10 +13,15 @@ import {
 	INSPECTION_TOOL_CALL_EXAMPLES,
 	SHARED_BROWSER_PLAYBOOK_GUIDELINES,
 	WRAPPER_TAB_RECOVERY_BEHAVIOR,
+	PROJECT_RULE_PROMPT,
+	QUICK_START_GUIDELINES,
+	ADVANCED_TOOL_PROMPT_GUIDELINES,
+	WEB_SEARCH_TOOL_PROMPT_GUIDELINES,
+	buildToolPromptGuidelines,
 } from "../extensions/agent-browser/lib/playbook.js";
 
 type Mode = "check" | "write";
-type BlockId = "inspection" | "shared-guidelines" | "wrapper-tab-recovery";
+type BlockId = "inspection" | "shared-guidelines" | "wrapper-tab-recovery" | "skill-guidelines";
 
 type Target = {
 	readonly path: string;
@@ -24,6 +29,7 @@ type Target = {
 };
 
 const TARGETS: Target[] = [
+	{ path: "resources/skills/pi-browser-tool/SKILL.md", blocks: ["skill-guidelines"] },
 	{ path: "README.md", blocks: ["inspection", "wrapper-tab-recovery"] },
 	{ path: "docs/COMMAND_REFERENCE.md", blocks: ["inspection", "wrapper-tab-recovery"] },
 	{
@@ -76,6 +82,21 @@ function bullets(lines: readonly string[]): string {
 
 function renderBlock(id: BlockId): string {
 	switch (id) {
+		case "skill-guidelines":
+			return [
+				PROJECT_RULE_PROMPT,
+				"",
+				bullets([
+					...new Set([
+						...buildToolPromptGuidelines({ includeWebSearch: false }),
+						...QUICK_START_GUIDELINES,
+						...SHARED_BROWSER_PLAYBOOK_GUIDELINES,
+						...WRAPPER_TAB_RECOVERY_BEHAVIOR,
+						...Object.values(ADVANCED_TOOL_PROMPT_GUIDELINES).flat(),
+						...WEB_SEARCH_TOOL_PROMPT_GUIDELINES,
+					]),
+				]),
+			].join("\n");
 		case "inspection":
 			return [
 				"Native inspection calls use the `agent_browser` tool shape, not shell-like direct-binary commands:",

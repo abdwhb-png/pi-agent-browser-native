@@ -13,7 +13,7 @@ Related docs:
 
 Entry tools are `agent_browser` (native argv), `agent_browser_code` (fresh JavaScript over a persistent browser), and `agent_browser_tools` (advanced capability discovery/activation). Optional credential-backed `agent_browser_web_search` remains independent of browser state and joins the entry surface only when registered.
 
-The extension synchronously registers a `browser` instruction group through the public `pi:instruction-groups` event bus. One full instruction function supplies project/config guidance, shared browser rules, and all specialized tool guidance. When the collector's dynamic `isManaged()` is true, Pi owns delivery through `discover_tools` and compaction repair; the extension does not inject a duplicate eager section. Otherwise `before_agent_start` supplies the identical full instructions eagerly, including on generic prompts and stock Pi. There is no legacy discovery metadata or prompt-keyword gate.
+The extension registers the ordinary `pi-browser-tool` skill through `resources_discover`. Pi advertises it in the model's normal skill catalogue only while at least one tool in the public `browser` namespace is active. Instructions are read on demand; manual `/skill:pi-browser-tool` invocation and explicit skill search remain available while inactive. This changes neither tool activation nor callable permissions, and requires no extension reload. Active tools receive only concise documentation and browser launch configuration guidelines.
 
 Group enablement reveals selected declarations and instructions, not callable permissions. `agent_browser_tools` remains the separate advanced-tool activation path. Existing host selections, exclusions, namespaces, and restored tool history are unchanged.
 

@@ -58,12 +58,6 @@ export const AGENT_BROWSER_TOOL_INVENTORY = {
 	},
 } as const satisfies Record<AgentBrowserAdvancedTool, { name: string; description: string }>;
 
-export const AGENT_BROWSER_INSTRUCTION_GROUP = {
-	name: "browser",
-	description:
-		"Search the web, browse and interact with pages, verify browser UI, and inspect Electron apps.",
-} as const;
-
 const advancedNames = new Set<string>(
 	Object.values(AGENT_BROWSER_TOOL_INVENTORY).map(({ name }) => name),
 );

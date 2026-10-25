@@ -26,9 +26,9 @@ Runtime graphs that use Pi host APIs are statically imported through Pi's extens
 
 Optional `agent_browser_web_search` remains separately credential/config gated and independent of browser state.
 
-The extension factory subscribes synchronously to the public `pi:instruction-groups` bus and registers `browser` with its direct/code/loader, advanced, and conditional web-search names. `fullInstructions(ctx)` is the sole delivery source: project rules, trusted runtime config, full shared playbook, tab recovery, every advanced guideline, and conditional web-search guidance. The callback reads current config rather than retaining startup-only guidance.
+The extension registers `resources/skills/pi-browser-tool/SKILL.md` through Pi's public `resources_discover` event. The skill lives outside conventional auto-discovery directories and is included in the published package. Pi owns frontmatter parsing, diagnostics, catalogue formatting, file loading, and `/skill` expansion.
 
-The collector's dynamic `isManaged()` decides ownership. Managed Pi delivers full text on group enable and repairs it after compaction; `before_agent_start` adds no duplicate browser section. Without management, including stock Pi or disabled discovery, that hook eagerly supplies the same full text in the named `agent_browser` section on every prompt. No `ToolDefinition.discovery`, `sectionTools` detection, keyword gate, or full system-prompt replacement remains. Registration and group enablement do not change callable permissions, tool names/namespaces, startup selection, or the separate advanced loader.
+At `before_agent_start`, the extension reads `getAllTools()` namespace metadata and `getActiveTools()`. If no tool in the `browser` namespace is active, it removes only its own skill file from `systemPromptOptions.skills` for that request. This does not change resource registration, manual skill commands, explicit search, tool permissions, or unrelated skills. Active tools receive concise installed-document pointers and effective browser launch configuration through normal `toolGuidelines`; the full operating playbook stays in the skill until read. The existing playbook generator keeps the skill's generated guidance and documentation synchronized.
 
 ### Direct subprocess execution
 
@@ -100,7 +100,7 @@ Global/override package profile names with `policy: "always"` and executable def
 
 Use Pi-native `promptGuidelines`, tool declarations, and named `systemPromptOptions.sections` contributions. Do not return a replacement full system prompt from `before_agent_start`: it breaks additive declaration anchoring. Official Pi 1.0 and the fork use this same composition; hosted programmatic tool calling, async provider lifecycle, image-detail overrides, or model-specific payload edits are not package dependencies. Prefix stability is not proof of a cache hit.
 
-Browser instructions come from one full source assembled from `lib/playbook.ts` and current trusted config. Shared rules and all advanced tool guidelines are delivered together, rather than maintaining a short eager summary beside a hidden manual. Managed hosts defer this full group; stock hosts receive it eagerly. Tool registrations retain concise descriptions and schemas without duplicate `promptGuidelines`.
+Browser operating instructions remain canonical in `lib/playbook.ts`; `scripts/check-playbook-drift.ts` generates the bundled skill and existing documentation blocks from that source. The normal skill catalogue provides progressive disclosure, while active runtime configuration is supplied separately through Pi's public structured prompt options. No instruction-group collector or unconditional full-playbook prompt section is maintained.
 
 Keep operating rules in the canonical playbook arrays and regenerate their documentation mirrors. Absolute installed-package documentation paths remain available for detailed examples and command inventories; they do not substitute for delivering the full browser guidance.
 

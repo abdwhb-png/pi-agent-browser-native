@@ -3,19 +3,13 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-	PROJECT_RULE_PROMPT,
-	ADVANCED_TOOL_PROMPT_GUIDELINES,
-	QUICK_START_GUIDELINES,
-	SHARED_BROWSER_PLAYBOOK_GUIDELINES,
-	WEB_SEARCH_TOOL_PROMPT_GUIDELINES,
-	WRAPPER_TAB_RECOVERY_BEHAVIOR,
 	buildBrowserDefaultProfileGuideline,
 	buildBrowserExecutablePathGuideline,
-	buildToolPromptGuidelines,
+	buildInstalledDocsGuideline,
 } from "../playbook.js";
+import { AGENT_BROWSER_NAMESPACE } from "../native-output.js";
 import { isRecord } from "../parsing.js";
 import { buildPromptPolicy, getLatestUserMessage, getMessageText } from "../prompt-policy.js";
-import { AGENT_BROWSER_INSTRUCTION_GROUP, AGENT_BROWSER_TOOL_INVENTORY } from "../tool-surface.js";
 import { canRegisterWebSearchTool, loadAgentBrowserConfigSync } from "../config.js";
 import { createAgentBrowserWebSearchTool } from "../web-search.js";
 import {
@@ -117,85 +111,47 @@ export class BrowserPrompt {
 		});
 		this.webSearchToolRegistered = true;
 	}
-	instructions(ctx: ExtensionContext): string {
+	private runtimeGuidelines(ctx: ExtensionContext): string[] {
 		const config = loadAgentBrowserConfigSync({
 			cwd: ctx.cwd,
 			includeProjectConfig: shouldIncludeProjectConfig(ctx),
 		});
-		const guidance = [
-			config.browserExecutablePathScope === "project"
-				? buildBrowserExecutablePathGuideline(config.browserExecutablePath)
-				: undefined,
-			config.browserDefaultProfileScope === "project"
-				? buildBrowserDefaultProfileGuideline(config.browserDefaultProfile)
-				: undefined,
-		].filter((line): line is string => typeof line === "string" && line.length > 0);
-		const configPrompt =
-			guidance.length > 0
-				? `\n\nProject agent_browser config guidance:\n${guidance.map((line) => `- ${line}`).join("\n")}`
-				: "";
-		const guidelines = [
-			...buildToolPromptGuidelines({
-				browserDefaultProfile: config.trustedBrowserDefaultProfile,
-				browserExecutablePath: config.trustedBrowserExecutablePath,
-				includeWebSearch: this.webSearchToolRegistered,
-				docs: getInstalledDocsPaths(),
-			}),
-			...QUICK_START_GUIDELINES,
-			...SHARED_BROWSER_PLAYBOOK_GUIDELINES,
-			...WRAPPER_TAB_RECOVERY_BEHAVIOR,
-			...Object.values(ADVANCED_TOOL_PROMPT_GUIDELINES).flat(),
-			...(this.webSearchToolRegistered ? WEB_SEARCH_TOOL_PROMPT_GUIDELINES : []),
-		];
-		return `${PROJECT_RULE_PROMPT}\n\n${[...new Set(guidelines)].map((line) => `- ${line}`).join("\n")}${configPrompt}`;
-	}
-	private registerCollector(data: unknown, setManaged: (managed: () => boolean) => void): void {
-		if (
-			!isRecord(data) ||
-			typeof data.register !== "function" ||
-			typeof data.isManaged !== "function"
-		) {
-			throw new Error("Invalid Pi instruction-group collector.");
-		}
-		const register = data.register;
-		const isManaged = data.isManaged;
-		Reflect.apply(register, data, [
-			{
-				...AGENT_BROWSER_INSTRUCTION_GROUP,
-				tools: [
-					"agent_browser",
-					"agent_browser_code",
-					"agent_browser_tools",
-					"agent_browser_web_search",
-					...Object.values(AGENT_BROWSER_TOOL_INVENTORY).map(({ name }) => name),
-				],
-				instructions: (ctx: ExtensionContext) => this.instructions(ctx),
-			},
-		]);
-		setManaged(() => {
-			const managed: unknown = Reflect.apply(isManaged, undefined, []);
-			if (typeof managed !== "boolean") {
-				throw new Error("Pi instruction-group ownership must be boolean.");
-			}
-			return managed;
-		});
+		return [
+			buildInstalledDocsGuideline(getInstalledDocsPaths()),
+			buildBrowserExecutablePathGuideline(config.browserExecutablePath),
+			buildBrowserDefaultProfileGuideline(config.browserDefaultProfile),
+		].filter((line): line is string => line !== undefined);
 	}
 	register(): void {
-		let isInstructionsManaged = () => false;
+		const skillPath = join(
+			findPackageRoot(dirname(fileURLToPath(import.meta.url))),
+			"resources",
+			"skills",
+			"pi-browser-tool",
+			"SKILL.md",
+		);
+		this.pi.on("resources_discover", () => ({ skillPaths: [skillPath] }));
 		this.pi.on("message_end", (event, ctx) => {
 			if (event.message.role === "user") {
 				this.state = { sessionId: ctx.sessionManager.getSessionId(), message: event.message };
 			}
 		});
-		this.pi.events.on("pi:instruction-groups", (data) =>
-			this.registerCollector(data, (managed) => {
-				isInstructionsManaged = managed;
-			}),
-		);
-		this.pi.on("before_agent_start", async (event, ctx) => {
-			if (!isInstructionsManaged()) {
-				event.systemPromptOptions.sections.agent_browser = this.instructions(ctx);
+		this.pi.on("before_agent_start", (event, ctx) => {
+			const active = new Set(this.pi.getActiveTools());
+			const tool = this.pi
+				.getAllTools()
+				.find(
+					(candidate) =>
+						candidate.namespace?.name === AGENT_BROWSER_NAMESPACE.name &&
+						active.has(candidate.name),
+				);
+			if (tool === undefined) {
+				event.systemPromptOptions.skills = event.systemPromptOptions.skills.filter(
+					(skill) => skill.filePath !== skillPath,
+				);
+				return;
 			}
+			event.systemPromptOptions.toolGuidelines[tool.name] = this.runtimeGuidelines(ctx);
 		});
 		this.pi.on("tool_call", async (event, ctx) => {
 			if (

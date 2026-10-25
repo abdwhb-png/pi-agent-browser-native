@@ -19,11 +19,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execPath as nodeExecPath, platform as processPlatform } from "node:process";
 
-import type {
-	ExtensionAPI,
-	Theme,
-	ToolDefinition,
-	ToolRenderResultOptions,
+import {
+	loadSkills,
+	type ExtensionAPI,
+	type Theme,
+	type ToolDefinition,
+	type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { Type, type Static, type TSchema } from "typebox";
@@ -32,7 +33,7 @@ import { Check } from "typebox/value";
 import agentBrowserExtension from "../../extensions/agent-browser/index.js";
 import { convertBrowserEntries } from "../../extensions/agent-browser/lib/browser-session-conversion.js";
 import { TARGET_AGENT_BROWSER_VERSION_LABEL } from "../../scripts/agent-browser-target.mjs";
-import { hasErrorCode } from "./assertions.js";
+import { hasErrorCode, readRecord, readArray, readString } from "./assertions.js";
 
 export const TEST_SESSION_ID = "12345678-1234-5678-9abc-def012345678";
 export const DOWNLOAD_FIXTURE_CONTENT = "download contract fixture report\n";
@@ -924,15 +925,35 @@ export async function getBrowserInstructions(harness: {
 	readonly handlers: ReadonlyMap<string, readonly HarnessHandler[]>;
 	readonly ctx: unknown;
 }): Promise<string> {
-	const event: {
-		prompt: string;
-		systemPromptOptions: { sections: Partial<Record<string, string>> };
-	} = {
+	const discovered = await runExtensionEventResults(
+		harness.handlers,
+		"resources_discover",
+		{ reason: "startup" },
+		harness.ctx,
+	);
+	const paths = discovered.flatMap((result) =>
+		readArray(readRecord(result).skillPaths).map(readString),
+	);
+	const loaded = loadSkills({
+		cwd: process.cwd(),
+		agentDir: process.cwd(),
+		includeDefaults: false,
+		skillPaths: paths,
+	});
+	const toolGuidelines: Record<string, string[]> = {};
+	const event = {
 		prompt: "Please continue.",
-		systemPromptOptions: { sections: {} },
+		systemPromptOptions: {
+			sections: {},
+			skills: loaded.skills,
+			toolGuidelines,
+		},
 	};
 	await runExtensionEvent(harness.handlers, "before_agent_start", event, harness.ctx);
-	return event.systemPromptOptions.sections.agent_browser ?? "";
+	const bodies = await Promise.all(
+		event.systemPromptOptions.skills.map((skill) => readFile(skill.filePath, "utf8")),
+	);
+	return [...bodies, ...Object.values(event.systemPromptOptions.toolGuidelines).flat()].join("\n");
 }
 
 export async function runExtensionEventResults(

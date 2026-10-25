@@ -332,7 +332,7 @@ test("captures browser defaults with conservative profile policy and executable 
 	assert.deepEqual(state.warnings, []);
 });
 
-test("records project-local browser guidance scope and uses it for prompt injection", async () => {
+test("records project-local browser guidance scope and delivers active runtime guidelines", async () => {
 	const fixture = await createConfigFixture();
 	await writeJson(fixture.projectPath, {
 		version: 1,
@@ -356,7 +356,6 @@ test("records project-local browser guidance scope and uses it for prompt inject
 	await withPatchedEnv({ HOME: fixture.home, [AGENT_BROWSER_CONFIG_ENV]: undefined }, async () => {
 		const harness = createExtensionHarness({ cwd: fixture.cwd });
 		const instructions = await getBrowserInstructions(harness);
-		assert.match(instructions, /Project agent_browser config guidance:/);
 		assert.match(
 			instructions,
 			/agent_browser config sets browser\.executablePath to "\/tmp\/project-browser"/,

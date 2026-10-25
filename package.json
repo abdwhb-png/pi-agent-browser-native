@@ -32,6 +32,7 @@
 		"pi-agent-browser-doctor": "scripts/doctor.mjs"
 	},
 	"files": [
+		"resources/skills/pi-browser-tool",
 		"dist",
 		"platform-smoke.config.mjs",
 		"scripts/config.mjs",

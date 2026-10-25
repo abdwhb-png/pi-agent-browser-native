@@ -29,12 +29,13 @@ interface HelpGrammar {
 	readonly commandOptionsDocumented: boolean;
 	readonly flags: ReadonlyMap<string, boolean>;
 	readonly maxPositionals?: number;
+	readonly requiredPositionals: number;
 	readonly variadicPositionals: boolean;
 }
 
 interface CachedHelp {
-	grammar?: HelpGrammar;
-	reason?: string;
+	readonly grammar?: HelpGrammar;
+	readonly reason?: string;
 }
 
 type RunProbe = (
@@ -50,12 +51,22 @@ function parseObservedVersion(stdout: string): string | undefined {
 
 function parseHelpFlags(help: string): ReadonlyMap<string, boolean> {
 	const flags = new Map<string, boolean>();
-	for (const match of help.matchAll(FLAG_PATTERN)) {
-		const flag = match.at(1);
-		if (flag === undefined) {
+	let optionsSection = false;
+	for (const line of help.split("\n")) {
+		if (/^\S.*:\s*$/u.test(line)) {
+			optionsSection = /^(?:Global )?Options:\s*$/u.test(line);
+		}
+		if (!optionsSection || !/^\s+--?[A-Za-z]/u.test(line)) {
 			continue;
 		}
-		flags.set(flag, match.at(2) !== undefined || flags.get(flag) === true);
+		const declaration = line.trim().split(/\s{2,}/u)[0] ?? "";
+		for (const match of declaration.matchAll(FLAG_PATTERN)) {
+			const flag = match.at(1);
+			if (flag === undefined) {
+				continue;
+			}
+			flags.set(flag, match.at(2) !== undefined || flags.get(flag) === true);
+		}
 	}
 	return flags;
 }
@@ -63,8 +74,9 @@ function parseHelpFlags(help: string): ReadonlyMap<string, boolean> {
 function parseHelpPositionals(
 	help: string,
 	command: string | undefined,
-): Pick<HelpGrammar, "maxPositionals" | "variadicPositionals"> {
+): Pick<HelpGrammar, "maxPositionals" | "requiredPositionals" | "variadicPositionals"> {
 	let maxPositionals: number | undefined;
+	let requiredPositionals = 0;
 	let variadicPositionals = false;
 	for (const match of help.matchAll(HELP_USAGE_PATTERN)) {
 		const usage = match.at(1)?.trim() ?? "";
@@ -77,30 +89,50 @@ function parseHelpPositionals(
 			.slice(commandIndex + 1)
 			.filter((token) => !token.startsWith("[--") && /^<[^>]+>$|^\[[^\]]+\]$/u.test(token));
 		maxPositionals = Math.max(maxPositionals ?? 0, positionals.length);
+		requiredPositionals = Math.max(
+			requiredPositionals,
+			positionals.filter((token) => token.startsWith("<")).length,
+		);
 		variadicPositionals ||= positionals.some((token) => token.includes("..."));
 	}
-	return { maxPositionals, variadicPositionals };
+	return { maxPositionals, requiredPositionals, variadicPositionals };
 }
 
 function parseHelpGrammar(help: string, command: string | undefined): HelpGrammar | undefined {
 	if (!/^Usage:\s+agent-browser\s+/mu.test(help)) {
 		return undefined;
 	}
+	const positionals = parseHelpPositionals(help, command);
+	if (command !== undefined && positionals.maxPositionals === undefined) {
+		return undefined;
+	}
 	return {
 		commandOptionsDocumented: command === undefined || /^Options:\s*$/mu.test(help),
 		flags: parseHelpFlags(help),
-		...parseHelpPositionals(help, command),
+		...positionals,
 	};
 }
 
-function combineHelpGrammar(
-	root: HelpGrammar | undefined,
-	family: HelpGrammar | undefined,
-): HelpGrammar | undefined {
-	if (root === undefined || family === undefined || !family.commandOptionsDocumented) {
-		return undefined;
+function inspectCommandFlags(
+	tokens: readonly string[],
+	root: CachedHelp,
+	family: CachedHelp | undefined,
+): { readonly unsupported: readonly string[]; readonly reason?: string } {
+	if (root.grammar === undefined) {
+		return { unsupported: [], reason: root.reason };
 	}
-	return { ...family, flags: new Map([...root.flags, ...family.flags]) };
+	if (family?.grammar === undefined) {
+		return { unsupported: [], reason: family?.reason ?? "command help was unavailable" };
+	}
+	const grammar = {
+		...family.grammar,
+		flags: new Map([...root.grammar.flags, ...family.grammar.flags]),
+	};
+	const unsupported = getUnsupportedFlags(tokens, grammar);
+	if (!grammar.commandOptionsDocumented && unsupported.length > 0) {
+		return { unsupported: [], reason: "command help does not document command-local options" };
+	}
+	return { unsupported };
 }
 
 function isUsableHelpResult(result: ProcessRunResult): boolean {
@@ -131,7 +163,7 @@ function getUnsupportedFlags(tokens: readonly string[], grammar: HelpGrammar): s
 	let positionalCount = 0;
 	for (let index = 1; index < tokens.length; index += 1) {
 		const token = tokens[index] ?? "";
-		if (!token.startsWith("-") || token === "-") {
+		if (!/^--?[A-Za-z]/u.test(token)) {
 			positionalCount += 1;
 			continue;
 		}
@@ -143,7 +175,7 @@ function getUnsupportedFlags(tokens: readonly string[], grammar: HelpGrammar): s
 			}
 			continue;
 		}
-		if (grammar.variadicPositionals || positionalCount < (grammar.maxPositionals ?? 0)) {
+		if (grammar.variadicPositionals || positionalCount < grammar.requiredPositionals) {
 			positionalCount += 1;
 			continue;
 		}
@@ -182,7 +214,7 @@ function buildRejection(options: {
 	const command = commandTokens[0] ?? "command";
 	const unsupported = options.unsupportedFlags.join(", ");
 	const consoleLevel = command === "console" && options.unsupportedFlags.includes("--level");
-	const nextActions: AgentBrowserNextAction[] | undefined = consoleLevel
+	const nextActions: AgentBrowserNextAction[] = consoleLevel
 		? [
 				{
 					id: "retry-console-without-level",
@@ -194,13 +226,19 @@ function buildRejection(options: {
 					tool: "agent_browser",
 				},
 			]
-		: undefined;
+		: [
+				{
+					id: "inspect-command-help",
+					params: { args: [command, "--help"] },
+					reason: "Read the installed command help for supported flags and positional arguments.",
+					safety: "Read-only CLI inspection; does not start a browser.",
+					tool: "agent_browser",
+				},
+			];
 	const message = consoleLevel
 		? `Installed agent-browser ${options.observedVersion ?? "(version unavailable)"} does not support --level for console. Upstream returns the aggregate console buffer; inspect message types after the call.`
 		: `Installed agent-browser does not support ${unsupported} for ${command}.`;
-	const nextActionText = nextActions
-		? `\n\nNext actions:\n- retry-console-without-level ${JSON.stringify(nextActions[0]?.params)}: ${nextActions[0]?.reason}`
-		: "";
+	const nextActionText = `\n\nNext actions:\n${nextActions.map((action) => `- ${action.id} ${JSON.stringify(action.params)}: ${action.reason}`).join("\n")}`;
 	return {
 		content: [{ type: "text", text: `${message}${nextActionText}` }],
 		details: {
@@ -249,7 +287,7 @@ export class DynamicArgvValidator {
 		const loaded = isUsableHelpResult(result)
 			? {
 					grammar: parseHelpGrammar(result.stdout, command),
-					reason: "help output did not contain a usable Usage line",
+					reason: "help output did not contain a command-specific Usage line",
 				}
 			: { reason: result.timedOut ? "help timed out" : "help was unavailable or exceeded 256 KiB" };
 		if (!loaded.grammar) {
@@ -280,7 +318,8 @@ export class DynamicArgvValidator {
 				: [commandTokens];
 		const checkedCommands: string[] = [];
 		const unsupportedFlags = new Set<string>();
-		let unavailable = !rootHelp.grammar;
+		const unavailableReasons = new Set<string>();
+
 		let hasFlagsNeedingVerification = hasUnverifiedFlag(commandTokens);
 
 		const commands = [
@@ -292,14 +331,12 @@ export class DynamicArgvValidator {
 					async (command) =>
 						[
 							command,
-							(
-								await this.#loadHelp(
-									`${identity}\0${command}`,
-									[command, "--help"],
-									command,
-									options,
-								)
-							).grammar,
+							await this.#loadHelp(
+								`${identity}\0${command}`,
+								[command, "--help"],
+								command,
+								options,
+							),
 						] as const,
 				),
 			),
@@ -314,13 +351,11 @@ export class DynamicArgvValidator {
 				continue;
 			}
 			hasFlagsNeedingVerification ||= hasUnverifiedFlag(tokens);
-			const familyHelp = families.get(command);
-			const grammar = combineHelpGrammar(rootHelp.grammar, familyHelp);
-			if (grammar === undefined) {
-				unavailable = true;
-				continue;
+			const inspected = inspectCommandFlags(tokens, rootHelp, families.get(command));
+			if (inspected.reason !== undefined) {
+				unavailableReasons.add(inspected.reason);
 			}
-			for (const flag of getUnsupportedFlags(tokens, grammar)) {
+			for (const flag of inspected.unsupported) {
 				unsupportedFlags.add(flag);
 			}
 		}
@@ -330,7 +365,7 @@ export class DynamicArgvValidator {
 			checkedCommands,
 			observedVersion,
 			unsupportedFlags: [...unsupportedFlags],
-			unavailable,
+			unavailableReasons: [...unavailableReasons],
 			hasFlagsNeedingVerification,
 		});
 	}
@@ -389,17 +424,18 @@ function validationResult({
 	checkedCommands,
 	observedVersion,
 	unsupportedFlags,
-	unavailable,
+	unavailableReasons,
 	hasFlagsNeedingVerification,
 }: {
 	readonly args: readonly string[];
 	readonly checkedCommands: readonly string[];
 	readonly observedVersion: string | undefined;
 	readonly unsupportedFlags: readonly string[];
-	readonly unavailable: boolean;
+	readonly unavailableReasons: readonly string[];
 	readonly hasFlagsNeedingVerification: boolean;
 }): DynamicArgvValidationResult {
-	let status: DynamicArgvValidationDetails["status"] = unavailable ? "unavailable" : "verified";
+	let status: DynamicArgvValidationDetails["status"] =
+		unavailableReasons.length > 0 ? "unavailable" : "verified";
 	if (unsupportedFlags.length > 0) {
 		status = "rejected";
 	}
@@ -423,8 +459,8 @@ function validationResult({
 	return {
 		details,
 		warning:
-			unavailable && hasFlagsNeedingVerification
-				? "Argv validation warning: installed agent-browser help could not be inspected, so one or more flags were not verified before dispatch."
+			unavailableReasons.length > 0 && hasFlagsNeedingVerification
+				? `Argv validation warning: ${unavailableReasons.join("; ")}. One or more flags were not verified before dispatch.`
 				: undefined,
 	};
 }
