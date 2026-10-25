@@ -132,13 +132,17 @@ async function withSurface(
 					},
 				});
 				pi.on("session_start", (_event, ctx) => {
-					context = {
+					const toolContext = {
 						...ctx,
 						tools: [],
 						async executeTool() {
 							throw new Error("Nested tool execution is not used by this surface fixture.");
 						},
+						runInBackground() {
+							throw new Error("Background execution is not used by this surface fixture.");
+						},
 					};
+					context = toolContext;
 				});
 			},
 		],
