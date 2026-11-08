@@ -3,7 +3,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -22,6 +22,7 @@ import {
 	loadAgentBrowserConfigSync,
 	resolveWebSearchCredential,
 	resolveArtifactDirectory,
+	validateAgentBrowserConfig,
 } from "../extensions/agent-browser/lib/config.js";
 import {
 	createExtensionHarness,
@@ -485,4 +486,27 @@ test("allows project-local Exa key sources", async () => {
 	assert.equal(canRegisterWebSearchTool(state, fixture.env), true);
 	const resolved = await resolveWebSearchCredential(state, "exa", { env: fixture.env });
 	assert.equal(resolved?.value, "plaintext-secret");
+});
+
+test("CLI blocking configuration validates booleans and preserves explicit false overrides", async () => {
+	const fixture = await createConfigFixture();
+	try {
+		await writeJson(fixture.globalPath, { blockDirectCli: true });
+		await writeJson(fixture.projectPath, { blockDirectCli: false });
+		const inherited = loadAgentBrowserConfigSync({
+			cwd: fixture.cwd,
+			env: fixture.env,
+			includeProjectConfig: false,
+		});
+		assert.equal(inherited.config.blockDirectCli, true);
+		const project = loadAgentBrowserConfigSync({ cwd: fixture.cwd, env: fixture.env });
+		assert.equal(project.config.blockDirectCli, false);
+		assert.deepEqual(project.errors, []);
+		assert.deepEqual(project.warnings, []);
+		const errors: string[] = [];
+		validateAgentBrowserConfig({ blockDirectCli: "true" }, "fixture", errors, []);
+		assert.deepEqual(errors, ["fixture.blockDirectCli must be a boolean."]);
+	} finally {
+		await rm(fixture.root, { recursive: true, force: true });
+	}
 });

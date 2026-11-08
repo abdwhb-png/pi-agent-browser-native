@@ -1,7 +1,7 @@
 import { LAUNCH_SCOPED_FLAG_LABEL } from "./launch-scoped-flags.js";
 
 export const PROJECT_RULE_PROMPT =
-	"Project rule: when browser automation is needed, prefer the native `agent_browser` tool. Do not run direct `agent-browser` bash commands unless the user explicitly asks for a bash-oriented workflow or browser-integration debugging.";
+	"Native `agent_browser` and direct `agent-browser` CLI calls are both supported. Direct CLI calls are allowed by default; `blockDirectCli: true` explicitly enables the package lexical guard. Follow the host Bash and sandbox policies for CLI execution.";
 
 export const TOOL_PROMPT_GUIDELINES_PREFIX = [
 	"Use agent_browser for real browser or live web content.",

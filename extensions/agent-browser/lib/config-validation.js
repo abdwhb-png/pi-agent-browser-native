@@ -15,7 +15,7 @@ import {
 /** @typedef {{ readonly enabled?: boolean; readonly preferredProvider?: WebSearchProvider; readonly defaultSearchType?: ExaSearchType; readonly braveApiKey?: string; readonly exaApiKey?: string }} WebSearchConfig */
 /** @typedef {{ readonly defaultProfile?: BrowserDefaultProfileConfig; readonly executablePath?: string }} BrowserConfig */
 /** @typedef {{ readonly directory?: string }} ArtifactsConfig */
-/** @typedef {{ readonly version?: 1; readonly webSearch?: WebSearchConfig; readonly browser?: BrowserConfig; readonly artifacts?: ArtifactsConfig }} AgentBrowserConfig */
+/** @typedef {{ readonly version?: 1; readonly blockDirectCli?: boolean; readonly webSearch?: WebSearchConfig; readonly browser?: BrowserConfig; readonly artifacts?: ArtifactsConfig }} AgentBrowserConfig */
 /** @typedef {{ readonly config: AgentBrowserConfig; readonly path: string; readonly scope: ConfigLayerScope }} ConfigLayer */
 /** Validation deliberately appends diagnostics to the caller's collectors.
  * @typedef {string[]} ConfigDiagnostics */
@@ -199,18 +199,21 @@ export function validateAgentBrowserConfig(value, path, errors, warnings) {
 	if (value.version !== undefined && value.version !== 1) {
 		errors.push(`${path}.version must be 1 when present.`);
 	}
+	const blockDirectCli = validateBoolean(value.blockDirectCli, `${path}.blockDirectCli`, errors);
 	const webSearch = validateWebSearchConfig(value.webSearch, `${path}.webSearch`, errors);
 	const browser = validateBrowserConfig(value.browser, `${path}.browser`, errors);
 	const artifacts = validateArtifactsConfig(value.artifacts, `${path}.artifacts`, errors);
-	for (const key of Object.keys(value)) {
-		if (!["version", "webSearch", "browser", "artifacts"].includes(key)) {
-			warnings.push(
-				`${path}.${key} is not a recognized pi-agent-browser-native config field and was ignored.`,
-			);
-		}
+	const unknownKeys = Object.keys(value).filter(
+		(key) => !["version", "blockDirectCli", "webSearch", "browser", "artifacts"].includes(key),
+	);
+	for (const key of unknownKeys) {
+		warnings.push(
+			`${path}.${key} is not a recognized pi-agent-browser-native config field and was ignored.`,
+		);
 	}
 	return {
 		...(value.version === 1 ? { version: 1 } : {}),
+		...(blockDirectCli !== undefined ? { blockDirectCli } : {}),
 		...(webSearch !== undefined ? { webSearch } : {}),
 		...(browser !== undefined ? { browser } : {}),
 		...(artifacts !== undefined ? { artifacts } : {}),

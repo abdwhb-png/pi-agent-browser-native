@@ -13,7 +13,6 @@ import { buildPromptPolicy, getLatestUserMessage, getMessageText } from "../prom
 import { canRegisterWebSearchTool, loadAgentBrowserConfigSync } from "../config.js";
 import { createAgentBrowserWebSearchTool } from "../web-search.js";
 import {
-	isDirectAgentBrowserBashAllowed,
 	isHarmlessAgentBrowserInspectionCommand,
 	looksLikeDirectAgentBrowserBash,
 } from "../bash-guard.js";
@@ -153,7 +152,7 @@ export class BrowserPrompt {
 			}
 			event.systemPromptOptions.toolGuidelines[tool.name] = this.runtimeGuidelines(ctx);
 		});
-		this.pi.on("tool_call", async (event, ctx) => {
+		this.pi.on("tool_call", (event, ctx) => {
 			if (
 				!isBashToolCallEvent(event) ||
 				!looksLikeDirectAgentBrowserBash(event.input.command) ||
@@ -162,13 +161,15 @@ export class BrowserPrompt {
 				return;
 			}
 			if (
-				!this.policy(ctx).allowLegacyAgentBrowserBash &&
-				!(await isDirectAgentBrowserBashAllowed(ctx.cwd))
+				loadAgentBrowserConfigSync({
+					cwd: ctx.cwd,
+					includeProjectConfig: shouldIncludeProjectConfig(ctx),
+				}).config.blockDirectCli === true
 			) {
 				return {
 					block: true,
 					reason:
-						"Use the native agent_browser tool instead of bash for agent-browser in this environment.",
+						"Direct agent-browser CLI calls are blocked by blockDirectCli. Use the native agent_browser tool or set blockDirectCli to false.",
 				};
 			}
 			return;

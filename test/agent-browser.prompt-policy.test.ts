@@ -1,6 +1,6 @@
 /**
  * Purpose: Verify prompt-derived policy helpers for the pi-agent-browser extension.
- * Responsibilities: Assert direct agent-browser bash allowance, stop boundaries, and requested artifact extraction.
+ * Responsibilities: Assert raw prompt restoration and requested artifact extraction.
  * Scope: Unit-style Node test-runner coverage for pure prompt-policy helpers.
  */
 
@@ -38,26 +38,12 @@ test("prompt policy restores the latest raw user intent without projecting or co
 	const policy = buildPromptPolicy(prompt);
 
 	assert.equal(prompt, "Please debug the browser integration via bash.");
-	assert.equal(policy.allowLegacyAgentBrowserBash, true);
+	assert.deepEqual(policy.requestedArtifacts, []);
 	assert.equal(
 		reads,
 		3,
 		"restoration stops at the latest raw user instead of reading the older history",
 	);
-});
-
-test("buildPromptPolicy does not allow direct agent-browser bash for generic docs prompts unrelated to agent-browser", () => {
-	const policy = buildPromptPolicy("Please review the repo docs and summarize the architecture.");
-
-	assert.equal(policy.allowLegacyAgentBrowserBash, false);
-});
-
-test("buildPromptPolicy allows explicit tool-specific direct agent-browser bash inspection requests", () => {
-	const policy = buildPromptPolicy(
-		"Show me the agent-browser docs and explain agent-browser --help output.",
-	);
-
-	assert.equal(policy.allowLegacyAgentBrowserBash, true);
 });
 
 test("buildPromptPolicy detects requested artifact paths without deriving semantic action blockers", () => {
@@ -67,7 +53,7 @@ Save a short screen recording here if recording is available: /tmp/pi-smoke/run.
 
 	assert.deepEqual(
 		Object.keys(policy).sort(),
-		["allowLegacyAgentBrowserBash", "requestedArtifacts"],
+		["requestedArtifacts"],
 		"prompt policy must not grow semantic action-gate fields under any name",
 	);
 	assert.deepEqual(policy.requestedArtifacts, [

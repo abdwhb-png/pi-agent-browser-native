@@ -1,12 +1,6 @@
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
-import { isRecord } from "./parsing.js";
-
-const DIRECT_AGENT_BROWSER_BASH_BYPASS_ENV = "PI_AGENT_BROWSER_ALLOW_DIRECT_BASH";
 const DIRECT_AGENT_BROWSER_EXECUTABLE_PATTERN = /^(?:[.~]|\.\.?|\/)?(?:[^\s;&|]+\/)?agent-browser$/;
 const HARMLESS_AGENT_BROWSER_INSPECTION_PATTERN =
 	/^\s*(?:command\s+-v|which|type\s+-P)\s+agent-browser\s*$/;
-const PACKAGE_NAME = "pi-agent-browser-native";
 
 type ShellQuoteState = "double" | "single" | undefined;
 interface Heredoc {
@@ -202,24 +196,4 @@ export function looksLikeDirectAgentBrowserBash(command: string): boolean {
 
 export function isHarmlessAgentBrowserInspectionCommand(command: string): boolean {
 	return HARMLESS_AGENT_BROWSER_INSPECTION_PATTERN.test(command);
-}
-
-function isTruthyEnvValue(value: string | undefined): boolean {
-	return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "yes";
-}
-
-async function isPackageDevelopmentCwd(cwd: string): Promise<boolean> {
-	try {
-		const packageJson: unknown = JSON.parse(await readFile(join(cwd, "package.json"), "utf8"));
-		return isRecord(packageJson) && packageJson.name === PACKAGE_NAME;
-	} catch {
-		return false;
-	}
-}
-
-export async function isDirectAgentBrowserBashAllowed(cwd: string): Promise<boolean> {
-	return (
-		isTruthyEnvValue(process.env[DIRECT_AGENT_BROWSER_BASH_BYPASS_ENV]) ||
-		(await isPackageDevelopmentCwd(cwd))
-	);
 }

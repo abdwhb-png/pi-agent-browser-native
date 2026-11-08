@@ -12,7 +12,7 @@ Use this skill for browser interaction through the active native Pi tools. Read 
 
 ## When Not to Use
 
-Ordinary HTTP requests do not require a browser. Other harnesses should use their own integration. If native tools are hidden, respect the host's activation policy; in the local browser-tools setup the user can run `/browser-tools on`. Do not bypass deactivation through Bash.
+Ordinary HTTP requests do not require a browser. Other harnesses should use their own integration. If native tools are hidden, respect the host's activation policy; in the local browser-tools setup the user can run `/browser-tools on`. Native-tool activation and CLI access are separate; respect the host Bash policy and the package CLI setting.
 
 ## Navigation, screenshots, and QA
 
@@ -33,7 +33,7 @@ Report TLS, launch, connection, and filesystem failures at the boundary where th
 <!-- agent-browser-playbook:start skill-guidelines -->
 <!-- Generated from extensions/agent-browser/lib/playbook.ts. Run `npm run docs -- playbook write` to update. -->
 
-Project rule: when browser automation is needed, prefer the native `agent_browser` tool. Do not run direct `agent-browser` bash commands unless the user explicitly asks for a bash-oriented workflow or browser-integration debugging.
+Native `agent_browser` and direct `agent-browser` CLI calls are both supported. Direct CLI calls are allowed by default; `blockDirectCli: true` explicitly enables the package lexical guard. Follow the host Bash and sandbox policies for CLI execution.
 
 - Use agent_browser for real browser or live web content.
 - Use agent_browser for one native command; batch --bail with JSON-array stdin for fixed sequences; agent_browser_code for loops/branches/aggregation. Return to the model at judgment boundaries. Use agent_browser_tools to discover/enable action, qa, electron, source, or network tools.
