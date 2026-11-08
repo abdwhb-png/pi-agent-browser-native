@@ -645,67 +645,6 @@ test(
 					await close(caller, ambient, "caller");
 					assert.equal(process.env.PI_AGENT_BROWSER_SOCKET_DIR, undefined);
 					assert.equal(process.env.AGENT_BROWSER_SOCKET_DIR, ambient);
-					// Fresh proxy navigation changes the selected managed identity; qualify it after root-identity assertions.
-					await t.test(
-						"authenticated proxy routes fresh and follow-up navigation and reports unavailability",
-						async () => {
-							const requests = [];
-							const authorization = `Basic ${Buffer.from("fixture-user:fixture-password").toString("base64")}`;
-							const proxy = createServer((req, res) => {
-								if (req.headers["proxy-authorization"] !== authorization) {
-									res.writeHead(407, { "Proxy-Authenticate": 'Basic realm="fixture"' });
-									res.end();
-									return;
-								}
-								requests.push(req.url);
-								res.writeHead(200, { "content-type": "text/html", "cache-control": "no-store" });
-								res.end("<!doctype html><title>Proxied fixture</title><h1>Proxy response</h1>");
-							});
-							await new Promise((done) => proxy.listen(0, "127.0.0.1", done));
-							try {
-								const proxyUrl = `http://fixture-user:fixture-password@127.0.0.1:${proxy.address().port}`;
-								const firstUrl = "http://proxy-only.invalid/first";
-								const secondUrl = "http://proxy-only.invalid/second";
-								const opened = await ok({
-									args: ["--proxy", proxyUrl, "--proxy-bypass", "*.internal", "open", firstUrl],
-									sessionMode: "fresh",
-								});
-								assert.ok(
-									requests.includes(firstUrl),
-									"the authenticated proxy must receive navigation",
-								);
-								assert.doesNotMatch(JSON.stringify(opened), /fixture-user|fixture-password/);
-								const title = await ok({ args: ["get", "title"] });
-								assert.match(JSON.stringify(title.details.data), /Proxied fixture/);
-								assert.equal(title.details.sessionName, opened.details.sessionName);
-								const followup = await ok({ args: ["open", secondUrl] });
-								assert.ok(
-									requests.includes(secondUrl),
-									"follow-up navigation must keep using the proxy",
-								);
-								assert.equal(followup.details.sessionName, opened.details.sessionName);
-								proxy.closeAllConnections();
-								await new Promise((done) => proxy.close(done));
-								const unavailable = await call({
-									args: ["open", "http://proxy-only.invalid/unavailable"],
-								});
-								assert.equal(
-									unavailable.isError,
-									true,
-									"a dead proxy must not report successful navigation",
-								);
-								receipts.push({
-									case: "authenticated-proxy",
-									routed: requests.includes(firstUrl) && requests.includes(secondUrl),
-									unavailableIsError: unavailable.isError,
-								});
-							} finally {
-								proxy.closeAllConnections();
-								await new Promise((done) => proxy.close(done));
-								await ok({ args: ["close"] });
-							}
-						},
-					);
 				} finally {
 					if (fresh) {
 						await close(fresh, ownedSockets);
@@ -720,6 +659,67 @@ test(
 				"historical ownership survives abnormal restart without acquiring cleanup ownership",
 				async () => {
 					await qualifyOffbranchRouting({ root, cwd, agentDir, sdkPath, extensionPath, receipts });
+				},
+			);
+			// Fresh proxy navigation changes the selected managed identity; qualify it after root-identity assertions.
+			await t.test(
+				"authenticated proxy routes fresh and follow-up navigation and reports unavailability",
+				async () => {
+					const requests = [];
+					const authorization = `Basic ${Buffer.from("fixture-user:fixture-password").toString("base64")}`;
+					const proxy = createServer((req, res) => {
+						if (req.headers["proxy-authorization"] !== authorization) {
+							res.writeHead(407, { "Proxy-Authenticate": 'Basic realm="fixture"' });
+							res.end();
+							return;
+						}
+						requests.push(req.url);
+						res.writeHead(200, { "content-type": "text/html", "cache-control": "no-store" });
+						res.end("<!doctype html><title>Proxied fixture</title><h1>Proxy response</h1>");
+					});
+					await new Promise((done) => proxy.listen(0, "127.0.0.1", done));
+					try {
+						const proxyUrl = `http://fixture-user:fixture-password@127.0.0.1:${proxy.address().port}`;
+						const firstUrl = "http://proxy-only.invalid/first";
+						const secondUrl = "http://proxy-only.invalid/second";
+						const opened = await ok({
+							args: ["--proxy", proxyUrl, "--proxy-bypass", "*.internal", "open", firstUrl],
+							sessionMode: "fresh",
+						});
+						assert.ok(
+							requests.includes(firstUrl),
+							"the authenticated proxy must receive navigation",
+						);
+						assert.doesNotMatch(JSON.stringify(opened), /fixture-user|fixture-password/);
+						const title = await ok({ args: ["get", "title"] });
+						assert.match(JSON.stringify(title.details.data), /Proxied fixture/);
+						assert.equal(title.details.sessionName, opened.details.sessionName);
+						const followup = await ok({ args: ["open", secondUrl] });
+						assert.ok(
+							requests.includes(secondUrl),
+							"follow-up navigation must keep using the proxy",
+						);
+						assert.equal(followup.details.sessionName, opened.details.sessionName);
+						proxy.closeAllConnections();
+						await new Promise((done) => proxy.close(done));
+						const unavailable = await call({
+							args: ["open", "http://proxy-only.invalid/unavailable"],
+						});
+						assert.equal(
+							unavailable.isError,
+							true,
+							"a dead proxy must not report successful navigation",
+						);
+						receipts.push({
+							case: "authenticated-proxy",
+							routed: requests.includes(firstUrl) && requests.includes(secondUrl),
+							unavailableIsError: unavailable.isError,
+						});
+					} finally {
+						proxy.closeAllConnections();
+						await new Promise((done) => proxy.close(done));
+						await ok({ args: ["close"] });
+					}
 				},
 			);
 		} finally {
