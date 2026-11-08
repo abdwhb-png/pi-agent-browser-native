@@ -312,7 +312,9 @@ test("production JSON-schema builder matches TypeBox shape for public tool schem
 			defaultValue === undefined || matchedDefault !== undefined,
 			"enum default must name an enum value",
 		);
-		return StringEnum(values, { ...options, default: matchedDefault });
+		return Type.Unsafe<(typeof values)[number]>(
+			StringEnum(values, { ...options, default: matchedDefault }),
+		);
 	};
 	for (const createSchema of [
 		createAgentBrowserParamsSchema,
