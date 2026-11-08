@@ -103,7 +103,7 @@ jobs:
           EOF
           # Load only our ephemeral profile, without reloading host policy or caching it.
           sudo apparmor_parser --add --skip-cache "$CI_ROOT/logs/chrome.apparmor"
-      - name: Documentation drift and native browser lifecycle (loopback only)
+      - name: Documentation drift, authenticated proxy, and native browser lifecycle (loopback only)
         run: |
           # Root only creates a loopback-only namespace, then drops all privileges.
           sudo unshare --net -- bash -c '

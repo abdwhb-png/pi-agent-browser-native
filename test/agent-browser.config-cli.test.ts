@@ -3,7 +3,7 @@
  */
 
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -500,4 +500,18 @@ test("config CLI writes project-local custom web-search env aliases", async () =
 		/webSearch\.exaApiKey: configured via environment interpolation \(project\)/,
 	);
 	assert.doesNotMatch(stdout, /aws-secret/);
+});
+
+test("config show reports the effective CLI policy including its permissive default", async () => {
+	const fixture = await createFixture();
+	try {
+		const defaults = await runConfig(["show"], fixture);
+		assert.match(defaults.stdout, /blockDirectCli: false/);
+		await mkdir(dirname(fixture.globalPath), { recursive: true });
+		await writeFile(fixture.globalPath, JSON.stringify({ blockDirectCli: true }));
+		const blocked = await runConfig(["show"], fixture);
+		assert.match(blocked.stdout, /blockDirectCli: true/);
+	} finally {
+		await rm(fixture.root, { recursive: true, force: true });
+	}
 });

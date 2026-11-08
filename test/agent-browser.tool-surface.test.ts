@@ -23,6 +23,7 @@ import {
 	type AgentToolResult,
 	type ExtensionToolContext,
 } from "@earendil-works/pi-coding-agent";
+import { Check } from "typebox/value";
 import { JsonSchema } from "../extensions/agent-browser/lib/json-schema.js";
 import {
 	AGENT_BROWSER_ACTION_PARAMS,
@@ -266,12 +267,13 @@ test("registered browser code serializes for Anthropic while Pi still rejects in
 			"timeoutMs",
 		]);
 		assert.ok(Buffer.byteLength(JSON.stringify(tool.parameters)) < 1400);
+		// Pi may normalize fractional values before dispatch; the raw tool schema remains integer-only.
+		assert.equal(Check(tool.parameters, { code: "emit(1)", timeoutMs: 1.5 }), false);
 		const invalidInputs: JsonObject[] = [
 			{ code: "" },
 			{ code: "emit(1)", session: "" },
 			{ code: "emit(1)", timeoutMs: 0 },
 			{ code: "emit(1)", timeoutMs: 300001 },
-			{ code: "emit(1)", timeoutMs: 1.5 },
 			{ code: "emit(1)", args: [] },
 			{ script: "emit(1)" },
 		];

@@ -217,6 +217,34 @@ Pi hosts that run as uid 0 should set `PI_AGENT_BROWSER_SOCKET_DIR` to a short a
 
 In a Linux user namespace, `/` may report an unmapped owner. Socket checks trust that operating-environment root while retaining checks on every other ancestor and the private socket directory; they do not protect against whoever controls the root filesystem. The demonstrated bubblewrap layout uses a read-only mode-`0755` root and a current-user-owned mode-`0700` `/tmp`, with private HOME and checkout below it. Unmapped non-root ancestors such as `/home` still fail automatic restore checks; this is not support for every bubblewrap layout. See [filesystem trust](docs/ARCHITECTURE.md#ownership).
 
+## Direct CLI policy and one-off proxies
+
+The native extension allows direct `agent-browser` Bash calls by default. To opt into its lexical CLI guard, add `"blockDirectCli": true` to the existing package configuration. Omit the field or set it to `false` to allow direct calls. Global, trusted project, and explicit override configurations retain their existing precedence. Changing this setting takes effect on the next CLI tool call. The guard recognizes common direct and wrapped launches; it is an ergonomic preference, not a general shell security boundary.
+
+```json
+{ "blockDirectCli": false }
+```
+
+An explicit block is not bypassed by prompt wording, the package development directory, or the former `PI_AGENT_BROWSER_ALLOW_DIRECT_BASH` variable. Executable discovery such as `command -v agent-browser` remains available. Host Bash permissions, sandbox access, and skill discovery are independent: this package setting does not install the CLI, expose it inside a sandbox, or undo a host's `"!agent-browser"` skill exclusion.
+
+For a one-off proxy, use upstream launch options on a fresh native browser session:
+
+```json
+{
+	"args": [
+		"--proxy",
+		"http://proxy.example:8080",
+		"--proxy-bypass",
+		"*.internal",
+		"open",
+		"https://example.com"
+	],
+	"sessionMode": "fresh"
+}
+```
+
+Follow-up calls such as `get title` reuse that browser and its proxy without repeating launch flags. Close or recreate the browser to change its launch configuration. The standalone CLI uses the same upstream `--proxy` and `--proxy-bypass` options. Upstream proxy environment/configuration mechanisms also remain available; this package adds no separate proxy registry or credential resolver. Supply credentials through a secure channel rather than conversations or tracked files; visible native results redact proxy credentials. The loopback-only GitHub Actions native lifecycle job qualifies authenticated proxy navigation, session reuse, and an explicit failure when the proxy is unavailable.
+
 ## Optional package config and web search
 
 `pi-agent-browser-native` also reads package-owned config under Pi-scoped paths:

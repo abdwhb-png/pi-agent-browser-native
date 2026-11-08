@@ -210,6 +210,7 @@ function printStatus() {
 	}
 	console.log("");
 	console.log("Effective config:");
+	console.log(`  blockDirectCli: ${state.config.blockDirectCli === true}`);
 	console.log(`  webSearch.enabled: ${state.webSearchEnabled ? "true" : "false"}`);
 	console.log(
 		`  webSearch.preferredProvider: ${state.config.webSearch?.preferredProvider ?? `auto (default ${DEFAULT_WEB_SEARCH_PROVIDER})`}`,
