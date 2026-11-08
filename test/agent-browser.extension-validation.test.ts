@@ -13,10 +13,10 @@ import { chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "n
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import test from "node:test";
+import test, { mock } from "node:test";
 
 import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
-import { Text, visibleWidth } from "@earendil-works/pi-tui";
+import { Text, visibleWidth, stripTerminalSequences, type Component } from "@earendil-works/pi-tui";
 import { Check } from "typebox/value";
 
 import {
@@ -3815,6 +3815,54 @@ process.stdout.write(JSON.stringify({ success: true, data }));`,
 	},
 );
 
+// Validate extension text before the host adds its own ANSI/OSC presentation metadata.
+function renderPlainTextWithSafetyCheck(build: () => Component, width: number): string {
+	const writes: string[] = [];
+	const descriptor = Object.getOwnPropertyDescriptor(Text.prototype, "setText");
+	const original: unknown = descriptor?.value;
+	assert.ok(typeof original === "function");
+	const spy = mock.method(Text.prototype, "setText", function (this: Readonly<Text>, text: string) {
+		writes.push(text);
+		Reflect.apply(original, this, [text]);
+	});
+	try {
+		const lines = build().render(width);
+		assert.ok(writes.length > 0, "capture the real extension text before host rendering");
+		// Model-controlled text must not reach the host with terminal control sequences.
+		// oxlint-disable-next-line no-control-regex
+		assert.doesNotMatch(writes.join("\n"), /[\x00\x07\x1B]/);
+		return lines.map((line) => stripTerminalSequences(line)).join("\n");
+	} finally {
+		spy.mock.restore();
+	}
+}
+
+test("render safety checks distinguish host metadata from unsafe extension text", () => {
+	const descriptor = Object.getOwnPropertyDescriptor(Text.prototype, "render");
+	const nativeRender: unknown = descriptor?.value;
+	assert.ok(typeof nativeRender === "function");
+	const spy = mock.method(Text.prototype, "render", function (this: Readonly<Text>, width: number) {
+		const lines: unknown = Reflect.apply(nativeRender, this, [width]);
+		return readArray(lines)
+			.map(readString)
+			.map((line) => `\x1B]pi:sc;1\x07${line}\x1B]pi:se\x07`);
+	});
+	try {
+		const build = (text: string) => () => {
+			const component = new Text("", 0, 0);
+			component.setText(text);
+			return component;
+		};
+		assert.equal(renderPlainTextWithSafetyCheck(build("safe"), 80).trim(), "safe");
+		assert.throws(
+			() => renderPlainTextWithSafetyCheck(build("\x1B]0;unsafe\x07"), 80),
+			assert.AssertionError,
+		);
+	} finally {
+		spy.mock.restore();
+	}
+});
+
 test("agentBrowserExtension renders long TUI output compactly without changing model-facing content", async () => {
 	const harness = createExtensionHarness({ cwd: process.cwd(), prompt: "Inspect a page." });
 	const renderCall = harness.tool.renderCall;
@@ -3873,13 +3921,15 @@ test("agentBrowserExtension renders long TUI output compactly without changing m
 	assert.match(collapsedScriptCallText, /↵/);
 	assert.match(collapsedScriptCallText, /\.\.\.<\/accent>/);
 	assert.doesNotMatch(collapsedScriptCallText, /emit\(rows\)/);
-	const expandedScriptCallText = renderCall(
-		scriptParams,
-		PLAIN_RENDER_THEME,
-		createRenderContext({ args: scriptParams, expanded: true }),
-	)
-		.render(200)
-		.join("\n");
+	const expandedScriptCallText = renderPlainTextWithSafetyCheck(
+		() =>
+			renderCall(
+				scriptParams,
+				PLAIN_RENDER_THEME,
+				createRenderContext({ args: scriptParams, expanded: true }),
+			),
+		200,
+	);
 	assert.match(expandedScriptCallText, /<dim>Source:<\/dim>/);
 	assert.match(
 		expandedScriptCallText,
@@ -3896,13 +3946,15 @@ test("agentBrowserExtension renders long TUI output compactly without changing m
 		args: ["open", "\x1B]0;pwned\x07https://example.com/\x1B[31m"],
 		stdin: "secret stdin must not render",
 	};
-	const maliciousCallText = renderCall(
-		maliciousParams,
-		PLAIN_RENDER_THEME,
-		createRenderContext({ args: maliciousParams }),
-	)
-		.render(200)
-		.join("\n");
+	const maliciousCallText = renderPlainTextWithSafetyCheck(
+		() =>
+			renderCall(
+				maliciousParams,
+				PLAIN_RENDER_THEME,
+				createRenderContext({ args: maliciousParams }),
+			),
+		200,
+	);
 	// Model-supplied text must not emit NUL, BEL, or terminal escape controls.
 	// oxlint-disable-next-line no-control-regex
 	assert.doesNotMatch(maliciousCallText, /[\x00\x07\x1B]/);
@@ -4083,14 +4135,16 @@ test("agentBrowserExtension renders long TUI output compactly without changing m
 		],
 		details: { summary: "click completed" },
 	};
-	const scalarText = renderResult(
-		scalarResult,
-		{ expanded: false, isPartial: false },
-		PLAIN_RENDER_THEME,
-		createRenderContext({ args: params }),
-	)
-		.render(120)
-		.join("\n");
+	const scalarText = renderPlainTextWithSafetyCheck(
+		() =>
+			renderResult(
+				scalarResult,
+				{ expanded: false, isPartial: false },
+				PLAIN_RENDER_THEME,
+				createRenderContext({ args: params }),
+			),
+		120,
+	);
 	// Scalar output must strip NUL, BEL, and terminal escape controls.
 	// oxlint-disable-next-line no-control-regex
 	assert.doesNotMatch(scalarText, /[\x00\x07\x1B]/);
@@ -4103,14 +4157,16 @@ test("agentBrowserExtension renders long TUI output compactly without changing m
 		content: [{ type: "text", text: "\x1B[31m\x1B[0m" }],
 		details: { summary: "\x1B]0;pwned\x07summary ok" },
 	};
-	const fallbackText = renderResult(
-		fallbackResult,
-		{ expanded: false, isPartial: false },
-		PLAIN_RENDER_THEME,
-		createRenderContext({ args: params }),
-	)
-		.render(120)
-		.join("\n");
+	const fallbackText = renderPlainTextWithSafetyCheck(
+		() =>
+			renderResult(
+				fallbackResult,
+				{ expanded: false, isPartial: false },
+				PLAIN_RENDER_THEME,
+				createRenderContext({ args: params }),
+			),
+		120,
+	);
 	// Fallback prose must strip NUL, BEL, and terminal escape controls too.
 	// oxlint-disable-next-line no-control-regex
 	assert.doesNotMatch(fallbackText, /[\x00\x07\x1B]/);
